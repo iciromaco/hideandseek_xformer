@@ -73,7 +73,7 @@ WANDB_ENTITY = None
 
 # PPO / Transformer (ユーザー指定設定 v18.52)
 TOTAL_TIMESTEPS = 100000   # 総ステップ数 
-LEARNING_RATE = 0.00011586 # 3e-4        # 学習率
+LEARNING_RATE = 0.00045036 # 3e-4        # 学習率
 NUM_ENVS = 8                # 環境数 (USE_VIEWER=True時は1に固定)
 NUM_STEPS = 128             # 各環境のステップ数
 MINIBATCH_SIZE = 64         # ミニバッチサイズ
@@ -81,7 +81,7 @@ UPDATE_EPOCHS = 2           # 更新エポック数
 GAMMA = 0.99                # 割引率
 GAE_LAMBDA = 0.95           # GAEのλ
 CLIP_COEF = 0.2             # クリッピング係数
-ENT_COEF = 0.00008567     # エントロピー係数           
+ENT_COEF = 0.00090286     # エントロピー係数           
 VF_COEF = 0.5               # 価値関数の損失係数
 MAX_GRAD_NORM = 0.5         # 勾配の最大ノルム
 TRANSFORMER_SEQ_LEN = 8     # トランスフォーマーのシーケンス長
@@ -100,10 +100,10 @@ ACTION_REPEAT = 16          # アクション繰り返し回数
 PREP_STEPS = 80             # 初期準備ステップ数 
 MAX_STEPS = 300             # エピソード最大ステップ数 
 FOV_DEG = 135               # 視野角 (度) 
-REWARD_SURVIVAL = 4.97792    # 生存報酬 
+REWARD_SURVIVAL = 4.72413    # 生存報酬 
 REWARD_DISTANCE_COEFF = 0.00000 # 距離報酬係数
 PENALTY_CAPTURE = -30.0      # 捕獲ペナルティ
-PENALTY_STAGNATION = -0.54703   # 停滞ペナルティ
+PENALTY_STAGNATION = -1.62375   # 停滞ペナルティ
 REWARD_CAPTURE_BONUS = 30.0  # 捕獲ボーナス
 HIDER_THRUST_LIMIT = 0.35    # HIDER推力制限
 SEEKER_THRUST_LIMIT = 0.35   # SEEKER推力制限
