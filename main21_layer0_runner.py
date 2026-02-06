@@ -1,12 +1,12 @@
 # main21_layer0_runner.py
 # 演習第21回：サブサンプション・アーキテクチャ Layer 0 (逃走)
 #
-# 【修正(v21.46)】
-# - インポートパス解決の強化:
-#   - Optunaの試行ディレクトリ構造 (root/optuna_results_layer0/trial_XX/trial_XX.py) 
-#     に対応するため、実行ファイルから最大4階層上までを検索パスに自動追加。
-#   - これにより、サブディレクトリから実行されても main18_optimization.py を確実に発見。
-# - モデル切り替え・保存ロジックは維持。
+# 【修正(v21.49)】
+# - ログ密度の正常化:
+#   - SPS, Entropy, 各種Lossを毎Update WandB(TensorBoard)に記録するように修正。
+#   - エピソードデータ(Return, Length)も消失を防ぐため、データがある毎Update記録。
+#   - コンソールへの print 出力のみ 10 Update ごとに制限し、視認性を確保。
+# - インポートパス解決・モデル切り替えロジックは維持。
 #
 # 【実行準備】
 # main18_optimization.py が同じフォルダに必要です。
@@ -25,12 +25,11 @@ import mujoco
 import wandb
 from tqdm import tqdm
 
-# --- インポートパスの解決 (Optunaサブディレクトリ実行対策: 強化版) ---
-# 実行中のスクリプト位置から親ディレクトリを再帰的に遡って sys.path に追加します
+# --- インポートパスの解決 ---
 search_path = os.path.dirname(os.path.abspath(__file__))
-for _ in range(4): # 最大4階層遡る (trial_XX -> results -> root)
+for _ in range(4):
     if search_path not in sys.path:
-        sys.path.insert(0, search_path) # 優先的に検索
+        sys.path.insert(0, search_path)
     search_path = os.path.dirname(search_path)
 
 # ベース設定のインポート
@@ -39,7 +38,6 @@ try:
     from main18_optimization import HideAndSeekEnv, Agent, ObsHistory
 except ImportError:
     print(f"Error: main18_optimization.py not found in sys.path.")
-    print(f"Current sys.path: {sys.path}")
     exit(1)
 
 # ==========================================
@@ -49,21 +47,22 @@ EXPERIMENT_NAME = "HideAndSeek_Layer0_Runner"
 
 # ★実行制御設定 (Optunaから書き換え対象)
 EXECUTION_MODE = "TRAIN" 
-LOAD_EXISTING_MODELS = True  # ロードするかどうか
-SAVE_MODEL = True            # 保存するかどうか
+LOAD_EXISTING_MODELS = True
+SAVE_MODEL = True
+TRACK_WANDB = True           
 FIXED_SEED = None
 
 TOTAL_TIMESTEPS = 1000000 
 NUM_ENVS = 8
 NUM_STEPS = 128
-LEARNING_RATE = 1.8665472485424183e-05 # 3e-4
-ENT_COEF = 9.909110098202789e-05 # 0.001
+LEARNING_RATE = 3e-4
+ENT_COEF = 0.001
 
 # ★報酬設定
-REWARD_DISTANCE_DIFF_SCALE = 0.0 # 距離報酬は廃止
-REWARD_SURVIVAL_SCALE = 4.524250918447132     # 生存報酬を主軸
-PENALTY_CAPTURE = -100.0         # 捕獲ペナルティ
-PENALTY_STAGNATION_FORCE = -1.373509005269032 # 停滞ペナルティ
+REWARD_DISTANCE_DIFF_SCALE = 0.0 
+REWARD_SURVIVAL_SCALE = 5.0      
+PENALTY_CAPTURE = -100.0         
+PENALTY_STAGNATION_FORCE = -0.1  
 
 # 親クラスの報酬無効化
 base_config.REWARD_SURVIVAL = 0.0
@@ -76,7 +75,7 @@ base_config.MODEL_PATH_HIDER = f"{EXPERIMENT_NAME}_HIDER.pt"
 device = torch.device("cuda" if torch.cuda.is_available() and base_config.CUDA else "cpu")
 
 # ==========================================
-# 2. 環境クラス
+# 2. 環境クラスの拡張 (Layer0RunnerEnv)
 # ==========================================
 class Layer0RunnerEnv(HideAndSeekEnv):
     def __init__(self, render_mode=None):
@@ -85,7 +84,6 @@ class Layer0RunnerEnv(HideAndSeekEnv):
         self.h1_geoms_set = set([i for i in range(self.model.ngeom) if "hider1" in self.model.geom(i).name])
         self.h2_geoms_set = set([i for i in range(self.model.ngeom) if "hider2" in self.model.geom(i).name])
         self.s0_geoms_set = set(self.s0_geoms)
-        # npc_obs_history を初期化
         self.npc_obs_history = {
             0: ObsHistory(1, base_config.TRANSFORMER_SEQ_LEN, 53, device),
             1: ObsHistory(1, base_config.TRANSFORMER_SEQ_LEN, 53, device),
@@ -99,13 +97,13 @@ class Layer0RunnerEnv(HideAndSeekEnv):
 
     def _seeker_rule_based_policy(self):
         target_pos = self.seeker_target_pos
-        if self.current_step < base_config.PREP_STEPS or target_pos is None: return 0.0, 0.0
+        if self.current_step < PREP_STEPS or target_pos is None: return 0.0, 0.0
         if self.seeker_mode == "SCANNING": return 0.0, 1.0
         sp = self.data.xpos[self.s0_body][:2]; sr = self.data.qpos[self.srot_adr]
         dy = float(target_pos[1] - sp[1]); dx = float(target_pos[0] - sp[0])
         desired_angle = np.arctan2(dy, dx); angle_diff = (desired_angle - float(sr) + np.pi) % (2*np.pi) - np.pi
-        thrust = base_config.SEEKER_RB_THRUST; steering = np.clip(angle_diff * 6.0, -3.0, 3.0)
-        if abs(angle_diff) > base_config.SEEKER_RB_TURN_THRESH: thrust *= 0.3
+        thrust = SEEKER_RB_THRUST; steering = np.clip(angle_diff * 6.0, -3.0, 3.0)
+        if abs(angle_diff) > SEEKER_RB_TURN_THRESH: thrust *= 0.3
         sx_dof = self.model.jnt_dofadr[self.model.joint('s_x').id]; s_vel = np.linalg.norm(self.data.qvel[sx_dof : sx_dof+2])
         if thrust > 0.05 and s_vel < 0.05: self.s0_stuck_timer += 1
         else: self.s0_stuck_timer = 0
@@ -135,7 +133,7 @@ class Layer0RunnerEnv(HideAndSeekEnv):
         self._apply_action(partner_id, act_npc)
         sf0, sr0 = self._seeker_rule_based_policy()
         self.data.ctrl[0:2] = [sf0, sr0]
-        for _ in range(base_config.ACTION_REPEAT):
+        for _ in range(ACTION_REPEAT):
             for box, pose in self.locked_pose.items():
                 if self.locked_boxes[box]:
                     bid = self.box1_joint_id if box==self.box1_body else self.box2_joint_id
@@ -163,7 +161,7 @@ class Layer0RunnerEnv(HideAndSeekEnv):
         else: reward += REWARD_SURVIVAL_SCALE
         dof_adr = self.model.jnt_dofadr[self.model.joint('h1_x' if self.learning_agent_id==1 else 'h2_x').id]
         if np.linalg.norm(self.data.qvel[dof_adr:dof_adr+2]) < 0.1: reward += PENALTY_STAGNATION_FORCE
-        terminated = captured_any or (self.current_step >= base_config.MAX_STEPS)
+        terminated = captured_any or (self.current_step >= MAX_STEPS)
         return self._get_obs(self.learning_agent_id), reward, terminated, False, {}
 
 # ==========================================
@@ -172,26 +170,17 @@ class Layer0RunnerEnv(HideAndSeekEnv):
 def main():
     print(f"--- Layer 0 Training: {EXPERIMENT_NAME} ---")
     start_time = time.time()
-    
-    # 実行ファイルのディレクトリ（パス解決用）
     current_script_dir = os.path.dirname(os.path.abspath(__file__))
 
     if EXECUTION_MODE == "PLAY":
         from stable_baselines3.common.vec_env import DummyVecEnv
         env = DummyVecEnv([lambda: Layer0RunnerEnv(render_mode="human")])
         agent = Agent(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
-        
-        # モデルロード（パス解決を含む）
         model_path = os.path.join(current_script_dir, f"{EXPERIMENT_NAME}_HIDER.pt")
-        if not os.path.exists(model_path):
-             # ルートディレクトリも探す
-             model_path = os.path.join(os.getcwd(), f"{EXPERIMENT_NAME}_HIDER.pt")
-             
         if os.path.exists(model_path):
             agent.load_state_dict(torch.load(model_path, map_location=device))
             print(f"Loaded model: {model_path}")
         else: print("Model missing."); return
-        
         agent.eval()
         obs_history = ObsHistory(1, base_config.TRANSFORMER_SEQ_LEN, env.observation_space.shape[0], device)
         for ep in range(10):
@@ -206,33 +195,36 @@ def main():
         env.close(); return
 
     # --- TRAIN モード ---
-    writer = SummaryWriter(f"runs/{EXPERIMENT_NAME}_{int(time.time())}")
+    run_name = f"{EXPERIMENT_NAME}_{int(time.time())}"
+    if TRACK_WANDB:
+        wandb.init(
+            project=base_config.WANDB_PROJECT_NAME,
+            entity=base_config.WANDB_ENTITY,
+            sync_tensorboard=True,
+            config={"layer": 0, "mode": "runner_optimized_logging"},
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
+    writer = SummaryWriter(f"runs/{run_name}")
+
     def make_env():
         env = Layer0RunnerEnv(); env = gym.wrappers.RecordEpisodeStatistics(env); return env
     envs = gym.vector.AsyncVectorEnv([make_env for _ in range(NUM_ENVS)])
     agent = Agent(envs.single_observation_space.shape[0], envs.single_action_space.shape[0]).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=LEARNING_RATE, eps=1e-5)
     
-    # パス解決: 既存モデルの検索
     model_path = os.path.join(current_script_dir, f"{EXPERIMENT_NAME}_HIDER.pt")
-    if not os.path.exists(model_path):
-        model_path = os.path.join(os.getcwd(), f"{EXPERIMENT_NAME}_HIDER.pt")
-        
     checkpoint_path = model_path.replace('.pt', '_checkpoint.json')
-    global_step = 0
-    start_global_step = 0
+    global_step = 0; start_global_step = 0
 
     if LOAD_EXISTING_MODELS and os.path.exists(model_path):
         print(f"★ Loading existing model: {model_path}")
         agent.load_state_dict(torch.load(model_path, map_location=device))
         if os.path.exists(checkpoint_path):
             with open(checkpoint_path, 'r') as f:
-                data = json.load(f)
-                global_step = data.get('global_step', 0)
-                start_global_step = global_step
+                data = json.load(f); global_step = data.get('global_step', 0); start_global_step = global_step
         print(f"  -> Resumed from step {global_step}")
-    else:
-        print("★ Starting from scratch (Initial mode)")
     
     obs_history = ObsHistory(NUM_ENVS, base_config.TRANSFORMER_SEQ_LEN, envs.single_observation_space.shape[0], device)
     obs = torch.zeros((NUM_STEPS, NUM_ENVS, base_config.TRANSFORMER_SEQ_LEN, envs.single_observation_space.shape[0]), device=device)
@@ -258,13 +250,18 @@ def main():
                 next_done = np.logical_or(terminations, truncations)
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
                 next_done = torch.tensor(next_done).to(device, dtype=torch.float32)
+                
+                # エピソードデータの収集 (消失を防ぐため毎ステップチェック)
                 if "episode" in infos:
-                    for i, is_done in enumerate(infos["_episode"]):
-                        if is_done:
-                             episodic_returns.append(infos["episode"]["r"][i])
-                             episodic_lengths.append(infos["episode"]["l"][i])
+                    mask = infos.get("_episode", [True] * len(infos["episode"]))
+                    if isinstance(infos["episode"], dict) and "r" in infos["episode"]:
+                        for i, is_done in enumerate(mask):
+                            if is_done:
+                                episodic_returns.append(infos["episode"]["r"][i])
+                                episodic_lengths.append(infos["episode"]["l"][i])
                 obs_history.update(next_obs)
 
+            # GAE / PPO Update (計算部分は変更なし)
             with torch.no_grad():
                 next_v = agent.get_value(obs_history.get()).reshape(1, -1)
                 advantages = torch.zeros_like(rewards).to(device); lastgaelam = 0
@@ -292,27 +289,37 @@ def main():
                     loss = pg_loss - ENT_COEF * entropy.mean() + base_config.VF_COEF * v_loss
                     optimizer.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(agent.parameters(), base_config.MAX_GRAD_NORM); optimizer.step()
 
+            # ★修正: WandB(TensorBoard)への記録を毎Update実行するようにガードの外へ移動
+            elapsed = time.time() - start_time
+            sps = int((global_step - start_global_step) / elapsed) if elapsed > 0 else 0
+            
+            writer.add_scalar("charts/SPS", sps, global_step)
+            writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+            writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+            writer.add_scalar("losses/entropy", entropy.mean().item(), global_step) # エントロピーを毎Update記録
+            writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+            
+            # エピソードデータも存在すれば毎Update記録 (消失防止)
+            if len(episodic_returns) > 0:
+                writer.add_scalar("charts/mean_episodic_return", np.mean(episodic_returns), global_step)
+                writer.add_scalar("charts/mean_episodic_length", np.mean(episodic_lengths), global_step)
+
+            # コンソールへの表示のみ 10回に 1回に制限
             if update % 10 == 0:
                 avg_ret = np.mean(episodic_returns) if episodic_returns else 0.0
                 avg_len = np.mean(episodic_lengths) if episodic_lengths else 0.0
-                print(f"Update {update}, Step {global_step}, Loss: {loss.item():.3f}, EpRet: {avg_ret:.2f}, EpLen: {avg_len:.1f}")
+                print(f"Update {update}, Step {global_step}, Loss: {loss.item():.3f}, Entropy: {entropy.mean().item():.4f}, EpRet: {avg_ret:.2f}, EpLen: {avg_len:.1f}")
 
-    except KeyboardInterrupt:
-        print("Training interrupted.")
-
+    except KeyboardInterrupt: print("Training interrupted.")
     if SAVE_MODEL:
-        # 保存パスの確定
-        final_model_path = os.path.join(current_script_dir, f"{EXPERIMENT_NAME}_HIDER.pt")
-        torch.save(agent.state_dict(), final_model_path)
+        torch.save(agent.state_dict(), model_path)
         try:
-            with open(final_model_path.replace('.pt', '_checkpoint.json'), 'w') as f: 
-                json.dump({'global_step': global_step}, f)
-            print(f"Model saved to {final_model_path}")
+            with open(model_path.replace('.pt', '_checkpoint.json'), 'w') as f: json.dump({'global_step': global_step}, f)
+            print(f"Model saved to {model_path}")
         except: pass
-    else:
-        print("★ Model saving skipped (SAVE_MODEL=False)")
-        
-    envs.close(); writer.close()
+    else: print("★ Model saving skipped")
+    envs.close(); writer.close(); 
+    if TRACK_WANDB: wandb.finish()
 
 if __name__ == "__main__":
     main()

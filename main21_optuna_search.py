@@ -1,12 +1,11 @@
 # main21_optuna_search.py
 # 演習第21回：Layer 0 (逃走) 専用のパラメータ自動最適化
 #
-# 【修正(v21.47)】
-# - 表示ロジックの修正:
-#   - objective 関数内の print 文を更新し、探索中の 4 つのパラメータ
-#     (SURVIVAL, STAGNATION, LR, ENT) すべてをコンソールに表示するように変更。
-# - 安定性の維持:
-#   - v21.39/v21.45 で確立した安全な置換ロジックと、モデル上書き禁止設定を継続。
+# 【修正(v21.48)】
+# - WandB 連携の有効化:
+#   - TRACK_WANDB = True を生成スクリプトに流し込むように変更。
+#   - これにより、各 Trial の学習経過が WandB ダッシュボードで確認可能になります。
+# - 表示ロジック・安定性は維持。
 #
 # 【実行準備】
 # uv add optuna pandas
@@ -59,8 +58,9 @@ def create_trial_script(trial, output_dir, mode="initial"):
         "ENT_COEF": f"{ent_coef:.8f}",
         "TOTAL_TIMESTEPS": str(int(TOTAL_STEPS)),
         "EXECUTION_MODE": '"TRAIN"',
-        "SAVE_MODEL": "False",  # 各Trialでの上書きを禁止
-        "FIXED_SEED": "1",      # 試行間の条件を同一にする
+        "SAVE_MODEL": "False",      # 各Trialでの上書きを禁止
+        "TRACK_WANDB": "True",      # ★修正: WandB 記録を有効化
+        "FIXED_SEED": "1",          # 試行間の条件を同一にする
     }
 
     # モードに応じたロード設定
@@ -71,7 +71,7 @@ def create_trial_script(trial, output_dir, mode="initial"):
         pattern = fr"^(\s*{key}\s*=\s*)(.+?)(?=\s*(#.*|;.*|$))"
         content = re.sub(pattern, fr"\g<1>{val}", content, flags=re.MULTILINE)
 
-    # 2. 実験名の変更
+    # 2. 実験名の変更 (WandB上でも Trial ごとに識別可能にする)
     content = re.sub(
         r'EXPERIMENT_NAME = ".*?"',
         f'EXPERIMENT_NAME = "{STUDY_NAME}_{mode}_{trial.number}"',
@@ -85,7 +85,7 @@ def create_trial_script(trial, output_dir, mode="initial"):
         content
     )
 
-    # 4. チェックポイント保存ブロックの安全な除去
+    # 4. チェックポイント保存ブロックの安全な除去 (フラグ SAVE_MODEL=False で十分だが保険として)
     checkpoint_block_pattern = re.compile(
         r"(\s*)try:.*?with open\(checkpoint_path, 'w'\).*?except:.*?pass",
         re.DOTALL
@@ -105,7 +105,6 @@ def objective(trial):
     
     script_path = create_trial_script(trial, trial_dir, mode=MODE)
     
-    # ★修正: 4つのパラメータすべてを表示するように変更
     print(f"\n[Trial {trial.number}] MODE={MODE}")
     print(f"  REWARD_SURVIVAL_SCALE:    {trial.params['REWARD_SURVIVAL_SCALE']:.4f}")
     print(f"  PENALTY_STAGNATION_FORCE: {trial.params['PENALTY_STAGNATION_FORCE']:.4f}")
