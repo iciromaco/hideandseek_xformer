@@ -1,12 +1,16 @@
 # main21_layer0_runner.py
 # 演習第21回：サブサンプション・アーキテクチャ Layer 0 (逃走)
 #
-# 【修正(v21.49)】
-# - ログ密度の正常化:
-#   - SPS, Entropy, 各種Lossを毎Update WandB(TensorBoard)に記録するように修正。
-#   - エピソードデータ(Return, Length)も消失を防ぐため、データがある毎Update記録。
-#   - コンソールへの print 出力のみ 10 Update ごとに制限し、視認性を確保。
-# - インポートパス解決・モデル切り替えロジックは維持。
+# 【修正(v21.54)】
+# - バグ修正:
+#   - _is_visible_cached および _get_obs 内で発生していた NameError (FOV_DEG) を修正。
+#   - FOV_DEG = 135 を設定セクションに追加。
+# - 高速化資産の完全復元 (v21.53を継承):
+#   1. main18 で効果を証明した「RayCastキャッシュ」を全判定箇所に適用。
+#   2. main18 の「ダブルバッファ版 ObsHistory」を復元。roll/cat を廃止しゼロコピー化。
+# - 指摘への対応:
+#   - 判定対象エージェント数は main18 と同じであることを前提に、処理効率を極大化。
+# - 実行環境: Mac(Apple Silicon)に合わせ、不要なスレッド制限を排除しつつ Worker は CPU 固定。
 #
 # 【実行準備】
 # main18_optimization.py が同じフォルダに必要です。
@@ -35,7 +39,7 @@ for _ in range(4):
 # ベース設定のインポート
 try:
     import main18_optimization as base_config
-    from main18_optimization import HideAndSeekEnv, Agent, ObsHistory
+    from main18_optimization import HideAndSeekEnv, Agent
 except ImportError:
     print(f"Error: main18_optimization.py not found in sys.path.")
     exit(1)
@@ -45,24 +49,27 @@ except ImportError:
 # ==========================================
 EXPERIMENT_NAME = "HideAndSeek_Layer0_Runner"
 
-# ★実行制御設定 (Optunaから書き換え対象)
-EXECUTION_MODE = "TRAIN" 
+EXECUTION_MODE = "PLAY" # "TRAIN" 
 LOAD_EXISTING_MODELS = True
 SAVE_MODEL = True
 TRACK_WANDB = True           
 FIXED_SEED = None
 
-TOTAL_TIMESTEPS = 1000000 
+TOTAL_TIMESTEPS = 5000000 
 NUM_ENVS = 8
 NUM_STEPS = 128
-LEARNING_RATE = 3e-4
-ENT_COEF = 0.001
+LEARNING_RATE = 0.00048501082775358824 # 3e-4
+ENT_COEF = 8.743739859758232e-05 #0.001
 
-# ★報酬設定
+# ★報酬設定 (Runner特化)
 REWARD_DISTANCE_DIFF_SCALE = 0.0 
-REWARD_SURVIVAL_SCALE = 5.0      
+REWARD_SURVIVAL_SCALE = 1.29127560264504 # 5.0      
 PENALTY_CAPTURE = -100.0         
-PENALTY_STAGNATION_FORCE = -0.1  
+PENALTY_STAGNATION_FORCE = -1.7194105348987463 # -0.1  
+
+# 環境定数
+FOV_DEG = 135 # ★追加: NameError回避のため定義
+RAYCAST_CACHE_POS_THRESH = 0.05
 
 # 親クラスの報酬無効化
 base_config.REWARD_SURVIVAL = 0.0
@@ -75,41 +82,198 @@ base_config.MODEL_PATH_HIDER = f"{EXPERIMENT_NAME}_HIDER.pt"
 device = torch.device("cuda" if torch.cuda.is_available() and base_config.CUDA else "cpu")
 
 # ==========================================
-# 2. 環境クラスの拡張 (Layer0RunnerEnv)
+# 2. 高速化データ構造 (main18より復元)
+# ==========================================
+class ObsHistory:
+    """ダブルバッファリングによるゼロコピー履歴管理 (SPS向上の鍵)"""
+    def __init__(self, num_envs, seq_len, obs_dim, device):
+        self.buffer = torch.zeros((num_envs, seq_len * 2, obs_dim), device=device)
+        self.device = device
+        self.ptr = 0
+        self.seq_len = seq_len
+
+    def reset(self):
+        self.buffer.zero_()
+        self.ptr = 0
+
+    def update(self, obs):
+        obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        if obs_tensor.ndim == 1:
+            obs_tensor = obs_tensor.unsqueeze(0)
+        # 現在位置と、seq_len分先の2箇所に書き込むことで、常に連続したスライスとして取得可能にする
+        self.buffer[:, self.ptr] = obs_tensor
+        self.buffer[:, self.ptr + self.seq_len] = obs_tensor
+        self.ptr = (self.ptr + 1) % self.seq_len
+
+    def get(self):
+        # メモリコピーなしで直近 seq_len 分を返す
+        return self.buffer[:, self.ptr : self.ptr + self.seq_len]
+
+# ==========================================
+# 3. 環境クラスの拡張 (Layer0RunnerEnv)
 # ==========================================
 class Layer0RunnerEnv(HideAndSeekEnv):
     def __init__(self, render_mode=None):
         super().__init__(render_mode=render_mode)
         self.prev_dist_to_seeker = {}
-        self.h1_geoms_set = set([i for i in range(self.model.ngeom) if "hider1" in self.model.geom(i).name])
-        self.h2_geoms_set = set([i for i in range(self.model.ngeom) if "hider2" in self.model.geom(i).name])
-        self.s0_geoms_set = set(self.s0_geoms)
+        
+        # Workerプロセス内ではCPUデバイスを使用して通信オーバーヘッドを抑制
+        worker_device = torch.device("cpu")
         self.npc_obs_history = {
-            0: ObsHistory(1, base_config.TRANSFORMER_SEQ_LEN, 53, device),
-            1: ObsHistory(1, base_config.TRANSFORMER_SEQ_LEN, 53, device),
-            2: ObsHistory(1, base_config.TRANSFORMER_SEQ_LEN, 53, device),
+            0: ObsHistory(1, base_config.TRANSFORMER_SEQ_LEN, 53, worker_device),
+            1: ObsHistory(1, base_config.TRANSFORMER_SEQ_LEN, 53, worker_device),
+            2: ObsHistory(1, base_config.TRANSFORMER_SEQ_LEN, 53, worker_device),
         }
+
+        # ★RayCastキャッシュ (main18より移植)
+        self.raycast_cache = {}  # (agent_id, target_id) -> (hp, tp, hit_id)
+        self.raycast_stats = {"hits": 0, "misses": 0}
+        self.visible_cache = {}
+
+    def reset_raycast_stats(self):
+        self.raycast_stats = {"hits": 0, "misses": 0}
+
+    def get_raycast_stats(self):
+        return self.raycast_stats
+
+    def _get_obs(self, agent_id):
+        """高速化版観測取得"""
+        if agent_id == 0: b_id, p_pref = self.s0_body, 's'
+        elif agent_id == 1: b_id, p_pref = self.h1_body, 'h1'
+        else: b_id, p_pref = self.h2_body, 'h2'
+        
+        hp, hra = self.data.xpos[b_id][:2], self.data.qpos[self.model.jnt_qposadr[self.model.joint(f'{p_pref}_rot').id]]
+        c, s = np.cos(-hra), np.sin(-hra); rot_mat = np.array([[c, -s], [s, c]])
+        dof = self.model.jnt_dofadr[self.model.joint(f'{p_pref}_x').id]
+        h_raw_vel = self.data.qvel[dof : dof+2]
+        h_local_vel = rot_mat @ h_raw_vel
+        self_s = np.concatenate([h_local_vel / 12.0, [hra, np.cos(hra), np.sin(hra)]])
+        
+        # Lidar (mj_ray自体は軽量だが呼び出し回数を考慮)
+        lidar = np.zeros(len(self.lidar_angles), dtype=np.float32)
+        geomid = np.zeros(1, dtype=np.int32)
+        for i, angle_offset in enumerate(self.lidar_angles):
+            beam_dir = angle_offset + hra
+            direction = np.array([np.cos(beam_dir), np.sin(beam_dir), 0.0], dtype=np.float64)
+            dist = mujoco.mj_ray(self.model, self.data, np.array([hp[0], hp[1], 0.5], dtype=np.float64), direction, None, 1, b_id, geomid)
+            lidar[i] = min(dist, 2.5)/2.5 if dist != -1 else 1.0
+
+        # --- RayCast視界キャッシュ判定 ---
+        self.visible_cache.clear()
+        targets = [self.box1_body, self.box2_body, self.ramp_body, self.h1_body, self.h2_body, self.s0_body]
+        targets = [t for t in targets if t != b_id]
+        
+        target_dists = []
+        for t in targets:
+            d = np.linalg.norm(self.data.xpos[t][:2] - hp)
+            target_dists.append((d, t))
+        target_dists.sort(key=lambda x: x[0], reverse=True) # 遠い順
+
+        for _, tid in target_dists:
+            if tid in self.visible_cache: continue
+            tp_vec = self.data.xpos[tid]
+            target_pos = tp_vec[:2]
+            
+            # FOVチェック
+            diff = target_pos - hp; dist = np.linalg.norm(diff)
+            if dist < 0.1: is_in_fov = True
+            else:
+                angle = (np.arctan2(diff[1], diff[0]) - hra + np.pi)%(2*np.pi)-np.pi
+                is_in_fov = abs(angle) <= np.deg2rad(FOV_DEG / 2.0)
+            
+            if not is_in_fov:
+                self.visible_cache[tid] = False; continue
+
+            # キャッシュチェック
+            cache_key = (agent_id, tid)
+            hit_id = None; should_raycast = True
+            if cache_key in self.raycast_cache:
+                c_hp, c_tp, c_hid = self.raycast_cache[cache_key]
+                if np.linalg.norm(hp - c_hp) < RAYCAST_CACHE_POS_THRESH and np.linalg.norm(target_pos - c_tp) < RAYCAST_CACHE_POS_THRESH:
+                    hit_id = c_hid; should_raycast = False; self.raycast_stats["hits"] += 1
+            
+            if should_raycast:
+                self.raycast_stats["misses"] += 1
+                dr = np.array([diff[0]/dist, diff[1]/dist, 0.0], dtype=np.float64)
+                gid = np.zeros(1, dtype=np.int32)
+                res = mujoco.mj_ray(self.model, self.data, np.array([hp[0], hp[1], 0.5], dtype=np.float64), dr, None, 1, b_id, gid)
+                if res != -1:
+                    h_body = self.model.geom_bodyid[gid[0]]
+                    if h_body == tid: hit_id = tid
+                    elif res < dist - 0.4: hit_id = h_body
+                    else: hit_id = tid
+                self.raycast_cache[cache_key] = (hp.copy(), target_pos.copy(), hit_id)
+            
+            is_vis = (hit_id == tid)
+            self.visible_cache[tid] = is_vis
+            if not is_vis and hit_id is not None and hit_id in targets:
+                self.visible_cache[hit_id] = True
+
+        def get_rel_info(target_id, lock=None):
+            if self.visible_cache.get(target_id, False):
+                tp = self.data.xpos[target_id]
+                rel_p = rot_mat @ (tp[:2] - hp) / 12.0
+                q = self.data.xquat[target_id]; yaw = np.arctan2(2*(q[0]*q[3]+q[1]*q[2]), 1-2*(q[2]**2+q[3]**2))
+                tv = self.data.qvel[self.model.body_jntadr[target_id]:self.model.body_jntadr[target_id]+2] if self.model.body_jntadr[target_id] != -1 else np.zeros(2)
+                rel_v = rot_mat @ (tv - self.data.qvel[dof:dof+2]) / 12.0
+                info = [rel_p, rel_v, [np.cos(yaw-hra), np.sin(yaw-hra)]]
+                if lock is not None: info.append([1.0 if lock else 0.0])
+                info.append([1.0]); return np.concatenate(info)
+            return np.zeros(8 if lock is not None else 7, dtype=np.float32)
+
+        if agent_id == 0:
+            h1 = get_rel_info(self.h1_body)[:5]; h2 = get_rel_info(self.h2_body)[:5]
+            objs = [get_rel_info(self.box1_body, self.locked_boxes[self.box1_body]), get_rel_info(self.box2_body, self.locked_boxes[self.box2_body]), get_rel_info(self.ramp_body)]
+            return np.concatenate([self_s, lidar, *objs, h1, h2, np.zeros(3, dtype=np.float32)]).astype(np.float32)
+        
+        partner = self.h2_body if agent_id == 1 else self.h1_body
+        enemy = get_rel_info(self.s0_body)[:5]; friend = get_rel_info(partner)
+        st = np.array([1.0 if self.grasping[agent_id] else 0.0], dtype=np.float32)
+        objs = [get_rel_info(self.box1_body, self.locked_boxes[self.box1_body]), get_rel_info(self.box2_body, self.locked_boxes[self.box2_body]), get_rel_info(self.ramp_body)]
+        return np.concatenate([self_s, lidar, *objs, enemy, friend, st]).astype(np.float32)
+
     def _get_current_dist(self):
         h1p = self.data.xpos[self.h1_body][:2]
         h2p = self.data.xpos[self.h2_body][:2]
         sp = self.data.xpos[self.s0_body][:2]
         return np.linalg.norm((h1p if self.learning_agent_id == 1 else h2p) - sp)
 
+    def _update_seeker_state(self):
+        sp, sr = self.data.xpos[self.s0_body][:2], self.data.qpos[self.srot_adr]
+        # キャッシュ判定を利用するように修正
+        _ = self._get_obs(0) 
+        v1 = self.visible_cache.get(self.h1_body, False)
+        v2 = self.visible_cache.get(self.h2_body, False)
+        
+        if v1 or v2:
+            self.seeker_target_pos = self.data.xpos[self.h1_body if v1 else self.h2_body][:2].copy()
+            self.seeker_last_known_pos, self.seeker_mode = self.seeker_target_pos.copy(), "CHASING"
+        elif self.seeker_last_known_pos is not None:
+            if np.linalg.norm(sp - self.seeker_last_known_pos) > 0.5:
+                self.seeker_target_pos, self.seeker_mode = self.seeker_last_known_pos, "SEARCHING"
+            else:
+                self.seeker_last_known_pos, self.seeker_search_timer = None, 50
+        else:
+            if self.seeker_search_timer <= 0: self.seeker_random_target, self.seeker_search_timer = self.np_random.uniform(-4, 4, 2), 80
+            self.seeker_search_timer -= 1; self.seeker_target_pos, self.seeker_mode = self.seeker_random_target, "PATROLLING"
+
     def _seeker_rule_based_policy(self):
-        target_pos = self.seeker_target_pos
-        if self.current_step < PREP_STEPS or target_pos is None: return 0.0, 0.0
-        if self.seeker_mode == "SCANNING": return 0.0, 1.0
-        sp = self.data.xpos[self.s0_body][:2]; sr = self.data.qpos[self.srot_adr]
-        dy = float(target_pos[1] - sp[1]); dx = float(target_pos[0] - sp[0])
-        desired_angle = np.arctan2(dy, dx); angle_diff = (desired_angle - float(sr) + np.pi) % (2*np.pi) - np.pi
-        thrust = SEEKER_RB_THRUST; steering = np.clip(angle_diff * 6.0, -3.0, 3.0)
-        if abs(angle_diff) > SEEKER_RB_TURN_THRESH: thrust *= 0.3
-        sx_dof = self.model.jnt_dofadr[self.model.joint('s_x').id]; s_vel = np.linalg.norm(self.data.qvel[sx_dof : sx_dof+2])
-        if thrust > 0.05 and s_vel < 0.05: self.s0_stuck_timer += 1
-        else: self.s0_stuck_timer = 0
-        if self.s0_stuck_timer > 20: self.s0_recovery_mode = 15; self.s0_stuck_timer = 0
-        if self.s0_recovery_mode > 0: thrust = -0.2; steering = 1.5; self.s0_recovery_mode -= 1
-        return float(thrust), float(steering)
+        if self.current_step < base_config.PREP_STEPS: return 0.0, 0.0
+        sp, sr = self.data.xpos[self.s0_body][:2], self.data.qpos[self.srot_adr]
+        ad = (np.arctan2(self.seeker_target_pos[1]-sp[1], self.seeker_target_pos[0]-sp[0]) - sr + np.pi)%(2*np.pi)-np.pi
+        
+        sx_dof = self.model.jnt_dofadr[self.model.joint('s_x').id]
+        s_vel = np.linalg.norm(self.data.qvel[sx_dof : sx_dof+2])
+        sf = base_config.SEEKER_RB_THRUST
+        sr_val = np.clip(ad * 6.0, -3.0, 3.0)
+        
+        if abs(ad) > base_config.SEEKER_RB_TURN_THRESH: sf *= 0.3
+        if sf > 0.05 and s_vel < 0.05: self.s0_stuck_timer += 5
+        else: self.s0_stuck_timer = max(0, self.s0_stuck_timer - 1)
+        
+        if self.s0_stuck_timer > 15: self.s0_recovery_mode = 15; self.s0_stuck_timer = 0
+        if self.s0_recovery_mode > 0: sf = -0.2; sr_val = 1.5; self.s0_recovery_mode -= 1
+        return sf, sr_val
 
     def reset(self, seed=None, options=None):
         obs, info = super().reset(seed=seed, options=options)
@@ -118,54 +282,56 @@ class Layer0RunnerEnv(HideAndSeekEnv):
         
     def step(self, action):
         self.current_step += 1
-        for i in [1, 2]:
-            if self.lock_cooldown[i] > 0: self.lock_cooldown[i] -= 1
+        for i in [1, 2]: self.lock_cooldown[i] = max(0, self.lock_cooldown[i]-1)
         self._update_seeker_state()
         prev_dist = self.prev_dist_to_seeker.get(self.learning_agent_id, 0.0)
         idx_main = 2 if self.learning_agent_id == 1 else 4
         self.data.ctrl[:] = 0.0 
+        
         self.data.ctrl[idx_main:idx_main+2] = [float(action[0]) * base_config.HIDER_THRUST_LIMIT, float(action[1])]
         self._apply_action(self.learning_agent_id, action)
+
         partner_id = 2 if self.learning_agent_id == 1 else 1
         pidx = 4 if partner_id == 2 else 2
         act_npc = self._get_npc_action(partner_id, "HIDER")
         self.data.ctrl[pidx:pidx+2] = [float(act_npc[0]) * base_config.HIDER_THRUST_LIMIT, float(act_npc[1])]
         self._apply_action(partner_id, act_npc)
+
         sf0, sr0 = self._seeker_rule_based_policy()
         self.data.ctrl[0:2] = [sf0, sr0]
-        for _ in range(ACTION_REPEAT):
+
+        for _ in range(base_config.ACTION_REPEAT):
             for box, pose in self.locked_pose.items():
                 if self.locked_boxes[box]:
                     bid = self.box1_joint_id if box==self.box1_body else self.box2_joint_id
                     self.data.qpos[self.model.jnt_qposadr[bid]:self.model.jnt_qposadr[bid]+7] = pose
                     self.data.qvel[self.model.jnt_dofadr[bid]:self.model.jnt_dofadr[bid]+6] = 0
             mujoco.mj_step(self.model, self.data)
+
         current_dist = self._get_current_dist(); self.prev_dist_to_seeker[self.learning_agent_id] = current_dist
         reward = (current_dist - prev_dist) * REWARD_DISTANCE_DIFF_SCALE
+        
         captured_self = False; captured_any = False
         for i in range(self.data.ncon):
-            c = self.data.contact[i]; g1, g2 = c.geom1, c.geom2
-            h_id = None
-            if g1 in self.s0_geoms_set:
-                if g2 in self.h1_geoms_set: h_id = 1
-                elif g2 in self.h2_geoms_set: h_id = 2
-            elif g2 in self.s0_geoms_set:
-                if g1 in self.h1_geoms_set: h_id = 1
-                elif g1 in self.h2_geoms_set: h_id = 2
-            if h_id is not None:
+            c = self.data.contact[i]; n1, n2 = self.model.geom(c.geom1).name, self.model.geom(c.geom2).name
+            if ("seeker" in n1 and "hider" in n2) or ("seeker" in n2 and "hider" in n1):
                 captured_any = True
-                if h_id == self.learning_agent_id: captured_self = True
+                if ("hider1" in n1 or "hider1" in n2) and self.learning_agent_id == 1: captured_self = True
+                if ("hider2" in n1 or "hider2" in n2) and self.learning_agent_id == 2: captured_self = True
                 if captured_self: break
+                
         if max(abs(self.data.xpos[self.h1_body if self.learning_agent_id==1 else self.h2_body][:2])) > 6.5: captured_self = True; captured_any = True
         if captured_self: reward += PENALTY_CAPTURE
         else: reward += REWARD_SURVIVAL_SCALE
+        
         dof_adr = self.model.jnt_dofadr[self.model.joint('h1_x' if self.learning_agent_id==1 else 'h2_x').id]
         if np.linalg.norm(self.data.qvel[dof_adr:dof_adr+2]) < 0.1: reward += PENALTY_STAGNATION_FORCE
-        terminated = captured_any or (self.current_step >= MAX_STEPS)
+        
+        terminated = captured_any or (self.current_step >= base_config.MAX_STEPS)
         return self._get_obs(self.learning_agent_id), reward, terminated, False, {}
 
 # ==========================================
-# 3. メイン処理
+# 4. メイン処理
 # ==========================================
 def main():
     print(f"--- Layer 0 Training: {EXPERIMENT_NAME} ---")
@@ -197,19 +363,15 @@ def main():
     # --- TRAIN モード ---
     run_name = f"{EXPERIMENT_NAME}_{int(time.time())}"
     if TRACK_WANDB:
-        wandb.init(
-            project=base_config.WANDB_PROJECT_NAME,
-            entity=base_config.WANDB_ENTITY,
-            sync_tensorboard=True,
-            config={"layer": 0, "mode": "runner_optimized_logging"},
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
+        wandb.init(project=base_config.WANDB_PROJECT_NAME, entity=base_config.WANDB_ENTITY, sync_tensorboard=True, config={"layer": 0, "mode": "runner_v21.53"}, name=run_name, monitor_gym=True, save_code=True)
     writer = SummaryWriter(f"runs/{run_name}")
 
     def make_env():
-        env = Layer0RunnerEnv(); env = gym.wrappers.RecordEpisodeStatistics(env); return env
+        env = Layer0RunnerEnv(); env = gym.wrappers.RecordEpisodeStatistics(env)
+        env.get_raycast_stats = env.env.get_raycast_stats
+        env.reset_raycast_stats = env.env.reset_raycast_stats
+        return env
+    
     envs = gym.vector.AsyncVectorEnv([make_env for _ in range(NUM_ENVS)])
     agent = Agent(envs.single_observation_space.shape[0], envs.single_action_space.shape[0]).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=LEARNING_RATE, eps=1e-5)
@@ -226,7 +388,9 @@ def main():
                 data = json.load(f); global_step = data.get('global_step', 0); start_global_step = global_step
         print(f"  -> Resumed from step {global_step}")
     
+    # ★高速化版 ObsHistory (ダブルバッファ)
     obs_history = ObsHistory(NUM_ENVS, base_config.TRANSFORMER_SEQ_LEN, envs.single_observation_space.shape[0], device)
+    
     obs = torch.zeros((NUM_STEPS, NUM_ENVS, base_config.TRANSFORMER_SEQ_LEN, envs.single_observation_space.shape[0]), device=device)
     actions = torch.zeros((NUM_STEPS, NUM_ENVS) + envs.single_action_space.shape, device=device)
     logprobs = torch.zeros((NUM_STEPS, NUM_ENVS), device=device); rewards = torch.zeros((NUM_STEPS, NUM_ENVS), device=device)
@@ -251,7 +415,6 @@ def main():
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
                 next_done = torch.tensor(next_done).to(device, dtype=torch.float32)
                 
-                # エピソードデータの収集 (消失を防ぐため毎ステップチェック)
                 if "episode" in infos:
                     mask = infos.get("_episode", [True] * len(infos["episode"]))
                     if isinstance(infos["episode"], dict) and "r" in infos["episode"]:
@@ -261,7 +424,6 @@ def main():
                                 episodic_lengths.append(infos["episode"]["l"][i])
                 obs_history.update(next_obs)
 
-            # GAE / PPO Update (計算部分は変更なし)
             with torch.no_grad():
                 next_v = agent.get_value(obs_history.get()).reshape(1, -1)
                 advantages = torch.zeros_like(rewards).to(device); lastgaelam = 0
@@ -276,6 +438,7 @@ def main():
             b_logprobs = logprobs.reshape(-1); b_actions = actions.reshape((-1, envs.single_action_space.shape[0]))
             b_advantages = advantages.reshape(-1); b_returns = returns.reshape(-1); b_values = values.reshape(-1)
             b_inds = np.arange(NUM_STEPS * NUM_ENVS)
+            
             for epoch in range(base_config.UPDATE_EPOCHS):
                 np.random.shuffle(b_inds)
                 for start in range(0, NUM_STEPS * NUM_ENVS, base_config.MINIBATCH_SIZE):
@@ -289,28 +452,37 @@ def main():
                     loss = pg_loss - ENT_COEF * entropy.mean() + base_config.VF_COEF * v_loss
                     optimizer.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(agent.parameters(), base_config.MAX_GRAD_NORM); optimizer.step()
 
-            # ★修正: WandB(TensorBoard)への記録を毎Update実行するようにガードの外へ移動
+            # Logging
             elapsed = time.time() - start_time
             sps = int((global_step - start_global_step) / elapsed) if elapsed > 0 else 0
             
             writer.add_scalar("charts/SPS", sps, global_step)
             writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
             writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-            writer.add_scalar("losses/entropy", entropy.mean().item(), global_step) # エントロピーを毎Update記録
-            writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+            writer.add_scalar("losses/entropy", entropy.mean().item(), global_step)
             
-            # エピソードデータも存在すれば毎Update記録 (消失防止)
             if len(episodic_returns) > 0:
                 writer.add_scalar("charts/mean_episodic_return", np.mean(episodic_returns), global_step)
                 writer.add_scalar("charts/mean_episodic_length", np.mean(episodic_lengths), global_step)
 
-            # コンソールへの表示のみ 10回に 1回に制限
             if update % 10 == 0:
                 avg_ret = np.mean(episodic_returns) if episodic_returns else 0.0
                 avg_len = np.mean(episodic_lengths) if episodic_lengths else 0.0
-                print(f"Update {update}, Step {global_step}, Loss: {loss.item():.3f}, Entropy: {entropy.mean().item():.4f}, EpRet: {avg_ret:.2f}, EpLen: {avg_len:.1f}")
+                print(f"Update {update}, Step {global_step}, SPS: {sps}, Loss: {loss.item():.3f}, EpRet: {avg_ret:.2f}, EpLen: {avg_len:.1f}")
+
+                # RayCast統計の取得
+                try:
+                    stats_list = envs.call("get_raycast_stats")
+                    total_h = sum(s["hits"] for s in stats_list); total_m = sum(s["misses"] for s in stats_list)
+                    if (total_h + total_m) > 0:
+                        hr = 100 * total_h / (total_h + total_m)
+                        writer.add_scalar("charts/raycast_cache_hit_rate", hr, global_step)
+                        print(f"  -> RayCast Cache Hit Rate: {hr:.1f}%")
+                    envs.call("reset_raycast_stats")
+                except: pass
 
     except KeyboardInterrupt: print("Training interrupted.")
+    
     if SAVE_MODEL:
         torch.save(agent.state_dict(), model_path)
         try:
@@ -318,7 +490,7 @@ def main():
             print(f"Model saved to {model_path}")
         except: pass
     else: print("★ Model saving skipped")
-    envs.close(); writer.close(); 
+    envs.close(); writer.close()
     if TRACK_WANDB: wandb.finish()
 
 if __name__ == "__main__":
