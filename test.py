@@ -1,4 +1,4 @@
-# main19_reward_optimization.py
+# main19_reward_optimizationV2.py
 # 演習第19回：Optunaによる報酬パラメータの自動最適化 (v2.10 - Syntax Fix)
 #
 # 【修正点】

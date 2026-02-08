@@ -1,22 +1,5 @@
-# main19_reward_optimization.py
-# 演習第19回：Optunaによる報酬パラメータの自動最適化 (v3.0)
-#
-# 【方針変更】
-# 距離報酬が「局所解（逃げずに稼ぐ）」の原因となっている可能性があるため、
-# 距離報酬を廃止(0.0)し、純粋な「生存報酬」の最大化を目指します。
-# 代わりに、学習率(LR)とエントロピー係数(ENT)を調整対象に加え、
-# 「難しいタスクでも学習が進むパラメータ」を探します。
-#
-# 【探索対象】
-# 1. REWARD_SURVIVAL: 生存報酬 (0.1 ~ 5.0) ※大幅増額
-# 2. PENALTY_STAGNATION: 停滞ペナルティ (-2.0 ~ 0.0)
-# 3. LEARNING_RATE: 学習率 (1e-5 ~ 1e-3)
-# 4. ENT_COEF: エントロピー係数 (1e-5 ~ 1e-2)
-#
-# 【固定パラメータ】
-# - REWARD_DISTANCE_COEFF = 0.0 (廃止)
-#
-# 【実行準備】
+# main22_reward_optimization.py
+
 # uv add optuna pandas
 
 import os
@@ -62,13 +45,13 @@ def create_trial_script(trial, output_dir, mode="initial"):
     # --- 探索空間の定義 (v3.0) ---
     
     # 報酬: 生存を重視し、距離は廃止
-    reward_survival = trial.suggest_float("REWARD_SURVIVAL", 0.1, 5.0) # 上限を5.0に拡大
-    reward_distance = 0.0 # 廃止 (0.0固定)
-    penalty_stagnation = trial.suggest_float("PENALTY_STAGNATION", -2.0, 0.0)
+    reward_survival = trial.suggest_float("REWARD_SURVIVAL", 5.0, 20.0) # 上限を5.0に拡大
+    reward_distance = trial.suggest_float("REWARD_DISTANCE_COEFF", 0.5, 10.0)
+    penalty_stagnation = trial.suggest_float("PENALTY_STAGNATION", -5.0, -1.5)
     
     # 学習制御: ここが重要
-    lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    ent_coef = trial.suggest_float("ent_coef", 1e-5, 1e-2, log=True)
+    lr = trial.suggest_float("lr", 1e-4, 1e-3, log=True)
+    ent_coef = trial.suggest_float("ent_coef", 1e-5, 5e-2, log=True)
 
     # --- スクリプトの書き換え ---
     with open(TARGET_SCRIPT, "r", encoding="utf-8") as f:

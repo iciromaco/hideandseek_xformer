@@ -1,15 +1,4 @@
-# main21_optuna_search.py
-# 演習第21回：Layer 0 (逃走) 専用のパラメータ自動最適化
-#
-# 【修正(v21.56)】
-# - 報酬ロジック変更への追従:
-#   - REWARD_DISTANCE_DIFF_SCALE の探索範囲を上方修正 (0.5 ~ 10.0)。
-#   - 視界内のみという制約により、報酬が入りにくくなる（スパース化）ため、
-#     一回あたりの「逃走成功報酬」の価値を高めて学習を促進させます。
-# - 安定性・高速化対策の継続。
-#
-# 【実行準備】
-# uv add optuna pandas
+# main22_reward_optimizationV3.py
 
 import os
 import sys
@@ -42,10 +31,33 @@ def create_trial_script(trial, output_dir, mode="initial"):
 
     # --- 探索空間の定義 ---
     # 視界内限定になったため、報酬スケールを大きめに設定可能に
-    reward_survival = trial.suggest_float("REWARD_SURVIVAL_SCALE", 0.5, 10.0)
+    #reward_survival = trial.suggest_float("REWARD_SURVIVAL_SCALE", 0.5, 10.0)
+    #reward_dist_diff = trial.suggest_float("REWARD_DISTANCE_DIFF_SCALE", 0.5, 10.0)
+    #penalty_stagnation = trial.suggest_float("PENALTY_STAGNATION_FORCE", -5.0, -0.1)
+    #lr = trial.suggest_float("LEARNING_RATE", 5e-5, 5e-4, log=True) # 範囲をやや絞る
+    #ent_coef = trial.suggest_float("ENT_COEF", 1e-5, 5e-3, log=True)
+
+    # --- 探索空間の定義（提案） ---
+
+    # 1. 生存報酬：PDPが右肩上がりで上限に張り付いているため、上限を大きく引き上げる
+    # Previous: 0.5 ~ 10.0 -> New: 5.0 ~ 20.0
+    reward_survival = trial.suggest_float("REWARD_SURVIVAL_SCALE", 5.0, 20.0)
+
+    # 2. 距離報酬：影響度は低いが生存報酬とのバランスをとるため、範囲は維持または微増
+    # Previous: 0.5 ~ 10.0 -> New: 0.5 ~ 10.0 (変更なし、または微調整)
     reward_dist_diff = trial.suggest_float("REWARD_DISTANCE_DIFF_SCALE", 0.5, 10.0)
-    penalty_stagnation = trial.suggest_float("PENALTY_STAGNATION_FORCE", -5.0, -0.1)
-    lr = trial.suggest_float("LEARNING_RATE", 5e-5, 5e-4, log=True) # 範囲をやや絞る
+
+    # 3. 停滞ペナルティ：-3.0周辺が良い結果。極端な値を避けるため範囲を絞る
+    # Previous: -5.0 ~ -0.1 -> New: -5.0 ~ -1.5
+    penalty_stagnation = trial.suggest_float("PENALTY_STAGNATION_FORCE", -5.0, -1.5)
+
+    # 4. 学習率：推奨値(約6e-4)を含むように上限を引き上げ
+    # Previous: 5e-5 ~ 5e-4 -> New: 1e-4 ~ 1e-3 (log=True)
+    lr = trial.suggest_float("LEARNING_RATE", 1e-4, 1e-3, log=True)
+
+    # 5. エントロピー：GBRは低め(6e-5)、LRは高め(3e-3)を推奨。
+    # "Unlearning"を防ぐためにも下限は下げすぎず、現状の範囲を維持して探索させる
+    # Previous: 1e-5 ~ 5e-3 -> New: 1e-5 ~ 5e-3 (log=True) (維持)
     ent_coef = trial.suggest_float("ENT_COEF", 1e-5, 5e-3, log=True)
 
     with open(TARGET_SCRIPT, "r", encoding="utf-8") as f:

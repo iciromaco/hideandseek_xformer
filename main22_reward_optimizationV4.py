@@ -1,15 +1,4 @@
-# main21_optuna_search.py
-# 演習第21回：Layer 0 (逃走) 専用のパラメータ自動最適化
-#
-# 【修正(v21.56)】
-# - 報酬ロジック変更への追従:
-#   - REWARD_DISTANCE_DIFF_SCALE の探索範囲を上方修正 (0.5 ~ 10.0)。
-#   - 視界内のみという制約により、報酬が入りにくくなる（スパース化）ため、
-#     一回あたりの「逃走成功報酬」の価値を高めて学習を促進させます。
-# - 安定性・高速化対策の継続。
-#
-# 【実行準備】
-# uv add optuna pandas
+# main22_reward_optimizationV4.py
 
 import os
 import sys
@@ -42,11 +31,32 @@ def create_trial_script(trial, output_dir, mode="initial"):
 
     # --- 探索空間の定義 ---
     # 視界内限定になったため、報酬スケールを大きめに設定可能に
-    reward_survival = trial.suggest_float("REWARD_SURVIVAL_SCALE", 0.5, 10.0)
+    #reward_survival = trial.suggest_float("REWARD_SURVIVAL_SCALE", 0.5, 10.0)
+    #reward_dist_diff = trial.suggest_float("REWARD_DISTANCE_DIFF_SCALE", 0.5, 10.0)
+    #penalty_stagnation = trial.suggest_float("PENALTY_STAGNATION_FORCE", -5.0, -0.1)
+    #lr = trial.suggest_float("LEARNING_RATE", 5e-5, 5e-4, log=True) # 範囲をやや絞る
+    #ent_coef = trial.suggest_float("ENT_COEF", 1e-5, 5e-3, log=True)
+
+    # --- 探索空間の定義（V4提案） ---
+
+    # 1. 生存報酬：最適値(16-18)が判明したため、範囲を維持しつつ精度を高める
+    # Previous: 5.0 ~ 20.0 -> New: 10.0 ~ 22.0 (最適値を中心に)
+    reward_survival = trial.suggest_float("REWARD_SURVIVAL_SCALE", 10.0, 22.0)
+
+    # 2. 学習率：上限(1e-3)に張り付いているため、さらに引き上げる
+    # Previous: 1e-4 ~ 1e-3 -> New: 5e-4 ~ 5e-3 (log=True)
+    lr = trial.suggest_float("LEARNING_RATE", 5e-4, 5e-3, log=True)
+
+    # 3. エントロピー：GBRの影響度が最大。低値を強く推奨しているため高領域を捨てる
+    # Previous: 1e-5 ~ 5e-3 -> New: 1e-6 ~ 1e-4 (log=True)
+    ent_coef = trial.suggest_float("ENT_COEF", 1e-6, 1e-4, log=True)
+
+    # 4. 停滞ペナルティ：-1.7付近も視野に入れるため上限を緩和
+    # Previous: -5.0 ~ -1.5 -> New: -4.0 ~ -1.0
+    penalty_stagnation = trial.suggest_float("PENALTY_STAGNATION_FORCE", -4.0, -1.0)
+
+    # 5. 距離報酬：大きな変更なし
     reward_dist_diff = trial.suggest_float("REWARD_DISTANCE_DIFF_SCALE", 0.5, 10.0)
-    penalty_stagnation = trial.suggest_float("PENALTY_STAGNATION_FORCE", -5.0, -0.1)
-    lr = trial.suggest_float("LEARNING_RATE", 5e-5, 5e-4, log=True) # 範囲をやや絞る
-    ent_coef = trial.suggest_float("ENT_COEF", 1e-5, 5e-3, log=True)
 
     with open(TARGET_SCRIPT, "r", encoding="utf-8") as f:
         content = f.read()
