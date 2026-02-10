@@ -1,0 +1,172 @@
+# main23_analysis.py
+# 演習第23回：報酬パラメータと隠蔽性能の多角的回帰分析 (v24.21)
+#
+# 【修正内容】
+# 1. 表形式レポートの復活: 全てのモデルの結果を整形された表としてコンソール表示＆ファイル保存。
+# 2. 3つの回帰手法を統合: 線形回帰(LR)、勾配ブースティング(GBR)、ガウス過程(GPR)をすべて実行。
+# 3. PDPグラフの完全強化: 全ての手法において 2x2 の PDP グラフを生成し、最大値をマーク。
+# 4. ログスケール対応: LEARNING_RATE, ENT_COEF の対数変換を適切に処理。
+
+import os
+import sys
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+# 機械学習ライブラリ
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+from sklearn.inspection import partial_dependence
+
+# ==========================================
+# 1. 実験設定
+# ==========================================
+# ★実行モード設定: 探索スクリプトの MODE と一致させてください
+MODE = "refinement" # initial" 
+
+RESULTS_DIR = Path("./optuna_results_layer23")
+CSV_PATH = RESULTS_DIR / f"results_{MODE}.csv"
+OUTPUT_DIR = RESULTS_DIR / "analysis_reports"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def analyze():
+    print(f"--- Multi-Model Analysis Phase: {MODE} ---")
+    
+    if not CSV_PATH.exists():
+        print(f"Error: {CSV_PATH} が見つかりません。")
+        print("先に main23_optuna_search.py を実行して結果を生成してください。")
+        return
+
+    # 1. データの読み込み
+    df = pd.read_csv(CSV_PATH)
+    
+    # OptunaのCSV列名（params_...）を分析用に変換
+    param_map = {
+        'params_ENT_COEF': 'Entropy',
+        'params_LEARNING_RATE': 'LR',
+        'params_REWARD_HIDDEN_BONUS': 'Hidden_Bonus',
+        'params_COS_PENALTY_SCALE': 'Cos_Penalty',
+        'value': 'Score'
+    }
+    df = df.rename(columns=param_map)
+    df = df.dropna(subset=['Score'])
+    
+    if len(df) < 5:
+        print("データ数が少なすぎるため、分析を中断します。")
+        return
+
+    print(f"Loaded {len(df)} trials. Best Score: {df['Score'].max():.1f}")
+
+    # 2. 特徴量作成（LR, Entropy は対数スケールに変換）
+    features = ['Entropy', 'LR', 'Hidden_Bonus', 'Cos_Penalty']
+    X = df[features].copy()
+    X['LR'] = np.log10(X['LR'] + 1e-10)
+    X['Entropy'] = np.log10(X['Entropy'] + 1e-10)
+    y = df['Score'].values
+
+    # 3. モデルの定義
+    models = {
+        "LR": Pipeline([('s', StandardScaler()), ('r', LinearRegression())]),
+        "GBR": GradientBoostingRegressor(n_estimators=100, random_state=42),
+        "GPR": GaussianProcessRegressor(
+            kernel=C(1.0, (1e-3, 1e8)) * RBF(length_scale=[1.0]*4, length_scale_bounds=(1e-2, 1e8)) + 
+                   WhiteKernel(noise_level=1, noise_level_bounds=(1e-8, 1e5)),
+            normalize_y=True, n_restarts_optimizer=10, random_state=42
+        )
+    }
+
+    # 全モデルのレポート内容を蓄積するリスト
+    summary_reports = []
+
+    # 4. 各モデルの実行とPDPの描画
+    for name, model in models.items():
+        print(f"  Training and Analyzing model: {name}...")
+        model.fit(X.values, y)
+        
+        # 2x2 のタイル状プロットを作成
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        axes = axes.ravel()
+
+        # 表形式用のヘッダー
+        report_lines = []
+        report_lines.append(f"\n{'='*75}")
+        report_lines.append(f"{f' ANALYSIS REPORT ({name} Model) ':^75}")
+        report_lines.append(f"{'='*75}")
+        report_lines.append(f"{'Param Name':<15} | {'Best Value':<15} | {'Impact (Steps)':<15}")
+        report_lines.append(f"{'-'*15}-|-{'-'*15}-|-{'-'*15}")
+
+        for i, f_name in enumerate(features):
+            ax = axes[i]
+            
+            # 部分依存性 (PDP) の計算
+            pdp_out = partial_dependence(model, X.values, [i], kind='average', grid_resolution=100)
+            x_raw = pdp_out['grid_values'][0]
+            y_pdp = pdp_out['average'][0]
+            
+            # 対数を元のスケールに戻す
+            is_log = f_name in ['LR', 'Entropy']
+            x_plot = 10**x_raw if is_log else x_raw
+            
+            # ピーク値（理論上の最適解）の特定
+            best_idx = np.argmax(y_pdp)
+            best_x = x_plot[best_idx]
+            best_y = y_pdp[best_idx]
+            impact = np.max(y_pdp) - np.min(y_pdp)
+            
+            # 表への追加
+            label_fmt = f"{best_x:.2e}" if is_log else f"{best_x:.3f}"
+            report_lines.append(f"{f_name:<15} | {label_fmt:<15} | {impact:15.2f}")
+
+            # グラフ描画
+            ax.plot(x_plot, y_pdp, color='tab:blue', linewidth=2.5, label='Estimated Trend')
+            ax.fill_between(x_plot, y_pdp - 1.0, y_pdp + 1.0, color='tab:blue', alpha=0.1)
+            
+            # 最大値のマーキング
+            ax.scatter([best_x], [best_y], color='red', s=80, zorder=5, edgecolors='white')
+            ax.annotate(f"Best: {label_fmt}\n({best_y:.1f} steps)", 
+                        xy=(best_x, best_y), xytext=(10, 10),
+                        textcoords='offset points', color='red', fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='red', alpha=0.7))
+
+            ax.set_title(f"{f_name} (via {name})", fontsize=13, fontweight='bold')
+            ax.set_ylabel('Estimated Hidden Steps')
+            ax.grid(True, which="both", ls="-", alpha=0.4)
+            if is_log: ax.set_xscale('log')
+
+        plt.suptitle(f"Partial Dependence Plots: {name} Regression ({MODE})", fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        save_path = OUTPUT_DIR / f"pdp_1d_{name}_{MODE}.png"
+        plt.savefig(save_path, dpi=300)
+        plt.close()
+
+        # レポートの結合
+        full_report = "\n".join(report_lines)
+        print(full_report)
+        summary_reports.append(full_report)
+
+    # 5. 全モデルの統合テキストレポート保存
+    summary_file = OUTPUT_DIR / f"summary_report_{MODE}.txt"
+    with open(summary_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_reports))
+    
+    # 6. 相関行列の保存
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(df[list(param_map.values())].corr(), annot=True, cmap='RdBu_r', center=0)
+    plt.title(f"Parameter Correlation ({MODE})")
+    corr_path = OUTPUT_DIR / f"correlation_{MODE}.png"
+    plt.savefig(corr_path)
+    plt.close()
+
+    print(f"\n[Done] すべての分析結果が {OUTPUT_DIR} に保存されました。")
+    print(f"テキスト形式のサマリー: {summary_file.name}")
+
+if __name__ == "__main__":
+    analyze()

@@ -64,7 +64,7 @@ CUDA = True                 # True: GPU使用 / False: CPU使用
 
 device = torch.device("cuda" if torch.cuda.is_available() and CUDA else "cpu")
 
-TRAIN_MODE = False         # True: 学習 / False: 推論         
+TRAIN_MODE = True         # True: 学習 / False: 推論         
 USE_VIEWER = False        # Trueにすると強制的に環境数=1になります
 TRACK_WANDB = True        # True: WandBで実験追跡 / False: ログなし
 
