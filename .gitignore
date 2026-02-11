@@ -6,3 +6,5 @@ sensitivity_results/
 sensitivity_results_multiseed/
 optuna_temp/
 optuna_results/trial_*/*
+*.pt
+*.json
