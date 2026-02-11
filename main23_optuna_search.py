@@ -1,12 +1,12 @@
 # main23_optuna_search.py
 # 演習第23回：Optunaによるハイパーパラメータ探索 (中間保存・モデル汚染防止版)
 #
-# 【修正内容 (v2.6)】
-# 1. 中間保存ロジック (Save Callback) の追加:
-#    - 試行が1回完了するたびに結果を CSV に書き出すコールバック関数を実装。
-#    - これにより、プログラムを途中で強制終了しても、それまでの結果が results_{MODE}.csv に残ります。
-# 2. 探索継続性の保証:
-#    - SQLite データベースを使用しているため、再実行時には前回の続きから自動的に再開されます。
+# 【修正内容 (v2.7)】
+# 1. 最適化対象の変更:
+#    - 最適化対象: LEARNING_RATE, ENT_COEF, REWARD_HIDDEN_BONUS, REWARD_DISTANCE_DIFF_SCALE
+#    - 固定値: COS_PENALTY_SCALE = 2.0 (最適化対象から除外)
+# 2. 中間保存ロジック (Save Callback) の維持:
+#    - 試行が1回完了するたびに結果を CSV に書き出し、中断時のデータ損失を防止。
 # 3. 既存の安全策を維持:
 #    - 各試行でのモデル保存禁止 (SAVE_MODEL = False) によるモデル汚染防止。
 #    - 試行終了後の作業ディレクトリ自動削除。
@@ -81,14 +81,20 @@ def objective(trial):
     
     # --- A. パラメータの提案 ---
     if MODE == "initial":
+        # 学習制御パラメータ (初期学習用)
         lr = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
         ent = trial.suggest_float("ent_coef", 1e-4, 5e-3, log=True)
     else:
+        # 学習制御パラメータ (微調整用)
         lr = trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True)
         ent = trial.suggest_float("ent_coef", 5e-5, 1e-3, log=True)
         
+    # 報酬設計パラメータ (最適化対象)
     hidden_bonus = trial.suggest_float("reward_hidden_bonus", 0.5, 3.0)
-    cos_scale = trial.suggest_float("cos_penalty_scale", 1.0, 5.0)
+    dist_diff_scale = trial.suggest_float("reward_distance_diff_scale", 0.5, 5.0)
+    
+    # 固定値設定 (最適化対象外)
+    cos_scale = 2.0
     
     # --- B. 環境構築 ---
     if not trial_path.exists():
@@ -98,23 +104,31 @@ def objective(trial):
         script_content = f.read()
         
     # --- C. スクリプトの動的書き換え (完全展開) ---
+    # 1. 学習率の置換
     script_content = re.sub(r"LEARNING_RATE = .*", f"LEARNING_RATE = {lr}", script_content)
+    # 2. エントロピー係数の置換
     script_content = re.sub(r"ENT_COEF = .*", f"ENT_COEF = {ent}", script_content)
+    # 3. 隠蔽報酬の置換
     script_content = re.sub(r"REWARD_HIDDEN_BONUS = .*", f"REWARD_HIDDEN_BONUS = {hidden_bonus}", script_content)
+    # 4. 距離増分報酬の置換 (新規追加)
+    script_content = re.sub(r"REWARD_DISTANCE_DIFF_SCALE = .*", f"REWARD_DISTANCE_DIFF_SCALE = {dist_diff_scale}", script_content)
+    # 5. 視界ペナルティの置換 (固定値として上書き)
     script_content = re.sub(r"COS_PENALTY_SCALE = .*", f"COS_PENALTY_SCALE = {cos_scale}", script_content)
     
+    # 6. モデルロード設定の反映
     load_flag = "True" if MODE == "refinement" else "False"
     script_content = re.sub(r"LOAD_EXISTING_MODELS = .*", f"LOAD_EXISTING_MODELS = {load_flag}", script_content)
 
-    # モデル保存の禁止
+    # 7. モデル保存の強制禁止 (探索時のドリフト防止)
     script_content = re.sub(r"SAVE_MODEL = .*", "SAVE_MODEL = False", script_content)
-    # 評価モード有効化
+    # 8. 評価モード（高頻度ログ）有効化
     script_content = re.sub(r"TRIAL_MODE = .*", "TRIAL_MODE = True", script_content)
-    # WandB無効化
-    script_content = re.sub(r"TRACK_WANDB = .*", "TRACK_WANDB = True", script_content)
-    # ステップ数反映
+    # 9. WandB無効化
+    script_content = re.sub(r"TRACK_WANDB = .*", "TRACK_WANDB = False", script_content)
+    # 10. 学習ステップ数の反映
     script_content = re.sub(r"TOTAL_TIMESTEPS = .*", f"TOTAL_TIMESTEPS = {TOTAL_STEPS}", script_content)
     
+    # 書き換えたスクリプトを一時ファイルとして保存
     tmp_script_path = trial_path / "runner.py"
     with open(tmp_script_path, "w", encoding="utf-8") as f:
         f.write(script_content)
@@ -126,6 +140,7 @@ def objective(trial):
     
     print(f"[Optuna] Trial {trial_id} ({MODE}) started: LR={lr:.2e}, ENT={ent:.2e}")
     
+    # 学習の実行
     process = subprocess.Popen(
         [sys.executable, str(tmp_script_path)],
         stdout=subprocess.PIPE,
@@ -137,6 +152,7 @@ def objective(trial):
     collected_metrics = []
     
     try:
+        # リアルタイムで標準出力を監視
         while True:
             line = process.stdout.readline()
             if not line:
@@ -144,18 +160,21 @@ def objective(trial):
                     break
                 continue
             
+            # 指定されたキーワードから物理指標を抽出
             if METRIC_KEYWORD in line:
                 match = re.search(f"{METRIC_KEYWORD}\s*(-?[\d\.]+)", line)
                 if match:
                     val = float(match.group(1))
                     collected_metrics.append(val)
                     
+        # プロセスの終了を待機
         try:
             stdout_remain, stderr_remain = process.communicate(timeout=60)
         except subprocess.TimeoutExpired:
             process.kill()
             stdout_remain, stderr_remain = process.communicate()
         
+        # 異常終了チェック
         if process.returncode != 0:
             print(f"[Optuna] Trial {trial_id} failed with exit code {process.returncode}")
             return 0.0
@@ -166,7 +185,7 @@ def objective(trial):
         return 0.0
 
     finally:
-        # --- E. 自動クリーンアップ ---
+        # --- E. 自動クリーンアップ：一時フォルダを削除 ---
         if trial_path.exists():
             try:
                 shutil.rmtree(trial_dir)
@@ -174,6 +193,7 @@ def objective(trial):
                 pass
 
     # --- F. スコアの算出 ---
+    # 学習後半の安定した隠蔽ステップ数（最後の5回分）の平均をスコアとする
     if len(collected_metrics) > 0:
         sample_size = min(len(collected_metrics), 5)
         final_score = np.mean(collected_metrics[-sample_size:])
@@ -185,12 +205,14 @@ def objective(trial):
 # 4. メイン処理
 # ==========================================
 def main():
+    # Linux環境のハング対策
     if platform.system() == "Linux":
         try:
             multiprocessing.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
 
+    # Optuna Study の作成またはロード
     study = optuna.create_study(
         study_name=STUDY_NAME,
         storage=STORAGE_URL,
@@ -198,14 +220,14 @@ def main():
         load_if_exists=True
     )
     
-    print(f"Starting Hyperparameter Optimization (v2.6)...")
+    print(f"Starting Hyperparameter Optimization (v2.7)...")
     print(f"  Mode:           {MODE}")
     print(f"  Target Script:  {RUNNER_SCRIPT}")
     print(f"  Total Trials:   {N_TRIALS}")
     print(f"  Auto-save:      {CSV_OUTPUT_PATH} (Every trial)")
     print("-" * 50)
     
-    # ★修正点: callbacks=[save_best_callback] を追加
+    # 最適化の実行 (コールバックを指定)
     study.optimize(objective, n_trials=N_TRIALS, n_jobs=PARALLEL_JOBS, callbacks=[save_best_callback])
     
     print("\n" + "="*50)

@@ -57,22 +57,22 @@ TRAIN_TARGET = "HIDER"
 
 EXPERIMENT_NAME = f"{EXPERIMENT_BASE_NAME}_{MODE}"
 # refinement モードのときのみ、既存のウェイトファイルをロードして再開します
-LOAD_EXISTING_MODELS = (MODE == "refinement")
+LOAD_EXISTING_MODELS = False
 
 # 実行モード: "TRAIN" (学習) または "PLAY" ( Viewer で挙動を観察)
 EXECUTION_MODE = "TRAIN" 
 
-SAVE_MODEL = True
-TRACK_WANDB = True           
+SAVE_MODEL = False
+TRACK_WANDB = True
 FIXED_SEED = None
-TRIAL_MODE = False
+TRIAL_MODE = True
 
 # PPO (強化学習アルゴリズム) のハイパーパラメータ
-TOTAL_TIMESTEPS = 5000000 
+TOTAL_TIMESTEPS = 150000
 NUM_ENVS = 8
 NUM_STEPS = 128            # 1回の更新で収集するデータ長
-LEARNING_RATE = 2e-4       # 学習率
-ENT_COEF = 0.001           # 探索の幅（エントロピー）を制御
+LEARNING_RATE = 4.4913274566167296e-05
+ENT_COEF = 0.00010572245490200716
 MINIBATCH_SIZE = 128
 UPDATE_EPOCHS = 4
 
@@ -99,8 +99,8 @@ RAYCAST_CACHE_POS_THRESH = 0.05
 OUTLIER_VALUE = 2.0
 
 # 報酬設計
-REWARD_HIDDEN_BONUS = 1.0        # シーカーから見つかっていないステップに付与
-COS_PENALTY_SCALE = 2.0          # 視界正面にいる場合のペナルティ倍率
+REWARD_HIDDEN_BONUS = 1.4599247818575418
+COS_PENALTY_SCALE = 4.018424914811919
 REWARD_DISTANCE_DIFF_SCALE = 1.0 # 敵から遠ざかる動きに対する補助報酬
 PENALTY_SAFEGUARD = -20.0        # 場外脱走に対するペナルティ
 PENALTY_STAGNATION = -0.5        # その場に留まった（棒立ち）場合へのペナルティ
