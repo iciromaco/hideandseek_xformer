@@ -1162,7 +1162,7 @@ def main():
     print(f"Start Training: {TOTAL_TIMESTEPS} steps")
     
     # 残りの更新回数を計算
-    remaining_steps = TOTAL_TIMESTEPS - global_step
+    remaining_steps = TOTAL_TIMESTEPS # - global_step
     num_updates = int(remaining_steps // (actual_num_envs * NUM_STEPS))
     print(f"Remaining updates: {num_updates}")
 
