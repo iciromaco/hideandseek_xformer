@@ -1,195 +1,141 @@
 # main23_analysis.py
-# 演習第23回：報酬パラメータと隠蔽性能の多角的回帰分析 (v25.01)
+# 演習第23回：Optuna探索結果の統計解析（客観的指標対応版）
 #
-# 【修正内容】
-# 1. カラム名の完全整合: main23_optuna_search.py の提案名（小文字）に合わせ param_map を修正。
-# 2. パス指定の柔軟化: CSVがカレントディレクトリにある場合に対応。
-# 3. データのクレンジング: Optunaの試行状態が 'COMPLETE' のもののみを抽出。
-# 4. ログスケール変換の堅牢化: 1e-10 を加算して log10(0) エラーを回避。
+# 【修正内容 v23.2】
+# 1. パス同期: main23_optuna_search.py が出力する results_{MODE}.csv に対応。
+# 2. 指標同期: 最適化目標が Hidden ステップ数であることを前提に解析。
+# 3. 統計解析の強化: 重回帰分析を行い、各パラメータの物理指標（生存）への寄与度を算出。
+# 4. 文法規約: セミコロンなし、独立行での記述。
 
 import os
-import sys
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
-
-# 機械学習ライブラリ
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
-from sklearn.inspection import partial_dependence
+from sklearn.preprocessing import StandardScaler
 
 # ==========================================
-# 1. 実験設定
+# 1. 解析設定
 # ==========================================
-# ★実行モード設定: 探索スクリプトの MODE と一致させてください
-MODE = "refinement" 
+# 解析対象のモードを指定 ("initial" または "refinement")
+MODE = "initial"
+INPUT_CSV = f"results_{MODE}.csv"
 
-# main23_optuna_search.py の出力先に合わせる
-# カレントディレクトリにCSVがある場合は "." を指定
-RESULTS_DIR = Path(".") 
-CSV_PATH = RESULTS_DIR / f"results_{MODE}.csv"
-OUTPUT_DIR = Path(f"./analysis_reports_{MODE}")
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-def analyze():
-    print(f"--- Multi-Model Analysis Phase: {MODE} ---")
-    
-    if not os.path.exists(CSV_PATH):
-        print(f"Error: {CSV_PATH} が見つかりません。")
-        print("先に main23_optuna_search.py を実行して結果を生成してください。")
+# ==========================================
+# 2. データ読み込みと前処理
+# ==========================================
+def run_analysis():
+    if not os.path.exists(INPUT_CSV):
+        print(f"[Error] {INPUT_CSV} が見つかりません。")
+        print("先に main23_optuna_search.py を実行してください。")
         return
 
-    # 1. データの読み込み
-    df_raw = pd.read_csv(CSV_PATH)
+    # CSVの読み込み
+    df = pd.read_csv(INPUT_CSV)
     
-    # 状態が COMPLETE のものだけを抽出（重要：失敗した試行を除外）
-    if 'state' in df_raw.columns:
-        df = df_raw[df_raw['state'] == 'COMPLETE'].copy()
-    else:
-        df = df_raw.copy()
-
-    # OptunaのCSV列名（params_...）を分析用に変換
-    # main23_optuna_search.py の trial.suggest_... の名前に厳密に合わせる
-    param_map = {
-        'params_ent_coef': 'Entropy',
-        'params_learning_rate': 'LR',
-        'params_reward_hidden_bonus': 'Hidden_Bonus',
-        'params_cos_penalty_scale': 'Cos_Penalty',
-        'value': 'Score'
-    }
-    
-    # 存在するカラムだけをリネーム
-    actual_map = {k: v for k, v in param_map.items() if k in df.columns}
-    df = df.rename(columns=actual_map)
-    df = df.dropna(subset=['Score'])
+    # 失敗した試行 (value が NaN または 0) の除外
+    df = df.dropna(subset=['value'])
+    # 物理指標（ステップ数）が0のデータも、学習が全く進んでいないため除外
+    df = df[df['value'] > 0]
     
     if len(df) < 5:
-        print(f"データ数が少なすぎるため（現在 {len(df)} 件）、分析を中断します。")
-        print("少なくとも 5〜10 回以上の COMPLETE な試行が必要です。")
+        print(f"[Warning] 有効なデータが少なすぎます（現在 {len(df)} 件）。")
+        print("解析には最低5件以上の成功試行が必要です。")
         return
 
-    print(f"Loaded {len(df)} trials. Best Score: {df['Score'].max():.1f}")
+    print(f"--- Analysis Report: {INPUT_CSV} ---")
+    print(f"Total successful trials: {len(df)}")
+    print(f"Best Objective Value (Hidden Steps): {df['value'].max():.2f}")
 
-    # 2. 特徴量作成（LR, Entropy は対数スケールに変換）
-    # 実際に存在する特徴量のみを使用
-    features = [v for k, v in actual_map.items() if v != 'Score']
-    X = df[features].copy()
+    # パラメータカラムの抽出 (Optuna は 'params_' という接頭辞をつける)
+    param_cols = [c for c in df.columns if c.startswith('params_')]
+    clean_param_names = [c.replace('params_', '') for c in param_cols]
     
-    if 'LR' in X.columns:
-        X['LR'] = np.log10(X['LR'] + 1e-10)
-    if 'Entropy' in X.columns:
-        X['Entropy'] = np.log10(X['Entropy'] + 1e-10)
-        
-    y = df['Score'].values
+    # 解析用データの準備
+    X = df[param_cols].copy()
+    y = df['value'].copy()
 
-    # 3. モデルの定義
-    models = {
-        "LR": Pipeline([('s', StandardScaler()), ('r', LinearRegression())]),
-        "GBR": GradientBoostingRegressor(n_estimators=100, random_state=42),
-        "GPR": GaussianProcessRegressor(
-            kernel=C(1.0, (1e-3, 1e8)) * RBF(length_scale=[1.0]*len(features), length_scale_bounds=(1e-2, 1e8)) + 
-                   WhiteKernel(noise_level=1, noise_level_bounds=(1e-8, 1e5)),
-            normalize_y=True, n_restarts_optimizer=10, random_state=42
-        )
-    }
+    # 指数スケールのパラメータ（LR等）を対数変換して感度を正しく測る
+    for col in X.columns:
+        if "learning_rate" in col or "ent_coef" in col:
+            X[col] = np.log10(X[col] + 1e-12)
+            print(f"  Applied log10 to {col}")
 
-    # 全モデルのレポート内容を蓄積するリスト
-    summary_reports = []
-
-    # 4. 各モデルの実行とPDPの描画
-    for name, model in models.items():
-        print(f"  Training and Analyzing model: {name}...")
-        try:
-            model.fit(X.values, y)
-        except Exception as e:
-            print(f"    Model {name} fitting failed: {e}")
-            continue
-        
-        # タイル状プロット (2x2)
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        axes = axes.ravel()
-
-        report_lines = []
-        report_lines.append(f"\n{'='*75}")
-        report_lines.append(f"{f' ANALYSIS REPORT ({name} Model) ':^75}")
-        report_lines.append(f"{'='*75}")
-        report_lines.append(f"{'Param Name':<15} | {'Best Value':<15} | {'Impact (Steps)':<15}")
-        report_lines.append(f"{'-'*15}-|-{'-'*15}-|-{'-'*15}")
-
-        for i, f_name in enumerate(features):
-            if i >= len(axes): break
-            ax = axes[i]
-            
-            # 部分依存性 (PDP) の計算
-            pdp_out = partial_dependence(model, X.values, [i], kind='average', grid_resolution=100)
-            x_raw = pdp_out['grid_values'][0]
-            y_pdp = pdp_out['average'][0]
-            
-            # 対数を元のスケールに戻す
-            is_log = f_name in ['LR', 'Entropy']
-            x_plot = 10**x_raw if is_log else x_raw
-            
-            # ピーク値（理論上の最適解）の特定
-            best_idx = np.argmax(y_pdp)
-            best_x = x_plot[best_idx]
-            best_y = y_pdp[best_idx]
-            impact = np.max(y_pdp) - np.min(y_pdp)
-            
-            # 表への追加
-            label_fmt = f"{best_x:.2e}" if is_log else f"{best_x:.3f}"
-            report_lines.append(f"{f_name:<15} | {label_fmt:<15} | {impact:15.2f}")
-
-            # グラフ描画
-            ax.plot(x_plot, y_pdp, color='tab:blue', linewidth=2.5, label='Estimated Trend')
-            ax.fill_between(x_plot, y_pdp - 1.0, y_pdp + 1.0, color='tab:blue', alpha=0.1)
-            
-            # 最大値のマーキング
-            ax.scatter([best_x], [best_y], color='red', s=80, zorder=5, edgecolors='white')
-            ax.annotate(f"Best: {label_fmt}\n({best_y:.1f} steps)", 
-                        xy=(best_x, best_y), xytext=(10, 10),
-                        textcoords='offset points', color='red', fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='red', alpha=0.7))
-
-            ax.set_title(f"{f_name} (via {name})", fontsize=13, fontweight='bold')
-            ax.set_ylabel('Estimated Hidden Steps')
-            ax.grid(True, which="both", ls="-", alpha=0.4)
-            if is_log: ax.set_xscale('log')
-
-        plt.suptitle(f"Partial Dependence Plots: {name} Regression ({MODE})", fontsize=16, fontweight='bold')
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        
-        save_path = OUTPUT_DIR / f"pdp_1d_{name}_{MODE}.png"
-        plt.savefig(save_path, dpi=300)
-        plt.close()
-
-        # レポートの結合
-        full_report = "\n".join(report_lines)
-        print(full_report)
-        summary_reports.append(full_report)
-
-    # 5. 全モデルの統合テキストレポート保存
-    summary_file = OUTPUT_DIR / f"summary_report_{MODE}.txt"
-    with open(summary_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(summary_reports))
+    # ==========================================
+    # 3. 重回帰分析 (各パラメータの寄与度算出)
+    # ==========================================
+    # スケーリング（単位の異なるパラメータを比較可能にする）
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
     
-    # 6. 相関行列の保存
-    plt.figure(figsize=(10, 8))
-    cols_to_corr = [v for v in actual_map.values() if v in df.columns]
-    sns.heatmap(df[cols_to_corr].corr(), annot=True, cmap='RdBu_r', center=0)
-    plt.title(f"Parameter Correlation ({MODE})")
-    corr_path = OUTPUT_DIR / f"correlation_{MODE}.png"
-    plt.savefig(corr_path)
-    plt.close()
+    # 回帰モデルの実行
+    model = LinearRegression()
+    model.fit(X_scaled, y)
+    
+    # 寄与度の集計
+    importance = pd.DataFrame({
+        'Parameter': clean_param_names,
+        'Coefficient': model.coef_
+    })
+    importance['Abs_Coef'] = importance['Coefficient'].abs()
+    importance = importance.sort_values(by='Abs_Coef', ascending=False)
 
-    print(f"\n[Done] すべての分析結果が {OUTPUT_DIR} に保存されました。")
-    print(f"テキスト形式のサマリー: {summary_file.name}")
+    print("\n[Parameter Influence (Standardized Coefficients)]")
+    print("※ 系数の絶対値が大きいほど、そのパラメータが Hidden Steps の増減に強く影響しています。")
+    print(importance[['Parameter', 'Coefficient']].to_string(index=False))
+
+    # ==========================================
+    # 4. 可視化
+    # ==========================================
+    sns.set_theme(style="whitegrid")
+    
+    # フィギュア作成 (2x2 のレイアウト)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"Hyperparameter Sensitivity Analysis ({MODE})\nObjective: Steps Hidden (Physical Metric)", fontsize=16)
+
+    # A. 寄与度の棒グラフ
+    sns.barplot(data=importance, x='Coefficient', y='Parameter', ax=axes[0, 0], palette='coolwarm')
+    axes[0, 0].set_title("Standardized Impact on Hidden Steps")
+    axes[0, 0].set_xlabel("Coefficient (Direction & Strength)")
+
+    # B. 学習推移
+    axes[0, 1].plot(df['number'], df['value'], marker='o', linestyle='-', color='tab:blue', alpha=0.6)
+    # 移動平均の追加
+    if len(df) > 5:
+        ma = df['value'].rolling(window=5).mean()
+        axes[0, 1].plot(df['number'], ma, color='red', linewidth=2, label='MA(5)')
+    axes[0, 1].set_title("Optimization History")
+    axes[0, 1].set_xlabel("Trial Number")
+    axes[0, 1].set_ylabel("Steps Hidden")
+    axes[0, 1].legend()
+
+    # C. 特徴的な散布図 (例: Learning Rate)
+    lr_col = [c for c in param_cols if "learning_rate" in c]
+    if lr_col:
+        sns.scatterplot(data=df, x=lr_col[0], y='value', ax=axes[1, 0], hue='value', palette='magma', legend=False)
+        axes[1, 0].set_xscale('log')
+        axes[1, 0].set_title("Learning Rate vs Hidden Steps")
+        axes[1, 0].set_xlabel("Learning Rate (log scale)")
+    else:
+        axes[1, 0].text(0.5, 0.5, "LR Data Missing", ha='center')
+
+    # D. 特徴的な散布図 (例: Cos Penalty Scale)
+    cos_col = [c for c in param_cols if "cos_penalty_scale" in c]
+    if cos_col:
+        sns.regplot(data=df, x=cos_col[0], y='value', ax=axes[1, 1], scatter_kws={'alpha':0.5}, line_kws={'color':'red'})
+        axes[1, 1].set_title("Cos Penalty Scale vs Hidden Steps")
+        axes[1, 1].set_xlabel("Cos Penalty Scale")
+    else:
+        axes[1, 1].text(0.5, 0.5, "Cos Scale Data Missing", ha='center')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    # 保存と表示
+    plot_path = f"analysis_summary_{MODE}.png"
+    plt.savefig(plot_path, dpi=200)
+    print(f"\nSummary plot saved to {plot_path}")
+    plt.show()
 
 if __name__ == "__main__":
-    analyze()
+    run_analysis()

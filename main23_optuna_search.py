@@ -29,7 +29,7 @@ from pathlib import Path
 # ★実行モードの設定
 # "initial":    新規探索 (LOAD_EXISTING_MODELS = False)
 # "refinement": 継続探索 (LOAD_EXISTING_MODELS = True)
-MODE = "refinement" # "initial" 
+MODE = "initial" 
 
 # ターゲットとなる学習スクリプト
 RUNNER_SCRIPT = "main23_runner_cos.py"
