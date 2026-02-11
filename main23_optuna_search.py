@@ -124,7 +124,7 @@ def objective(trial):
     # 8. 評価モード（高頻度ログ）有効化
     script_content = re.sub(r"TRIAL_MODE = .*", "TRIAL_MODE = True", script_content)
     # 9. WandB無効化
-    script_content = re.sub(r"TRACK_WANDB = .*", "TRACK_WANDB = False", script_content)
+    script_content = re.sub(r"TRACK_WANDB = .*", "TRACK_WANDB = True", script_content)
     # 10. 学習ステップ数の反映
     script_content = re.sub(r"TOTAL_TIMESTEPS = .*", f"TOTAL_TIMESTEPS = {TOTAL_STEPS}", script_content)
     
@@ -162,7 +162,7 @@ def objective(trial):
             
             # 指定されたキーワードから物理指標を抽出
             if METRIC_KEYWORD in line:
-                match = re.search(f"{METRIC_KEYWORD}\s*(-?[\d\.]+)", line)
+                match = re.search(rf"{METRIC_KEYWORD}\s*(-?[\d\.]+)", line)
                 if match:
                     val = float(match.group(1))
                     collected_metrics.append(val)

@@ -63,22 +63,22 @@ TRAIN_TARGET = "HIDER"
 
 EXPERIMENT_NAME = f"{EXPERIMENT_BASE_NAME}_{MODE}"
 # refinement モード時のみ既存のウェイトファイルを読み込みます
-LOAD_EXISTING_MODELS = (MODE == "refinement")
+LOAD_EXISTING_MODELS = False
 
 # 実行モード: "TRAIN" (学習) または "PLAY" ( Viewer で挙動を鑑賞)
 EXECUTION_MODE = "TRAIN" 
 
-SAVE_MODEL = True
-TRACK_WANDB = True           
+SAVE_MODEL = False
+TRACK_WANDB = True
 FIXED_SEED = None
-TRIAL_MODE = False
+TRIAL_MODE = True
 
 # PPO アルゴリズムのハイパーパラメータ
-TOTAL_TIMESTEPS = 5000000 
+TOTAL_TIMESTEPS = 150000
 NUM_ENVS = 8
 NUM_STEPS = 128            # 更新1回あたりのデータ収集長さ
-LEARNING_RATE = 2e-4       # 学習率
-ENT_COEF = 0.001           # 探索のランダム性を制御
+LEARNING_RATE = 1.6527918912821367e-05
+ENT_COEF = 0.00019532430787861334
 MINIBATCH_SIZE = 128
 UPDATE_EPOCHS = 4
 
@@ -104,9 +104,9 @@ RAYCAST_CACHE_POS_THRESH = 0.05
 OUTLIER_VALUE = 2.0
 
 # 報酬設計
-REWARD_HIDDEN_BONUS = 1.0        # チーム全体が隠れている時の報酬
-COS_PENALTY_SCALE = 2.0          # 正面被視認時のペナルティ強度
-REWARD_DISTANCE_DIFF_SCALE = 1.0 # 敵から遠ざかる動きに対する補助報酬
+REWARD_HIDDEN_BONUS = 2.6042974660462024
+COS_PENALTY_SCALE = 2.0
+REWARD_DISTANCE_DIFF_SCALE = 2.6698493868363062
 PENALTY_SAFEGUARD = -20.0        # フィールド外脱走に対する罰
 PENALTY_STAGNATION = -0.5        # 停滞（棒立ち）に対する罰
 
