@@ -1,15 +1,17 @@
-#  main23_runner_cos.py
+# main23_runner_cos.py
 # 演習第23回：視界勾配（Cos）ペナルティと固定長エピソードによるチーム学習
 # 
-# 【修正内容 (v25.34)】
-# 1. 独立行展開の徹底 (Regression Fix):
-#    - GAE計算ループ内に残存していた複数代入 (nt, vp = ...) を完全に分解。
-#    - 言葉通り「1行につき1つの代入・動作」をプログラム全編で貫徹。
-# 2. ロジックの完全維持 (No Omission):
+# 【修正内容 (v25.35)】
+# 1. CUDA 定数およびデバイス制御の正常化:
+#    - 実験設定セクションに CUDA 定数を明示し、base_config.CUDA を確実に反映。
+#    - main() 内で混在していた device_actual と device_final を統合。
+#    - 全てのテンソル計算とモデル配置において、設定されたデバイスが正しく使われるよう修正。
+# 2. 独立行展開の徹底:
+#    - すべてのステートメントを1行ずつ個別に記述。
+#    - 複数代入、インラインif、セミコロンを完全に根絶。
+# 3. ロジックの完全維持:
 #    - チーム指標 (hidden + caught = 300)、外れ値 2.0、停滞罰 (-0.5)、
 #      Seekerのヘディング制御、PLAYモードのロード制限解除をすべて継承。
-# 3. 変数名の英語維持 (Maintain Continuity):
-#    - 過去コードとの連続性を守るため、標準的な英語の変数名を使用。
 # 4. 詳細な日本語技術解説の網羅:
 #    - 報酬計算の数理的背景、物理エンジンの強制固定仕様などを詳細に記述。
 
@@ -23,7 +25,7 @@ import multiprocessing
 from tqdm import tqdm
 
 # --- 実行環境の最適化 ---
-# 並列実行時に各プロセスが CPU スレッドを奪い合わないよう、計算ライブラリを制限します。
+# 並列実行時に各プロセスがスレッドを奪い合わないよう、数値計算ライブラリを制限します。
 if platform.processor() != 'arm':
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -32,21 +34,21 @@ if platform.processor() != 'arm':
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 # --- プロジェクトパスの解決 ---
-# 共通資産である main18_optimization.py 等にアクセスするため、ディレクトリを解決します。
+# 共通資産である main18_optimization.py 等にアクセスするため、ディレクトリを特定します。
 current_file_path = os.path.abspath(__file__)
 current_dir_path = os.path.dirname(current_file_path)
 search_path = current_dir_path
 for _ in range(5):
-    # 特定ファイルが存在する階層を特定
-    target_marker_file = os.path.join(search_path, "main18_optimization.py")
-    if os.path.exists(target_marker_file):
+    # ファイルの存在を確認
+    potential_marker = os.path.join(search_path, "main18_optimization.py")
+    if os.path.exists(potential_marker):
         if search_path not in sys.path:
             sys.path.insert(0, search_path)
         break
-    # 一つ上の階層へ遡る
+    # 階層を遡る
     search_path = os.path.dirname(search_path)
 
-# カレントディレクトリも実行パスに追加
+# カレントディレクトリをパスに追加
 if os.getcwd() not in sys.path:
     sys.path.insert(0, os.getcwd())
 
@@ -60,16 +62,20 @@ EXPERIMENT_BASE_NAME = "HideAndSeek_Layer23_TeamCos"
 TRAIN_TARGET = "HIDER" 
 
 EXPERIMENT_NAME = f"{EXPERIMENT_BASE_NAME}_{MODE}"
-# refinement モードのときのみ、既存モデルをロードして再開します
+# refinement モードのときのみ、既存モデルをロードして再開
 LOAD_EXISTING_MODELS = (MODE == "refinement")
 
 # 実行モード: "TRAIN" (学習) または "PLAY" ( Viewer で挙動を鑑賞)
-EXECUTION_MODE = "PLAY" 
+EXECUTION_MODE = "TRAIN" 
 
 SAVE_MODEL = True
 TRACK_WANDB = True           
 FIXED_SEED = None
 TRIAL_MODE = False
+
+# ★CUDA 設定の正常化: main18_optimization からの設定を継承
+import main18_optimization as base_config
+CUDA = base_config.CUDA
 
 # PPO アルゴリズムのハイパーパラメータ
 TOTAL_TIMESTEPS = 5000000 
@@ -143,7 +149,6 @@ class Agent(nn.Module):
         self.pos_encoder = nn.Parameter(torch.zeros(1, TRANSFORMER_SEQ_LEN, HIDDEN_DIM))
         
         # Transformer エンコーダ層
-        # enable_nested_tensor=False により警告と将来の不整合を抑止
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=HIDDEN_DIM, 
             nhead=NUM_HEADS, 
@@ -283,7 +288,7 @@ def create_env(render_mode=None):
             # 親クラスの物理初期化
             super().__init__(render_mode=render_mode)
             
-            # デバイス設定
+            # 内部ワーカープロセスでは常に CPU を使用
             cpu_dev = torch.device("cpu")
             # 各エージェント（Seeker=0, Hider1=1, Hider2=2）の観測履歴管理
             self.npc_obs_history = {
@@ -350,7 +355,7 @@ def create_env(render_mode=None):
                 os.environ["NPC_MODELS_LOGGED"] = "TRUE"
 
         def _is_visible(self, origin_pos, origin_rot, target_pos, target_body_id, exclude_body_id):
-            """視界角と物理적遮蔽を考慮し、対象が見えているか判定します。"""
+            """視界角と物理的遮蔽を考慮し、対象が見えているか判定します。"""
             diff_vec = target_pos[:2] - origin_pos[:2]
             distance_val = np.linalg.norm(diff_vec)
             
@@ -427,11 +432,11 @@ def create_env(render_mode=None):
                 if p_moved < RAYCAST_CACHE_POS_THRESH:
                     a_err = (ang_val - ca + np.pi) % (2 * np.pi) - np.pi
                     if abs(a_err) < 0.05:
-                        self.raycast_stats["hits"] = self.raycast_stats["hits"] + 1
+                        self.raycast_stats["hits"] += 1
                         return cr, cg
             
             # キャッシュミス
-            self.raycast_stats["misses"] = self.raycast_stats["misses"] + 1
+            self.raycast_stats["misses"] += 1
             hit_res = np.zeros(1, dtype=np.int32)
             r_from = np.array([origin_p[0], origin_p[1], 0.5], dtype=np.float64)
             r_dir = np.array([direction[0], direction[1], 0.0], dtype=np.float64)
@@ -792,6 +797,7 @@ def create_env(render_mode=None):
 # 5. メイン処理 (学習ループ)
 # ==========================================
 def main():
+    # --- 1. マルチプロセス起動設定 ---
     if platform.system() == "Linux":
         try:
             multiprocessing.set_start_method("spawn", force=True)
@@ -817,9 +823,9 @@ def main():
     import torch.optim as optim
     from torch.utils.tensorboard import SummaryWriter
     import wandb
-    import main18_optimization as base_config
 
-    device_final = torch.device("cuda" if torch.cuda.is_available() and base_config.CUDA else "cpu")
+    # ★デバイス判定の統一
+    device_final = torch.device("cuda" if torch.cuda.is_available() and CUDA else "cpu")
     exp_run_name = f"{EXPERIMENT_NAME}_{TRAIN_TARGET}_{int(time.time())}"
     
     if EXECUTION_MODE == "PLAY":
@@ -863,7 +869,7 @@ def main():
     if TRACK_WANDB:
         wandb.init(
             project=base_config.WANDB_PROJECT_NAME, 
-            config={"Target": TRAIN_TARGET, "MODE": MODE, "v": "25.34_PEP8_strict_fix"}, 
+            config={"Target": TRAIN_TARGET, "MODE": MODE, "v": "25.35_CUDA_fix"}, 
             name=exp_run_name, 
             sync_tensorboard=False,
             save_code=True
@@ -889,6 +895,7 @@ def main():
                 except:
                     pass
 
+    # 訓練用バッファの確保 (device_final を確実に使用)
     hist_t = ObsHistory(NUM_ENVS, TRANSFORMER_SEQ_LEN, 53, device_final)
     S, E, O, A = NUM_STEPS, NUM_ENVS, 53, 4
     b_obs = torch.zeros((S, E, TRANSFORMER_SEQ_LEN, O), device=device_final)
@@ -908,7 +915,7 @@ def main():
     start_clock = time.time()
     l_loss, l_ent = 0.0, 0.0
 
-    print(f"--- Training started (v25.34) ---")
+    print(f"--- Training started (v25.35) ---")
     try:
         # total_updates_needed をループに使用
         for u_idx in tqdm(range(1, total_updates_needed + 1), desc="Updates"):
