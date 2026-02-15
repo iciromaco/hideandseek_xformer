@@ -71,7 +71,7 @@ import main18_optimization as base_config
 # 1. 実験設定 (定数定義) - main18 準拠
 # ==========================================
 # ★ MODE: 学習フェーズ設定
-MODE = "refinement"  # 既存モデルの微調整
+MODE = "initial" 
 
 EXPERIMENT_BASE_NAME = "HideAndSeek_Layer23_TeamCos"
 
@@ -83,28 +83,28 @@ EXPERIMENT_NAME = f"{EXPERIMENT_BASE_NAME}_{MODE}"
 # 既存モデルのロード判定
 LOAD_EXISTING_MODELS = False
 if MODE == "refinement":
-    LOAD_EXISTING_MODELS = True
+    LOAD_EXISTING_MODELS = False
 
 # 実行モードの設定: "TRAIN" (学習) or "PLAY" (鑑賞)
-EXECUTION_MODE = "PLAY"
+EXECUTION_MODE = "TRAIN"
 
 # 成果物の保存および WandB 記録の設定
-SAVE_MODEL = True
-TRACK_WANDB = True           
+SAVE_MODEL = False
+TRACK_WANDB = True
 FIXED_SEED = None
 
 # TRIAL_MODE: Optuna 探索時に True。統計情報を即時 flush して通信を安定させます。
-TRIAL_MODE = False
+TRIAL_MODE = True
 
 # デバイス設定
 CUDA = base_config.CUDA
 
 # PPO アルゴリズムのハイパーパラメータ
-TOTAL_TIMESTEPS = 5000000 
+TOTAL_TIMESTEPS = 150000
 NUM_ENVS = 8
 NUM_STEPS = 128
-LEARNING_RATE = 2e-4
-ENT_COEF = 0.001
+LEARNING_RATE = 2.037184998974468e-05
+ENT_COEF = 0.0003980098695533517
 MINIBATCH_SIZE = 128
 UPDATE_EPOCHS = 4
 GAMMA = 0.99
@@ -132,9 +132,9 @@ RAYCAST_CACHE_POS_THRESH = 0.05
 OUTLIER_VALUE = 2.0
 
 # 報酬設計パラメータ
-REWARD_HIDDEN_BONUS = 1.0
+REWARD_HIDDEN_BONUS = 1.3779148482568229
 COS_PENALTY_SCALE = 2.0
-REWARD_DISTANCE_DIFF_SCALE = 1.0
+REWARD_DISTANCE_DIFF_SCALE = 1.956010762979199
 
 # 基本ペナルティ
 PENALTY_SAFEGUARD = -20.0

@@ -1,4 +1,4 @@
-# main23_optuna_search.py
+# main23_optuna_searchKai.py
 # 演習第23回：Optunaによるハイパーパラメータ探索 (中間保存・モデル汚染防止版)
 #
 # 【修正内容 (v2.7)】
@@ -18,7 +18,7 @@ import subprocess
 import re
 import platform
 import multiprocessing
-import time
+import threading
 import numpy as np
 import optuna
 from pathlib import Path
@@ -53,6 +53,31 @@ PARALLEL_JOBS = 1
 
 # 客観的指標として抽出するキーワード (Hiddenステップ数)
 METRIC_KEYWORD = "Hidden:"
+
+# ==========================================
+# 2. ユーティリティ関数
+# ==========================================
+def read_output_in_thread(pipe, output_list, metrics_list):
+    """スレッドでstdoutを読み込み、デッドロックを防止"""
+    try:
+        for line in iter(pipe.readline, ''):
+            if line:
+                output_list.append(line)
+                print(line, end="", flush=True)
+                
+                # メトリクス抽出
+                if METRIC_KEYWORD in line:
+                    match = re.search(rf"{METRIC_KEYWORD}\s*(-?[\d\.]+)", line)
+                    if match:
+                        val = float(match.group(1))
+                        metrics_list.append(val)
+    except Exception as e:
+        print(f"[Thread Error] {e}", flush=True)
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
 
 # ==========================================
 # 2. コールバック関数 (中間保存用)
@@ -130,6 +155,7 @@ def objective(trial):
     
     # 書き換えたスクリプトを一時ファイルとして保存
     tmp_script_path = trial_path / "runner.py"
+    print(f"[Optuna] Trial {trial_id} parameters: LR={lr:.2e}, ENT={ent:.2e}, HIDDEN_BONUS={hidden_bonus:.2f}, DIST_DIFF_SCALE={dist_diff_scale:.2f}")
     with open(tmp_script_path, "w", encoding="utf-8") as f:
         f.write(script_content)
     
@@ -140,66 +166,88 @@ def objective(trial):
     
     print(f"[Optuna] Trial {trial_id} ({MODE}) started: LR={lr:.2e}, ENT={ent:.2e}")
     
+    # メトリクスファイルのパス（子プロセスがここに結果を書く）
+    # metrics_file = trial_path / "trial_metrics.json"
+    
     # 学習の実行
     process = subprocess.Popen(
         [sys.executable, str(tmp_script_path)],
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         env=current_env
     )
+    # 親側のトレースファイルを書いておく（デバッグ用）
+    try:
+        with open(trial_path / "optuna_parent_launched.txt", "w", encoding="utf-8") as f:
+            f.write(f"launched: pid={process.pid}\n")
+    except Exception:
+        pass
+    print(f"[Optuna] Launched child PID={process.pid}")
     
     collected_metrics = []
+    output_lines = []
     
     try:
-        # リアルタイムで標準出力を監視
-        while True:
-            line = process.stdout.readline()
-            if not line:
-                if process.poll() is not None:
-                    break
-                continue
-            
-            # 指定されたキーワードから物理指標を抽出
-            if METRIC_KEYWORD in line:
-                match = re.search(rf"{METRIC_KEYWORD}\s*(-?[\d\.]+)", line)
-                if match:
-                    val = float(match.group(1))
-                    collected_metrics.append(val)
-                    
-        # プロセスの終了を待機
-        try:
-            stdout_remain, stderr_remain = process.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout_remain, stderr_remain = process.communicate()
+        # スレッドでstdoutを読む
+        reader_thread = threading.Thread(
+            target=read_output_in_thread,
+            args=(process.stdout, output_lines, collected_metrics),
+            daemon=False
+        )
+        reader_thread.start()
         
-        # 異常終了チェック
-        if process.returncode != 0:
-            print(f"[Optuna] Trial {trial_id} failed with exit code {process.returncode}")
-            return 0.0
-
-    except Exception as e:
-        print(f"[Optuna] Unexpected error in Trial {trial_id}: {e}")
+        # プロセス完了を待機（タイムアウト付き）
+        returncode = process.wait(timeout=TIMEOUT_PER_TRIAL)
+        print(f"[Optuna] Trial {trial_id} process exited with code {returncode}", flush=True)
+        
+    except subprocess.TimeoutExpired:
+        print(f"[Optuna] Trial {trial_id} timeout after {TIMEOUT_PER_TRIAL} seconds. Killing...", flush=True)
         process.kill()
-        return 0.0
-
+        process.wait()
+        
+    except Exception as e:
+        print(f"[Optuna] Unexpected error in Trial {trial_id}: {e}", flush=True)
+        try:
+            process.kill()
+        except Exception:
+            pass
+    
     finally:
-        # --- E. 自動クリーンアップ：一時フォルダを削除 ---
-        if trial_path.exists():
-            try:
-                shutil.rmtree(trial_dir)
-            except Exception:
-                pass
+        # リーダースレッドが完了するまで待つ（最大10秒）
+        reader_thread.join(timeout=10)
+        
+        # 標準出力の残りを消費
+        try:
+            if process.stdout:
+                remaining_output = process.stdout.read()
+                if remaining_output:
+                    print(remaining_output, flush=True)
+        except Exception:
+            pass
+
+    # プロセス終了コードをチェック
+    if process.returncode != 0 and process.returncode is not None:
+        print(f"[Optuna] Trial {trial_id} failed with exit code {process.returncode}", flush=True)
 
     # --- F. スコアの算出 ---
     # 学習後半の安定した隠蔽ステップ数（最後の5回分）の平均をスコアとする
     if len(collected_metrics) > 0:
         sample_size = min(len(collected_metrics), 5)
         final_score = np.mean(collected_metrics[-sample_size:])
-        return float(final_score)
+        print(f"[Optuna] Trial {trial_id} result: {len(collected_metrics)} metrics collected, final score={final_score:.2f}")
     else:
-        return 0.0
+        final_score = 0.0
+        print(f"[Optuna] Trial {trial_id} result: no metrics collected, score={final_score:.2f}")
+
+    # --- G. 自動クリーンアップ：一時フォルダを削除 ---
+    if trial_path.exists():
+        try:
+            shutil.rmtree(trial_dir)
+        except Exception as e:
+            print(f"[Warning] Failed to clean up {trial_dir}: {e}", flush=True)
+
+    return float(final_score)
 
 # ==========================================
 # 4. メイン処理

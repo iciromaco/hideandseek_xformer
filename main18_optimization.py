@@ -60,11 +60,24 @@ else:                  # ランダムシード
     SEED = int(time.time())
 
 TORCH_DETERMINISTIC = True  # True: PyTorchの決定論的動作を有効化 / False: デフォルト動作
-CUDA = True                 # True: GPU使用 / False: CPU使用
+# ★CUDA 定数
+# この値を False にすると、GPU が搭載されていても CPU (device="cpu") で実行されます。
+CUDA = True
 
-device = torch.device("cuda" if torch.cuda.is_available() and CUDA else "cpu")
+# デバイス決定プロセスの完全展開
+is_gpu_available = torch.cuda.is_available()
+use_gpu_final = False
+if is_gpu_available:
+    # 物理的に GPU があり、かつ設定フラグが True の場合のみ
+    if CUDA:
+        use_gpu_final = True
 
-TRAIN_MODE = True         # True: 学習 / False: 推論         
+if use_gpu_final:
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
+TRAIN_MODE = False         # True: 学習 / False: 推論         
 USE_VIEWER = False        # Trueにすると強制的に環境数=1になります
 TRACK_WANDB = True        # True: WandBで実験追跡 / False: ログなし
 
