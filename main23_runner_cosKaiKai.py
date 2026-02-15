@@ -90,7 +90,7 @@ if MODE == "refinement":
     LOAD_EXISTING_MODELS = True
 
 # 実行モードの設定
-EXECUTION_MODE = "PLAY" 
+EXECUTION_MODE = "TRAIN" 
 
 # モデル保存および記録の有無
 SAVE_MODEL = True
