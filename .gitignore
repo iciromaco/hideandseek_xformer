@@ -8,3 +8,4 @@ optuna_temp/
 optuna_results/trial_*/*
 *.pt
 *.json
+*.pkl
