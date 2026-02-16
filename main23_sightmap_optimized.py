@@ -86,7 +86,7 @@ import main18_optimization as base_config
 # 1. 実験設定 (定数定義)
 # ==========================================
 # ★ MODE: 学習フェーズ設定
-MODE = "refinement" # "initial" 
+MODE = "initial" # "refinement" # 
 
 EXPERIMENT_BASE_NAME = "HideAndSeek_Layer23_TeamCos"
 
@@ -527,9 +527,11 @@ class VisibilityEngine:
         self.ramp_body = ramp_body
         
         # 動的オブジェクトの構成を記録（毎フレーム更新に使用）
+        # agents, boxes, ramp 全てを含める
         self.dynamic_body_ids = []
         self.dynamic_body_radii = []
         
+        # agents も含める（自分自身は exclude_agent_id で除外）
         for agent_id, body_id in self.agent_bodies.items():
             self.dynamic_body_ids.append(body_id)
             self.dynamic_body_radii.append(0.4)
@@ -556,6 +558,8 @@ class VisibilityEngine:
         - 外壁
         - 内壁（線分）
         事前計算に使用
+        
+        注意：Sphere Tracing 用に、環境内では外壁までの距離を正の値で返す
         """
         # 1. 外壁までの距離
         center = self.boundary[:2]
@@ -563,41 +567,77 @@ class VisibilityEngine:
         d = np.abs(p[:2] - center) - half_size
         outside_dist = np.linalg.norm(np.maximum(d, 0.0))
         inside_dist = np.minimum(np.max(d), 0.0)
-        min_dist = outside_dist + inside_dist
+        boundary_dist = outside_dist + inside_dist
         
-        # 2. 内壁（線分）までの距離
-        for seg in self.static_walls:
-            seg_start = np.array(seg[0], dtype=np.float32)
-            seg_end = np.array(seg[1], dtype=np.float32)
-            dist_to_seg = self._point_to_segment_distance(p[:2], seg_start, seg_end)
-            min_dist = min(min_dist, dist_to_seg)
+        # 2. 内壁（線分）までの距離（ベクトル化）
+        if len(self.static_walls) > 0:
+            # static_walls: [(start, end), ...]
+            seg_starts = np.array([seg[0] for seg in self.static_walls], dtype=np.float32)  # (N, 2)
+            seg_ends = np.array([seg[1] for seg in self.static_walls], dtype=np.float32)    # (N, 2)
+            
+            # 点pから各線分への距離を計算
+            seg_vecs = seg_ends - seg_starts  # (N, 2)
+            seg_len_sq = np.sum(seg_vecs**2, axis=1, keepdims=True)  # (N, 1)
+            
+            # 点pから線分開始点へのベクトル
+            p_to_start = p[:2] - seg_starts  # (N, 2)
+            
+            # 投影パラメータ t (各線分ごと)
+            t = np.sum(p_to_start * seg_vecs, axis=1, keepdims=True) / (seg_len_sq + 1e-8)  # (N, 1)
+            t = np.clip(t, 0, 1)  # (N, 1)
+            
+            # 線分上の最近点
+            closest_pts = seg_starts + t * seg_vecs  # (N, 2)
+            
+            # 点pから最近点までの距離
+            dists = np.linalg.norm(p[:2] - closest_pts, axis=1)  # (N,)
+            min_wall_dist = np.min(dists)
+        else:
+            min_wall_dist = 1e6
         
-        return min_dist
+        # 3. 外壁と内壁の最小値
+        # 環境内（boundary_dist < 0）の場合、外壁距離を正にしてから比較
+        if boundary_dist < 0:
+            # 環境内：外壁までの距離（正の値）と内壁を比較
+            return min(-boundary_dist, min_wall_dist)
+        else:
+            # 環境外：外壁までの距離
+            return min(boundary_dist, min_wall_dist)
     
-    def get_sdf_dynamic(self, p, exclude_agent_id=None):
+    def get_sdf_dynamic(self, p, exclude_agent_id=None, exclude_body_id=None):
         """
         点pから可動物までの最小距離（リアルタイム計算）
         事前割り当てされた配列を使用（毎フレーム update_dynamic_positions() で更新）
-        exclude_agent_id: 除外するエージェント ID（自分の場合）
+        exclude_agent_id: 除外するエージェント ID（自分自身を除外）
+        exclude_body_id: 除外する body_id（target を除外）
         """
         if self.num_dynamic_objects == 0:
             return 1e6
         
-        # 除外対象の body_id を事前計算
-        exclude_body_id = None
-        if exclude_agent_id is not None and exclude_agent_id in self.agent_bodies:
-            exclude_body_id = self.agent_bodies[exclude_agent_id]
+        # 除外対象の body_id を取得
+        exclude_body_ids = set()
+        if exclude_agent_id is not None:
+            if exclude_agent_id in self.agent_bodies:
+                exclude_body_ids.add(self.agent_bodies[exclude_agent_id])
+        if exclude_body_id is not None:
+            exclude_body_ids.add(exclude_body_id)
         
-        # 配列ベースで距離計算
-        min_dist = 1e6
-        for i in range(self.num_dynamic_objects):
-            if self.dynamic_body_ids[i] == exclude_body_id:
-                continue
-            diff = self.dynamic_positions[i] - p[:2]
-            dist = np.sqrt(diff[0]**2 + diff[1]**2) - self.dynamic_radii[i]
-            if dist < min_dist:
-                min_dist = dist
+        # ベクトル化：全可動物の距離を一度に計算
+        positions = self.dynamic_positions[:self.num_dynamic_objects]  # (N, 2)
+        radii = self.dynamic_radii[:self.num_dynamic_objects]  # (N,)
         
+        # 点pから各オブジェクトへのベクトル
+        diff = positions - p[:2]  # (N, 2)
+        
+        # 距離を計算
+        dists = np.linalg.norm(diff, axis=1) - radii  # (N,)
+        
+        # 除外対象がある場合、そのインデックスをマスク
+        if exclude_body_ids:
+            mask = np.array([body_id not in exclude_body_ids for body_id in self.dynamic_body_ids[:self.num_dynamic_objects]])
+            dists = dists * mask + (1e6 * (~mask))  # 除外対象を 1e6 に置き換え
+        
+        min_dist = float(np.min(dists))
         return min_dist
     
     def _point_to_segment_distance(self, p, seg_start, seg_end):
@@ -619,26 +659,30 @@ class VisibilityEngine:
         inside_dist = np.minimum(np.max(d), 0.0)
         return outside_dist + inside_dist
 
-    def cast_ray(self, start_pos, direction, exclude_agent_id=None):
+    def cast_ray(self, start_pos, direction, exclude_agent_id=None, exclude_body_id=None, target_body_id=None):
         """
         Sphere Tracingで光線の距離を計算
         - 静的壁：事前計算SDF（ルックアップテーブル）
         - 可動物：リアルタイム計算
         exclude_agent_id: 自エージェントのIDを指定（自分を除外）
+        exclude_body_id: ターゲットのbody_idを指定（ターゲットを除外）
+        target_body_id: デバッグ用（ターゲットの body_id）
         """
         self.sp_curr_p[:] = start_pos  # バッファに位置をコピー
         total_d = 0.0
         
-        for _ in range(self.max_steps):
+        for step in range(self.max_steps):
             # 静的SDF（テーブル）と動的距離を組み合わせる
             d_static = self._sdf_lookup(self.sp_curr_p)  # ルックアップ
-            d_dynamic = self.get_sdf_dynamic(self.sp_curr_p, exclude_agent_id=exclude_agent_id)
+            d_dynamic = self.get_sdf_dynamic(self.sp_curr_p, exclude_agent_id=exclude_agent_id, exclude_body_id=exclude_body_id)
+            
+            # get_sdf_static() は既に環境内で正の値を返すので、そのまま使う
             d = min(d_static, d_dynamic)
             
             if d < self.epsilon:
                 return total_d, True
             total_d += d
-            self.sp_curr_p += direction * d  # インプレース更新
+            self.sp_curr_p[:2] += direction * d  # XY座標のみ更新（Z=0のため）
             if total_d > self.max_dist:
                 break
         
@@ -985,12 +1029,13 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         print("[Sightmap] ✓ Visibility cache ready", flush=True)
         
         # ★ VisibilityEngine の初期化
-        self.visibility_engine = VisibilityEngine(self.model, self.data)
+        # max_dist を環境サイズに合わせて設定 (12m x 12m 環境の対角線距離は約17m)
+        self.visibility_engine = VisibilityEngine(self.model, self.data, max_dist=20.0)
         self.visibility_engine.set_bodies(
             self.s0_body, self.h1_body, self.h2_body,
             self.box1_body, self.box2_body, self.ramp_body
         )
-        print("[VisibilityEngine] ✓ Initialized", flush=True)
+        print("[VisibilityEngine] ✓ Initialized with max_dist=20.0m", flush=True)
         
         # ★ Lidar SDF キャッシュのロード/ビルド
         self._init_lidar_sdf_cache()
@@ -1099,49 +1144,68 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         idx_a = pos2idx(pos_a, self.sightmap_bounds, self.sightmap_cell_size, self.grid_n)
         idx_b = pos2idx(pos_b, self.sightmap_bounds, self.sightmap_cell_size, self.grid_n)
         
-        # キャッシュで (idx_a, idx_b) ペアの可視性をチェック
-        if self.visibility_cache[idx_a, idx_b] == 0:
+        # デバッグ：キャッシュの値を確認
+        try:
+            cache_val = self.visibility_cache[idx_a, idx_b]
+        except Exception as e:
+            print(f"[DEBUG] Cache access error: idx_a={idx_a}, idx_b={idx_b}, cache shape={self.visibility_cache.shape}, error={e}")
             return False, -1
         
-        # 動的障害物（box, ramp）のチェックはレイキャストで実行
-        # ターゲットまでの方向ベクトル
-        direction = diff / dist
+        # キャッシュで (idx_a, idx_b) ペアの可視性をチェック
+        if cache_val == 0:
+            return False, -1
         
-        # レイキャストバッファ使用
-        self._raycast_from[0] = pos_a[0]
-        self._raycast_from[1] = pos_a[1]
-        self._raycast_from[2] = 0.5
-        self._raycast_dir[0] = direction[0]
-        self._raycast_dir[1] = direction[1]
-        self._raycast_dir[2] = 0.0
+        # 動的障害物（box, ramp）のチェック：ターゲット方向の視線上にあるかを確認
+        # エージェント同士の遮蔽は無視（エージェントは動くため意味がない）
+        direction = diff / dist  # ターゲット方向の単位ベクトル
         
-        # 観測者自身を除外
-        if agent_id == 0:
-            exclude_body = self.s0_body
-        elif agent_id == 1:
-            exclude_body = self.h1_body
+        # Sightmap で静的壁は clear なので、動的障害物だけチェック
+        box_bodies = self.visibility_engine.box_bodies
+        ramp_body = self.visibility_engine.ramp_body
+        
+        # 各障害物についてチェック
+        obstacles = []
+        
+        # Box1, Box2
+        for box_id in box_bodies:
+            box_pos = self.data.xpos[box_id][:2]
+            
+            # オブザーバーから障害物へのベクトル
+            to_obstacle = box_pos - pos_a
+            
+            # ターゲット方向への投影距離（direction 方向でどこまでか）
+            dist_along_direction = np.dot(to_obstacle, direction)
+            
+            # ターゲットより手前か
+            if dist_along_direction < dist - 0.5:  # 0.5m の余裕
+                # vision line からの横ずれ
+                # 投影点を計算
+                projected_point = pos_a + direction * dist_along_direction
+                lateral_dist = np.linalg.norm(box_pos - projected_point)
+                
+                # 横ずれがボックス半径（0.84m）より小さければ視線を遮る
+                if lateral_dist < 0.84:
+                    obstacles.append(('Box', box_id, dist_along_direction, lateral_dist))
+        
+        # Ramp
+        ramp_pos = self.data.xpos[ramp_body][:2]
+        to_obstacle = ramp_pos - pos_a
+        dist_along_direction = np.dot(to_obstacle, direction)
+        
+        if dist_along_direction < dist - 0.5:
+            projected_point = pos_a + direction * dist_along_direction
+            lateral_dist = np.linalg.norm(ramp_pos - projected_point)
+            
+            if lateral_dist < 0.836:  # ランプの半径
+                obstacles.append(('Ramp', ramp_body, dist_along_direction, lateral_dist))
+        
+        # デバッグ出力
+        if obstacles:
+            # ターゲット方向に障害物がある
+            return False, -1
         else:
-            exclude_body = self.h2_body
-        
-        ray_dist = mujoco.mj_ray(
-            self.model, self.data,
-            self._raycast_from,
-            self._raycast_dir,
-            None, 1, exclude_body,
-            self._raycast_geomid
-        )
-        
-        if ray_dist != -1:
-            hit_body = self.model.geom_bodyid[self._raycast_geomid[0]]
-            # ターゲットにヒットした場合は可視
-            if hit_body == target_body_id:
-                return True, target_body_id
-            # ターゲットより手前に何かがあれば不可視
-            if ray_dist < dist - 0.1:  # 0.1mのマージン
-                return False, -1
-        
-        # 5. 可視性確定
-        return True, target_body_id
+            # 障害物がない
+            return True, target_body_id
     
     def _get_obs(self, agent_id):
         """ 個体固有の 53次元観測。自己状態変数の名称を統一。 """
@@ -1230,6 +1294,10 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         
         for tid, name in target_bodies:
             if tid != body_id:
+                # デバッグ出力：距離を計算
+                pos_a = self.data.xpos[body_id][:2]
+                pos_b = self.data.xpos[tid][:2]
+                
                 is_visible, _ = self._is_visible(self.data.xpos[body_id], yaw, self.data.xpos[tid], tid, agent_id)
                 vis_lookup_record_dict_ref[tid] = is_visible
                 if is_visible:
