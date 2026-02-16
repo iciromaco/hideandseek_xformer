@@ -1,4 +1,4 @@
-# main23_runner_cos.py
+# main23_sightmap_optimized.py
 # 演習第23回：視界勾配（Cos）ペナルティと固定長エピソードによるチーム学習
 # 
 # 【修正内容 (v25.64 - Sightmap統合版)】
@@ -21,6 +21,7 @@ import sys
 import platform
 import json
 import time
+import signal
 import pickle
 import xml.etree.ElementTree as ET
 import numpy as np
@@ -85,7 +86,7 @@ import main18_optimization as base_config
 # 1. 実験設定 (定数定義)
 # ==========================================
 # ★ MODE: 学習フェーズ設定
-MODE = "initial" 
+MODE = "refinement" # "initial" 
 
 EXPERIMENT_BASE_NAME = "HideAndSeek_Layer23_TeamCos"
 
@@ -100,7 +101,7 @@ if MODE == "refinement":
     LOAD_EXISTING_MODELS = True
 
 # 実行モードの設定
-EXECUTION_MODE = "PLAY" 
+EXECUTION_MODE = "TRAIN"  # "TRAIN" / "PLAY"
 
 # モデル保存および記録の有無
 SAVE_MODEL = True
@@ -167,10 +168,12 @@ SAVE_MODEL_PATH = f"{EXPERIMENT_NAME}_{TRAIN_TARGET}.pt"
 # ==========================================
 
 # Sightmap設定
-ENV_BOUNDS = 5.9        # 環境範囲 (±6)
-CELL_SIZE = 0.2         # セルサイズ
-MAZE_PREFIX = "maze_"   # 内壁の接頭語
+ENV_BOUNDS = 5.9                # 環境範囲 (±6)
+SIGHTMAP_CELL_SIZE = 0.1        # Sightmap用セルサイズ（粗い、高速）
+SDF_CELL_SIZE = 0.02            # SDF距離場用セルサイズ（細かい、高精度）
+MAZE_PREFIX = "maze_"           # 内壁の接頭語
 VISIBILITY_CACHE_FILE = "visibility_cache.pkl"
+SDF_DISTANCE_FIELD_FILE = "sdf_distance_field.pkl"
 
 def ccw(A: np.ndarray, B: np.ndarray, C: np.ndarray) -> bool:
     """時計回り判定"""
@@ -179,6 +182,34 @@ def ccw(A: np.ndarray, B: np.ndarray, C: np.ndarray) -> bool:
 def segments_intersect(A: np.ndarray, B: np.ndarray, C: np.ndarray, D: np.ndarray) -> bool:
     """線分AB と CD が交差するかどうか"""
     return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+
+def line_segment_intersection(A: np.ndarray, B: np.ndarray, C: np.ndarray, D: np.ndarray) -> np.ndarray:
+    """
+    線分ABと線分CDの交点を返す。交差しない場合はNoneを返す。
+    A, B: 線分1の始点・終点
+    C, D: 線分2の始点・終点
+    """
+    # まず交差判定
+    if not segments_intersect(A, B, C, D):
+        return None
+    
+    # 交点を計算
+    x1, y1 = A[0], A[1]
+    x2, y2 = B[0], B[1]
+    x3, y3 = C[0], C[1]
+    x4, y4 = D[0], D[1]
+    
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-10:
+        return None
+    
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+    
+    # 交点
+    px = x1 + t * (x2 - x1)
+    py = y1 + t * (y2 - y1)
+    
+    return np.array([px, py], dtype=np.float32)
 
 def rect_to_segments(x_min: float, y_min: float, x_max: float, y_max: float) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
     """矩形を4本の線分に分解"""
@@ -220,105 +251,436 @@ def extract_maze_walls_from_xml(xml_source: str, from_string: bool = False) -> L
     return maze_walls
 
 def walls_to_segments(maze_walls: List[Dict]) -> List:
-    """MuJoCoの矩形壁情報をlineSegmentリストに変換"""
+    """MuJoCoの矩形壁情報をlineSegmentリストに変換（Lidar用に最適化）"""
     wall_segments = []
+    
+    # 環境の境界を定義
+    ENV_BOUND = 12.0  # 想定される環境の範囲
+    
     for wall in maze_walls:
         pos, size = wall['pos'], wall['size']
         cx, cy = pos[0], pos[1]
         x_min, x_max = cx - size[0], cx + size[0]
         y_min, y_max = cy - size[1], cy + size[1]
-        segments = rect_to_segments(x_min, y_min, x_max, y_max)
-        wall_segments.extend(segments)
+        
+        # 壁のタイプを判定
+        width = size[0] * 2
+        height = size[1] * 2
+        
+        # 四方の外壁判定（内側の面だけ）
+        is_left_wall = abs(x_min + ENV_BOUND) < 0.5  # 左壁
+        is_right_wall = abs(x_max - ENV_BOUND) < 0.5  # 右壁
+        is_bottom_wall = abs(y_min + ENV_BOUND) < 0.5  # 下壁
+        is_top_wall = abs(y_max - ENV_BOUND) < 0.5  # 上壁
+        
+        if is_left_wall:
+            # 左壁：右向き面（x=x_max）のみ
+            wall_segments.append(((x_max, y_min), (x_max, y_max)))
+        elif is_right_wall:
+            # 右壁：左向き面（x=x_min）のみ
+            wall_segments.append(((x_min, y_min), (x_min, y_max)))
+        elif is_bottom_wall:
+            # 下壁：上向き面（y=y_max）のみ
+            wall_segments.append(((x_min, y_max), (x_max, y_max)))
+        elif is_top_wall:
+            # 上壁：下向き面（y=y_min）のみ
+            wall_segments.append(((x_min, y_min), (x_max, y_min)))
+        else:
+            # 内部の壁：長辺のみ抽出
+            if width > height:
+                # 横長：上下の辺のみ
+                wall_segments.append(((x_min, y_min), (x_max, y_min)))  # 下辺
+                wall_segments.append(((x_min, y_max), (x_max, y_max)))  # 上辺
+            else:
+                # 縦長：左右の辺のみ
+                wall_segments.append(((x_min, y_min), (x_min, y_max)))  # 左辺
+                wall_segments.append(((x_max, y_min), (x_max, y_max)))  # 右辺
+    
     return wall_segments
 
 def create_cell_grid(bounds: float, cell_size: float) -> Tuple[np.ndarray, Dict]:
     """セルグリッドを生成"""
     x_cells = np.arange(-bounds, bounds, cell_size)
     y_cells = np.arange(-bounds, bounds, cell_size)
+    grid_n = len(x_cells)
     cell_centers = []
     for x in x_cells:
         for y in y_cells:
             cell_centers.append([x + cell_size/2, y + cell_size/2])
     cell_centers = np.array(cell_centers, dtype=np.float32)
-    metadata = {'bounds': bounds, 'cell_size': cell_size, 'num_cells': len(cell_centers)}
+    metadata = {
+        'bounds': bounds, 
+        'cell_size': cell_size, 
+        'num_cells': len(cell_centers),
+        'grid_n': grid_n
+    }
     return cell_centers, metadata
 
-def build_visibility_cache(cell_centers: np.ndarray, wall_segments: List) -> Dict:
-    """セル間の可視性をすべて計算してキャッシュ化"""
+def build_visibility_cache(cell_centers: np.ndarray, wall_segments: List) -> np.ndarray:
+    """セル間の可視性をすべて計算してキャッシュ化（1次元インデックス配列）"""
     num_cells = len(cell_centers)
-    cache = {}
+    # 1次元インデックスペア (i, j) をそのまま2次元配列に保存
+    cache = np.ones((num_cells, num_cells), dtype=np.uint8)  # デフォルト可視
     print(f"Building visibility cache for {num_cells} cells...")
     for i in range(num_cells):
         for j in range(i + 1, num_cells):
             p1 = cell_centers[i]
             p2 = cell_centers[j]
-            cache[(i, j)] = is_visible_static(p1, p2, wall_segments)
+            visible = is_visible_static(p1, p2, wall_segments)
+            val = 1 if visible else 0
+            cache[i, j] = val  # (i, j) ペア
+            cache[j, i] = val  # 対称性
         if (i + 1) % max(1, num_cells // 10) == 0:
             print(f"  Progress: {(i + 1) / num_cells * 100:.1f}%")
     return cache
 
-def save_visibility_cache(cache: Dict, cell_centers: np.ndarray, metadata: Dict, output_file: str):
-    """キャッシュを pickle で保存"""
+def save_visibility_cache(cache: np.ndarray, cell_centers: np.ndarray, metadata: Dict, output_file: str):
+    """キャッシュを pickle で保存（NumPy配列形式）"""
     data = {'cache': cache, 'cell_centers': cell_centers, 'metadata': metadata}
     with open(output_file, 'wb') as f:
         pickle.dump(data, f)
     file_size = Path(output_file).stat().st_size / 1024
     print(f"✓ Visibility cache saved: {output_file} ({file_size:.1f} KB)")
 
-def load_visibility_cache(cache_file: str) -> Tuple[Dict, np.ndarray, Dict]:
-    """キャッシュを pickle から読み込み"""
+def load_visibility_cache(cache_file: str) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """キャッシュを pickle から読み込み（NumPy配列形式）"""
     with open(cache_file, 'rb') as f:
-        data = pickle.load(f)  # ★修正: dump → load
+        data = pickle.load(f)
     return data['cache'], data['cell_centers'], data['metadata']
 
-def find_nearest_cell_index(point: np.ndarray, cell_centers: np.ndarray) -> int:
-    """座標に最も近いセルのインデックスを返す"""
-    distances = np.linalg.norm(cell_centers - point, axis=1)
-    return np.argmin(distances)
+def build_sdf_distance_field(visibility_engine, cell_centers: np.ndarray) -> np.ndarray:
+    """
+    グリッド全体のSDF（静的環境のみ）を計算
+    ルックアップテーブル用にNumPy配列で返す [num_cells_x, num_cells_y]
+    """
+    num_cells = len(cell_centers)
+    sdf_field = np.zeros((int(np.sqrt(num_cells)), int(np.sqrt(num_cells))), dtype=np.float32)
+    
+    print(f"[SDF] Building distance field for {num_cells} cells (this may take a few minutes)...", flush=True)
+    start_time = time.time()
+    
+    idx = 0
+    for i, cell_pos in enumerate(cell_centers):
+        # 静的環境のみでSDF計算（可動物は含めない）
+        point_3d = np.array([cell_pos[0], cell_pos[1], 0.5], dtype=np.float32)
+        sdf_value = visibility_engine.get_sdf_static(point_3d)
+        
+        # 2次元グリッド配列に格納
+        grid_x = i % sdf_field.shape[0]
+        grid_y = i // sdf_field.shape[0]
+        sdf_field[grid_x, grid_y] = sdf_value
+        
+        if (i + 1) % max(1, num_cells // 20) == 0:
+            elapsed = time.time() - start_time
+            progress = (i + 1) / num_cells
+            eta = elapsed / progress - elapsed if progress > 0 else 0
+            print(f"  Progress: {progress*100:.1f}% ({i+1}/{num_cells}), ETA: {eta:.0f}s", flush=True)
+    
+    elapsed = time.time() - start_time
+    print(f"[SDF] ✓ Distance field built in {elapsed:.1f}s", flush=True)
+    return sdf_field
+
+def save_sdf_distance_field(sdf_field: np.ndarray, cell_centers: np.ndarray, metadata: Dict, output_file: str):
+    """SDF距離場を pickle で保存（NumPy配列形式）"""
+    data = {'sdf_field': sdf_field, 'cell_centers': cell_centers, 'metadata': metadata}
+    with open(output_file, 'wb') as f:
+        pickle.dump(data, f)
+    file_size = Path(output_file).stat().st_size / 1024
+    print(f"[SDF] ✓ Distance field saved: {output_file} ({file_size:.1f} KB)", flush=True)
+
+def load_sdf_distance_field(cache_file: str) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """SDF距離場を pickle から読み込み（NumPy配列形式）"""
+    with open(cache_file, 'rb') as f:
+        data = pickle.load(f)
+    return data['sdf_field'], data['cell_centers'], data['metadata']
+
+def pos2idx(point: np.ndarray, bounds: float, cell_size: float, grid_n: int) -> int:
+    """座標からセルインデックスを直接計算（O(1)）"""
+    x, y = point[0], point[1]
+    # グリッド座標に変換（境界外はクランプ）
+    grid_x = int((x + bounds) / cell_size)
+    grid_y = int((y + bounds) / cell_size)
+    grid_x = max(0, min(grid_n - 1, grid_x))
+    grid_y = max(0, min(grid_n - 1, grid_y))
+    # 1次元インデックスに変換（y軸優先）
+    return grid_x * grid_n + grid_y
 
 def get_2d_geom_segments(model: mujoco.MjModel, data: mujoco.MjData, geom_names: List[str]) -> List[Dict]:
-    """MuJoCoのgeomの現在位置から2D線分を抽出（8頂点の凸包）"""
-    if not SCIPY_AVAILABLE:
-        return []
+    """MuJoCoのgeomの現在位置から2D線分を抽出（Lidar用に最適化）"""
     structured_dynamic_segments = []
     for geom_name in geom_names:
         try:
             geom_id = model.geom(geom_name).id
         except (KeyError, AttributeError):
             continue
+        
         sx, sy, sz = model.geom_size[geom_id]
         geom_xpos = data.geom_xpos[geom_id]
         geom_xmat = data.geom_xmat[geom_id].reshape(3, 3)
-        local_corners_3d = np.array([
-            [-sx, -sy, -sz], [sx, -sy, -sz], [sx, sy, -sz], [-sx, sy, -sz],
-            [-sx, -sy, sz], [sx, -sy, sz], [sx, sy, sz], [-sx, sy, sz]
-        ])
-        world_corners_2d = []
-        for lc in local_corners_3d:
-            wc_3d = geom_xpos + np.dot(geom_xmat, lc)
-            world_corners_2d.append([wc_3d[0], wc_3d[1]])
-        world_corners_2d_np = np.array(world_corners_2d)
+        
         geom_segments = []
-        try:
-            unique_corners = np.unique(world_corners_2d_np, axis=0)
-            if len(unique_corners) >= 3:
-                hull = ConvexHull(unique_corners)
-                for simplex in hull.simplices:
-                    p1 = tuple(unique_corners[simplex[0]])
-                    p2 = tuple(unique_corners[simplex[1]])
-                    geom_segments.append((p1, p2))
-            elif len(unique_corners) == 2:
-                p1, p2 = tuple(unique_corners[0]), tuple(unique_corners[1])
+        
+        # ランプの場合：斜面のXY投影のみ
+        if "ramp" in geom_name:
+            # ランプの上面4頂点のXY投影
+            local_top = np.array([
+                [-sx, -sy, sz], [sx, -sy, sz], [sx, sy, sz], [-sx, sy, sz]
+            ])
+            world_2d = []
+            for lc in local_top:
+                wc = geom_xpos + np.dot(geom_xmat, lc)
+                world_2d.append([wc[0], wc[1]])
+            
+            # 4つの辺を追加
+            for i in range(4):
+                p1 = tuple(world_2d[i])
+                p2 = tuple(world_2d[(i + 1) % 4])
                 geom_segments.append((p1, p2))
-        except Exception:
-            pass
+        
+        # 箱の場合：4つの側面のみ（上下を除く）
+        else:
+            # 下面の4頂点
+            local_bottom = np.array([
+                [-sx, -sy, -sz], [sx, -sy, -sz], [sx, sy, -sz], [-sx, sy, -sz]
+            ])
+            # 上面の4頂点
+            local_top = np.array([
+                [-sx, -sy, sz], [sx, -sy, sz], [sx, sy, sz], [-sx, sy, sz]
+            ])
+            
+            bottom_2d = []
+            top_2d = []
+            for lc in local_bottom:
+                wc = geom_xpos + np.dot(geom_xmat, lc)
+                bottom_2d.append([wc[0], wc[1]])
+            for lc in local_top:
+                wc = geom_xpos + np.dot(geom_xmat, lc)
+                top_2d.append([wc[0], wc[1]])
+            
+            # 側面4つのみ（底面と上面の対応する頂点を結ぶ辺は省略）
+            for i in range(4):
+                # 底面の辺
+                p1 = tuple(bottom_2d[i])
+                p2 = tuple(bottom_2d[(i + 1) % 4])
+                geom_segments.append((p1, p2))
+        
         structured_dynamic_segments.append({
             'name': geom_name,
             'center_2d': np.array([geom_xpos[0], geom_xpos[1]]),
             'segments': geom_segments
         })
+    
     return structured_dynamic_segments
 
+
+class VisibilityEngine:
+    """
+    SDFとSphere Tracingを用いた視界観測エンジン
+    静的壁はXMLから抽出、可動物はリアルタイム計算
+    """
+    def __init__(self, model, data, epsilon=0.05, max_steps=15, max_dist=2.5):
+        self.model = model
+        self.data = data
+        self.epsilon = epsilon
+        self.max_steps = max_steps
+        self.max_dist = max_dist
+        
+        # 外壁（境界）は固定
+        self.boundary = np.array([0.0, 0.0, 6.0, 6.0])
+        
+        # 内壁はXMLから抽出（XMLの形式に合わせる）
+        self.static_walls = []  # walls_to_segments()の結果を格納
+        self._build_static_walls_from_xml()
+        
+        # 可動物の参照（環境から提供される）
+        self.agent_bodies = {}  # {0: s0_body, 1: h1_body, 2: h2_body}
+        self.box_bodies = {}    # {box1_body, box2_body}
+        self.ramp_body = None
+        
+        # 動的オブジェクト情報の事前割り当て（毎フレーム更新用）
+        self.dynamic_positions = np.zeros((6, 2), dtype=np.float32)  # 最大6オブジェクト
+        self.dynamic_radii = np.zeros(6, dtype=np.float32)
+        self.num_dynamic_objects = 0
+        
+        # Sphere Tracing 用バッファ
+        self.sp_curr_p = np.zeros(3, dtype=np.float32)  # 現在位置
+        
+        # SDF距離場（後で外部から設定）
+        self.sdf_field = None
+        
+    def _build_static_walls_from_xml(self):
+        """XMLから内壁を抽出"""
+        try:
+            xml_string = base_config.XML_CONTENT
+            maze_walls = extract_maze_walls_from_xml(xml_string, from_string=True)
+            # walls_to_segments()で線分に変換
+            self.static_walls = walls_to_segments(maze_walls)
+            print(f"[VisibilityEngine] Built SDF from {len(maze_walls)} maze walls → {len(self.static_walls)} segments", flush=True)
+        except Exception as e:
+            print(f"[VisibilityEngine] Warning: Failed to extract walls from XML: {e}")
+            self.static_walls = []
+    
+    def set_bodies(self, s0_body, h1_body, h2_body, box1_body, box2_body, ramp_body):
+        """環境から body IDs を設定"""
+        self.agent_bodies = {0: s0_body, 1: h1_body, 2: h2_body}
+        self.box_bodies = {box1_body, box2_body}
+        self.ramp_body = ramp_body
+        
+        # 動的オブジェクトの構成を記録（毎フレーム更新に使用）
+        self.dynamic_body_ids = []
+        self.dynamic_body_radii = []
+        
+        for agent_id, body_id in self.agent_bodies.items():
+            self.dynamic_body_ids.append(body_id)
+            self.dynamic_body_radii.append(0.4)
+        for box_body in self.box_bodies:
+            self.dynamic_body_ids.append(box_body)
+            self.dynamic_body_radii.append(np.sqrt(0.6**2 + 0.6**2))
+        if ramp_body is not None:
+            self.dynamic_body_ids.append(ramp_body)
+            self.dynamic_body_radii.append(np.sqrt(0.67**2 + 0.5**2))
+        
+        self.num_dynamic_objects = len(self.dynamic_body_ids)
+        self.dynamic_radii[:self.num_dynamic_objects] = self.dynamic_body_radii
+        
+        print(f"[VisibilityEngine] Configured {len(self.agent_bodies)} agents, {len(self.box_bodies)} boxes, 1 ramp", flush=True)
+    
+    def update_dynamic_positions(self):
+        """毎フレーム、動的オブジェクトの位置を更新（cast_ray呼び出し前に実行）"""
+        for i, body_id in enumerate(self.dynamic_body_ids):
+            self.dynamic_positions[i] = self.data.xpos[body_id][:2]
+    
+    def get_sdf_static(self, p):
+        """
+        点pの符号付き距離関数（静的壁のみ）
+        - 外壁
+        - 内壁（線分）
+        事前計算に使用
+        """
+        # 1. 外壁までの距離
+        center = self.boundary[:2]
+        half_size = self.boundary[2:]
+        d = np.abs(p[:2] - center) - half_size
+        outside_dist = np.linalg.norm(np.maximum(d, 0.0))
+        inside_dist = np.minimum(np.max(d), 0.0)
+        min_dist = outside_dist + inside_dist
+        
+        # 2. 内壁（線分）までの距離
+        for seg in self.static_walls:
+            seg_start = np.array(seg[0], dtype=np.float32)
+            seg_end = np.array(seg[1], dtype=np.float32)
+            dist_to_seg = self._point_to_segment_distance(p[:2], seg_start, seg_end)
+            min_dist = min(min_dist, dist_to_seg)
+        
+        return min_dist
+    
+    def get_sdf_dynamic(self, p, exclude_agent_id=None):
+        """
+        点pから可動物までの最小距離（リアルタイム計算）
+        事前割り当てされた配列を使用（毎フレーム update_dynamic_positions() で更新）
+        exclude_agent_id: 除外するエージェント ID（自分の場合）
+        """
+        if self.num_dynamic_objects == 0:
+            return 1e6
+        
+        # 除外対象の body_id を事前計算
+        exclude_body_id = None
+        if exclude_agent_id is not None and exclude_agent_id in self.agent_bodies:
+            exclude_body_id = self.agent_bodies[exclude_agent_id]
+        
+        # 配列ベースで距離計算
+        min_dist = 1e6
+        for i in range(self.num_dynamic_objects):
+            if self.dynamic_body_ids[i] == exclude_body_id:
+                continue
+            diff = self.dynamic_positions[i] - p[:2]
+            dist = np.sqrt(diff[0]**2 + diff[1]**2) - self.dynamic_radii[i]
+            if dist < min_dist:
+                min_dist = dist
+        
+        return min_dist
+    
+    def _point_to_segment_distance(self, p, seg_start, seg_end):
+        """点pから線分(seg_start, seg_end)までの距離"""
+        seg_vec = seg_end - seg_start
+        seg_len_sq = np.dot(seg_vec, seg_vec)
+        if seg_len_sq < 1e-8:
+            return np.linalg.norm(p - seg_start)
+        
+        t = np.dot(p - seg_start, seg_vec) / seg_len_sq
+        t = np.clip(t, 0.0, 1.0)
+        closest = seg_start + t * seg_vec
+        return np.linalg.norm(p - closest)
+    
+    def _point_to_rect_distance(self, p, rect_center, half_size):
+        """点pから矩形（中心rect_center, 半幅half_size）までの距離（軸並行）"""
+        d = np.abs(p - rect_center) - half_size
+        outside_dist = np.linalg.norm(np.maximum(d, 0.0))
+        inside_dist = np.minimum(np.max(d), 0.0)
+        return outside_dist + inside_dist
+
+    def cast_ray(self, start_pos, direction, exclude_agent_id=None):
+        """
+        Sphere Tracingで光線の距離を計算
+        - 静的壁：事前計算SDF（ルックアップテーブル）
+        - 可動物：リアルタイム計算
+        exclude_agent_id: 自エージェントのIDを指定（自分を除外）
+        """
+        self.sp_curr_p[:] = start_pos  # バッファに位置をコピー
+        total_d = 0.0
+        
+        for _ in range(self.max_steps):
+            # 静的SDF（テーブル）と動的距離を組み合わせる
+            d_static = self._sdf_lookup(self.sp_curr_p)  # ルックアップ
+            d_dynamic = self.get_sdf_dynamic(self.sp_curr_p, exclude_agent_id=exclude_agent_id)
+            d = min(d_static, d_dynamic)
+            
+            if d < self.epsilon:
+                return total_d, True
+            total_d += d
+            self.sp_curr_p += direction * d  # インプレース更新
+            if total_d > self.max_dist:
+                break
+        
+        return total_d if total_d < self.max_dist else self.max_dist, False
+    
+    def _sdf_lookup(self, p):
+        """
+        事前計算SDF（静的環境）をルックアップテーブルから取得
+        双線形補間で値を計算
+        """
+        if self.sdf_field is None:
+            # フォールバック：その場で計算（コストあり）
+            return self.get_sdf_static(p)
+        
+        # グリッド座標に変換
+        grid_size = self.sdf_field.shape
+        cell_size = 12.0 / (grid_size[0] - 1)  # 12m環境
+        grid_x = (p[0] + 6.0) / cell_size
+        grid_y = (p[1] + 6.0) / cell_size
+        
+        # 境界チェック
+        if grid_x < 0 or grid_x >= grid_size[0] or grid_y < 0 or grid_y >= grid_size[1]:
+            return 1e6  # 環境外
+        
+        # 双線形補間
+        x0, x1 = int(grid_x), int(grid_x) + 1
+        y0, y1 = int(grid_y), int(grid_y) + 1
+        fx = grid_x - x0
+        fy = grid_y - y0
+        
+        x0, x1 = np.clip([x0, x1], 0, grid_size[0] - 1)
+        y0, y1 = np.clip([y0, y1], 0, grid_size[1] - 1)
+        
+        v00 = self.sdf_field[x0, y0]
+        v10 = self.sdf_field[x1, y0]
+        v01 = self.sdf_field[x0, y1]
+        v11 = self.sdf_field[x1, y1]
+        
+        v0 = v00 * (1 - fx) + v10 * fx
+        v1 = v01 * (1 - fx) + v11 * fx
+        return v0 * (1 - fy) + v1 * fy
+    
 # ==========================================
 # 2. クラス定義 (Agent / ObsHistory / Env)
 # ==========================================
@@ -451,7 +813,7 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         self.recovery_turn_dir = 1.0
         self.visible_names = {0: [], 1: [], 2: []}
 
-        self.lidar_array_cache_storage = {} 
+        self.lidar_cache = {} 
 
         # 親クラスの初期化
         super().__init__(render_mode=render_mode)
@@ -475,28 +837,78 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         }
 
         # NPC 推論エンジン
-        self.npc_hider_agent= None # Agent(53, 4).to("cpu")
-        self.npc_seeker_agent = None # Agent(53, 4).to("cpu")
+        self.npc_hider_agent = None
+        self.npc_seeker_agent = None
         
         log_marker_id_status_str = os.environ.get("NPC_MODELS_LOGGED")
         should_log = (log_marker_id_status_str != "TRUE")
         
-        # ★修正: 敵エージェントのモデルはロードしない（ルールベースを使用）
-        # Hider学習時 → Seekerはルールベース、パートナーHiderのみモデルロード
-        # Seeker学習時 → Hiderモデルロード、Seekerは学習中
-        if LOAD_EXISTING_MODELS or render_mode == "human":
-            # Hider学習時以外（Seeker学習時またはデバッグ時）のみHiderモデルをロード
-            if TRAIN_TARGET != "HIDER" and should_log:
-                h_path = load_model_safely(self.npc_hider_agent, EXPERIMENT_BASE_NAME, "HIDER")
-                if h_path:
-                    print(f"Loaded NPC Hider Engine for Env: {h_path}", flush=True)
+        # ★PLAY MODE判定（render_mode="human"）
+        is_play_mode = (render_mode == "human")
+        
+        # ★正確な設計実装
+        if is_play_mode:
+            # PLAY MODE: すべてのエージェント用モデルを読み込み
+            self.npc_seeker_agent = Agent(53, 4).to("cpu")
+            s_path = load_model_with_mode(self.npc_seeker_agent, EXPERIMENT_BASE_NAME, "SEEKER", MODE)
+            if s_path:
+                if should_log:
+                    print(f"[PLAY] Loaded Seeker model: {s_path}", flush=True)
+            else:
+                self.npc_seeker_agent = None  # モデルがない場合は None
             
-            # Seeker学習時以外（Hider学習時またはデバッグ時）のみSeekerモデルをロード
-            # ただしHider学習時はルールベースを使うためロードしない
-            if TRAIN_TARGET == "SEEKER" and should_log:
-                s_path = load_model_safely(self.npc_seeker_agent, EXPERIMENT_BASE_NAME, "SEEKER")
+            self.npc_hider_agent = Agent(53, 4).to("cpu")
+            h_path = load_model_with_mode(self.npc_hider_agent, EXPERIMENT_BASE_NAME, "HIDER", MODE)
+            if h_path:
+                if should_log:
+                    print(f"[PLAY] Loaded Hider model: {h_path}", flush=True)
+            else:
+                self.npc_hider_agent = None  # モデルがない場合は None
+        
+        elif MODE == "refinement":
+            if TRAIN_TARGET == "HIDER":
+                # 1-1: Seeker は学習済みモデルがあれば推論、なければルールベース
+                self.npc_seeker_agent = Agent(53, 4).to("cpu")
+                s_path = load_model_with_mode(self.npc_seeker_agent, EXPERIMENT_BASE_NAME, "SEEKER", MODE)
                 if s_path:
-                    print(f"Loaded NPC Seeker Engine for Env: {s_path}", flush=True)
+                    if should_log:
+                        print(f"[Refinement] Loaded Seeker model: {s_path}", flush=True)
+                else:
+                    self.npc_seeker_agent = None  # ルールベース使用
+                
+                # 1-3: パートナーHider は学習済みモデルがあれば推論、なければランダム
+                self.npc_hider_agent = Agent(53, 4).to("cpu")
+                h_path = load_model_with_mode(self.npc_hider_agent, EXPERIMENT_BASE_NAME, "HIDER", MODE)
+                if h_path:
+                    if should_log:
+                        print(f"[Refinement] Loaded Hider model for NPC: {h_path}", flush=True)
+                else:
+                    self.npc_hider_agent = None  # ランダム使用
+            else:
+                # TRAIN_TARGET == "SEEKER"
+                # 2-1, 2-2: Hider は学習済みモデルがあれば推論、なければランダム
+                self.npc_hider_agent = Agent(53, 4).to("cpu")
+                h_path = load_model_with_mode(self.npc_hider_agent, EXPERIMENT_BASE_NAME, "HIDER", MODE)
+                if h_path:
+                    if should_log:
+                        print(f"[Refinement] Loaded Hider model: {h_path}", flush=True)
+                else:
+                    self.npc_hider_agent = None  # ランダム使用
+        
+        elif MODE == "initial":
+            if TRAIN_TARGET == "SEEKER":
+                # initial + SEEKER: Hider は学習済みモデルがあれば推論、なければランダム
+                self.npc_hider_agent = Agent(53, 4).to("cpu")
+                h_path = load_model_with_mode(self.npc_hider_agent, EXPERIMENT_BASE_NAME, "HIDER", MODE)
+                if h_path:
+                    if should_log:
+                        print(f"[Initial] Loaded Hider model: {h_path}", flush=True)
+                else:
+                    self.npc_hider_agent = None  # ランダム使用
+            else:
+                # initial + HIDER: パートナーHider は ランダムのみ
+                # 学習済みモデルが存在しても読み込まない
+                self.npc_hider_agent = None
 
         os.environ["NPC_MODELS_LOGGED"] = "TRUE"
         
@@ -508,6 +920,7 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         
         # Lidar用バッファ
         self._lidar_dir = np.zeros(2, dtype=np.float64)
+        self._lidar_from_pos = np.zeros(3, dtype=np.float32)  # 光線の開始位置
         
         # 報酬計算用バッファ
         self._reward_fwd_vec = np.zeros(2, dtype=np.float64)
@@ -550,18 +963,68 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
             try:
                 print(f"[Sightmap] Loading visibility cache from {VISIBILITY_CACHE_FILE}...", flush=True)
                 self.visibility_cache, self.cell_centers, cache_metadata = load_visibility_cache(VISIBILITY_CACHE_FILE)
+                self.sightmap_bounds = cache_metadata['bounds']
+                self.sightmap_cell_size = cache_metadata['cell_size']
+                self.grid_n = cache_metadata['grid_n']
                 print(f"[Sightmap] ✓ Loaded {len(self.visibility_cache)} visibility pairs", flush=True)
-                return
             except Exception as e:
                 print(f"[Sightmap] Warning: Failed to load cache ({e}). Rebuilding...", flush=True)
+                self.visibility_cache = None
+        else:
+            self.visibility_cache = None
         
         # キャッシュが存在しないか、ロード失敗した場合はビルド
-        print("[Sightmap] Building visibility cache (first time only)...", flush=True)
-        self.cell_centers, cache_metadata = create_cell_grid(ENV_BOUNDS, CELL_SIZE)
-        print(f"[Sightmap] Created grid with {len(self.cell_centers)} cells", flush=True)
-        self.visibility_cache = build_visibility_cache(self.cell_centers, self.wall_segments)
-        save_visibility_cache(self.visibility_cache, self.cell_centers, cache_metadata, VISIBILITY_CACHE_FILE)
+        if self.visibility_cache is None:
+            print("[Sightmap] Building visibility cache (first time only)...", flush=True)
+            self.cell_centers, cache_metadata = create_cell_grid(ENV_BOUNDS, SIGHTMAP_CELL_SIZE)
+            self.sightmap_bounds = cache_metadata['bounds']
+            self.sightmap_cell_size = cache_metadata['cell_size']
+            self.grid_n = cache_metadata['grid_n']
+            print(f"[Sightmap] Created grid with {len(self.cell_centers)} cells", flush=True)
+            self.visibility_cache = build_visibility_cache(self.cell_centers, self.wall_segments)
+            save_visibility_cache(self.visibility_cache, self.cell_centers, cache_metadata, VISIBILITY_CACHE_FILE)
+        
         print("[Sightmap] ✓ Visibility cache ready", flush=True)
+        
+        # ★ VisibilityEngine の初期化
+        self.visibility_engine = VisibilityEngine(self.model, self.data)
+        self.visibility_engine.set_bodies(
+            self.s0_body, self.h1_body, self.h2_body,
+            self.box1_body, self.box2_body, self.ramp_body
+        )
+        print("[VisibilityEngine] ✓ Initialized", flush=True)
+        
+        # ★ Lidar SDF キャッシュのロード/ビルド
+        self._init_lidar_sdf_cache()
+    
+    def _init_lidar_sdf_cache(self):
+        """SDF距離場の初期化（ロードまたはビルド）"""
+        print("[SDF] Initializing distance field...", flush=True)
+        
+        # キャッシュファイルの存在確認
+        if os.path.exists(SDF_DISTANCE_FIELD_FILE):
+            try:
+                print(f"[SDF] Loading distance field from {SDF_DISTANCE_FIELD_FILE}...", flush=True)
+                sdf_field, sdf_cell_centers, metadata = load_sdf_distance_field(SDF_DISTANCE_FIELD_FILE)
+                self.visibility_engine.sdf_field = sdf_field
+                self.sdf_cell_centers = sdf_cell_centers
+                print(f"[SDF] ✓ Loaded SDF field shape: {sdf_field.shape}", flush=True)
+                return
+            except Exception as e:
+                print(f"[SDF] Warning: Failed to load distance field ({e}). Rebuilding...", flush=True)
+        
+        # キャッシュが存在しないか、ロード失敗した場合はビルド
+        print("[SDF] Building distance field (first time only - this may take a few minutes)...", flush=True)
+        # SDF用に別のグリッドを作成（細かい間隔）
+        sdf_cell_centers, cache_metadata = create_cell_grid(ENV_BOUNDS, SDF_CELL_SIZE)
+        self.sdf_cell_centers = sdf_cell_centers
+        cache_metadata['cell_size'] = SDF_CELL_SIZE
+        sdf_field = build_sdf_distance_field(self.visibility_engine, sdf_cell_centers)
+        print(f"[SDF] Built SDF field shape: {sdf_field.shape}", flush=True)
+        self.visibility_engine.sdf_field = sdf_field
+        print(f"[SDF] Saving to {SDF_DISTANCE_FIELD_FILE}...", flush=True)
+        save_sdf_distance_field(sdf_field, sdf_cell_centers, cache_metadata, SDF_DISTANCE_FIELD_FILE)
+        print("[SDF] ✓ Distance field ready", flush=True)
 
     def _get_cached_ray(self, agent_id, origin, direction, beam_id):
         """ レイキャストの空間・角度キャッシュ制御。★最適化: バッファ再利用 """
@@ -633,47 +1096,51 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         if abs(rel_angle) > np.deg2rad(FOV_DEG / 2.0):
             return False, -1
         
-        # 3. 静的壁のチェック（キャッシュ使用）
-        idx_a = find_nearest_cell_index(pos_a, self.cell_centers)
-        idx_b = find_nearest_cell_index(pos_b, self.cell_centers)
-        cache_key = tuple(sorted((idx_a, idx_b)))
+        # 3. レイキャストによる遮蔽チェック
+        # 静的壁の可視性はキャッシュで高速化
+        idx_a = pos2idx(pos_a, self.sightmap_bounds, self.sightmap_cell_size, self.grid_n)
+        idx_b = pos2idx(pos_b, self.sightmap_bounds, self.sightmap_cell_size, self.grid_n)
         
-        # キャッシュで静的壁をチェック
-        if not self.visibility_cache.get(cache_key, False):
+        # キャッシュで (idx_a, idx_b) ペアの可視性をチェック
+        if self.visibility_cache[idx_a, idx_b] == 0:
             return False, -1
         
-        # 念のため直接チェックも（キャッシュとのずれを補正）
-        if not is_visible_static(pos_a, pos_b, self.wall_segments):
-            return False, -1
+        # 動的障害物（box, ramp）のチェックはレイキャストで実行
+        # ターゲットまでの方向ベクトル
+        direction = diff / dist
         
-        # 4. 動的障害物のチェック（box1, box2, ramp）
-        # ターゲット自身は除外する必要がある
-        all_dynamic_geoms = ["box1_geom", "box2_geom", "ramp_slope_surface"]
-        target_geoms = []
+        # レイキャストバッファ使用
+        self._raycast_from[0] = pos_a[0]
+        self._raycast_from[1] = pos_a[1]
+        self._raycast_from[2] = 0.5
+        self._raycast_dir[0] = direction[0]
+        self._raycast_dir[1] = direction[1]
+        self._raycast_dir[2] = 0.0
         
-        # ターゲットのbody_idに対応するgeomを特定して除外
-        for geom_name in all_dynamic_geoms:
-            geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
-            if geom_id != -1:
-                geom_body_id = self.model.geom_bodyid[geom_id]
-                # ターゲット自身のgeomは障害物リストから除外
-                if geom_body_id != target_body_id:
-                    target_geoms.append(geom_name)
+        # 観測者自身を除外
+        if agent_id == 0:
+            exclude_body = self.s0_body
+        elif agent_id == 1:
+            exclude_body = self.h1_body
+        else:
+            exclude_body = self.h2_body
         
-        obstacles = get_2d_geom_segments(self.model, self.data, target_geoms)
+        ray_dist = mujoco.mj_ray(
+            self.model, self.data,
+            self._raycast_from,
+            self._raycast_dir,
+            None, 1, exclude_body,
+            self._raycast_geomid
+        )
         
-        # 観測者からの距離でソート（遠い障害物から先にチェック）
-        for obs in obstacles:
-            obs['distance'] = np.linalg.norm(obs['center_2d'] - pos_a)
-        obstacles.sort(key=lambda x: x['distance'])
-        
-        # 各動的障害物の線分をチェック
-        for obs_info in obstacles:
-            for seg in obs_info['segments']:
-                seg_start = np.array(seg[0], dtype=np.float32)
-                seg_end = np.array(seg[1], dtype=np.float32)
-                if segments_intersect(pos_a, pos_b, seg_start, seg_end):
-                    return False, -1  # 動的障害物で遮蔽
+        if ray_dist != -1:
+            hit_body = self.model.geom_bodyid[self._raycast_geomid[0]]
+            # ターゲットにヒットした場合は可視
+            if hit_body == target_body_id:
+                return True, target_body_id
+            # ターゲットより手前に何かがあれば不可視
+            if ray_dist < dist - 0.1:  # 0.1mのマージン
+                return False, -1
         
         # 5. 可視性確定
         return True, target_body_id
@@ -682,6 +1149,9 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         """ 個体固有の 53次元観測。自己状態変数の名称を統一。 """
         if agent_id in self.obs_memo:
             return self.obs_memo[agent_id]
+        
+        # ★ 動的オブジェクトの位置を毎フレーム更新（Lidar計測前に）
+        self.visibility_engine.update_dynamic_positions()
         
         if agent_id == 0:
             body_id = self.s0_body
@@ -715,28 +1185,24 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
             [yaw, np.cos(yaw), np.sin(yaw)]
         ])
         
-        # 1. Lidar データの生成 (Lidar用ID: 1000〜)
-        lidar = None
-        if agent_id in self.lidar_array_cache_storage:
-            cached_pos, cached_yaw, cached_lidar = self.lidar_array_cache_storage[agent_id]
-            pos_diff = np.linalg.norm(pos - cached_pos)
-            if pos_diff < LIDAR_CACHE_POS_THRESH:
-                angle_diff = (yaw - cached_yaw + np.pi) % (2 * np.pi) - np.pi
-                if abs(angle_diff) < LIDAR_CACHE_ANG_THRESH:
-                    lidar = cached_lidar.copy()
+        # 1. Lidar データの生成 (毎フレーム Sphere Tracing で計算)
+        lidar = np.zeros(len(self.lidar_angles), dtype=np.float32)
         
-        if lidar is None:
-            lidar = np.zeros(len(self.lidar_angles), dtype=np.float32)
-            for i, angle_offset in enumerate(self.lidar_angles):
-                beam_angle = angle_offset + yaw
-                
-                # ★最適化: バッファに直接書き込み（配列生成を削減）
-                self._lidar_dir[0] = np.cos(beam_angle)
-                self._lidar_dir[1] = np.sin(beam_angle)
-                
-                dist, _ = self._get_cached_ray(agent_id, pos, self._lidar_dir, i + 1000)
-                lidar[i] = min(dist, 2.5) / 2.5 if dist != -1 else 1.0
-            self.lidar_array_cache_storage[agent_id] = (pos.copy(), yaw, lidar.copy())
+        for i, angle_offset in enumerate(self.lidar_angles):
+            beam_angle = angle_offset + yaw
+            
+            # ★最適化: バッファに直接書き込み（配列生成を削減）
+            self._lidar_dir[0] = np.cos(beam_angle)
+            self._lidar_dir[1] = np.sin(beam_angle)
+            
+            # 光線開始位置をバッファに書き込み
+            self._lidar_from_pos[0] = pos[0]
+            self._lidar_from_pos[1] = pos[1]
+            self._lidar_from_pos[2] = 0.5
+            
+            # Sphere Tracing で距離を測定（静的壁+動的障害物）
+            dist, _ = self.visibility_engine.cast_ray(self._lidar_from_pos, self._lidar_dir, exclude_agent_id=agent_id)
+            lidar[i] = min(dist, 2.5) / 2.5 if dist >= 0 else 1.0
 
         # 2. オブジェクト視認情報の更新
         vis_lookup_record_dict_ref = self.visible_map[agent_id]
@@ -1109,19 +1575,44 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
 # 3. ヘルパー関数 & ファクトリ
 # ==========================================
 
-def load_model_safely(model, base_name, arget_type):
-    """ 指定候補からモデルをロード。 """
-    search_paths = [f"{base_name}_refinement_{arget_type}.pt", f"{base_name}_initial_{arget_type}.pt", f"{base_name}_{arget_type}.pt"]
-    for path in search_paths:
+def load_model_with_mode(model, base_name, agent_type, mode):
+    """モード別の識別子優先度でモデルをロード"""
+    if mode == "refinement":
+        # refinement → initial → 汎用
+        search_paths = [
+            f"{base_name}_refinement_{agent_type}.pt",
+            f"{base_name}_initial_{agent_type}.pt",
+            f"{base_name}_{agent_type}.pt"
+        ]
+    else:  # initial
+        # initial → 汎用（refinement識別子は使わない）
+        search_paths = [
+            f"{base_name}_initial_{agent_type}.pt",
+            f"{base_name}_{agent_type}.pt"
+        ]
+    
+    print(f"[Model] Searching {agent_type} (mode={mode}):", flush=True)
+    for i, path in enumerate(search_paths, 1):
+        print(f"  [{i}] {path}...", flush=True, end=" ")
         if os.path.exists(path):
             try:
                 state_dict = torch.load(path, map_location="cpu")
                 model.load_state_dict(state_dict)
                 model.eval()
+                print(f"✓ LOADED", flush=True)
                 return path
-            except Exception:
+            except Exception as e:
+                print(f"✗ ERROR: {e}", flush=True)
                 continue
+        else:
+            print(f"✗ NOT FOUND", flush=True)
+    
+    print(f"[Model] {agent_type} model not found", flush=True)
     return None
+
+def load_model_safely(model, base_name, agent_type):
+    """後方互換性用（デフォルト: refinement モード）"""
+    return load_model_with_mode(model, base_name, agent_type, "refinement")
 
 def env_factory():
     """ AsyncVectorEnv 用。 """
@@ -1139,17 +1630,61 @@ def main():
         except RuntimeError:
             pass
 
-
+    # グローバル変数で vec_envs と agent を保持（Signal ハンドラからアクセス可能）
+    state_ref = {'vec_envs': None, 'agent': None, 'global_step': 0, 'device': None}
+    
+    def signal_handler(signum, frame):
+        """Ctrl+C や SIGTERM で graceful shutdown を実行"""
+        print("\n[SHUTDOWN] Received signal, saving model and closing environments...", flush=True)
+        
+        # モデル保存
+        if state_ref['agent'] is not None and state_ref['device'] is not None:
+            try:
+                save_path = SAVE_MODEL_PATH.replace('.pt', '_checkpoint_emergency.pt')
+                torch.save(state_ref['agent'].state_dict(), save_path)
+                checkpoint_path = save_path.replace('.pt', '.json')
+                with open(checkpoint_path, 'w') as f:
+                    json.dump({'global_step': state_ref['global_step']}, f)
+                print(f"[SHUTDOWN] Model saved: {save_path}", flush=True)
+            except Exception as e:
+                print(f"[SHUTDOWN] Error saving model: {e}")
+        
+        # 環境クローズ（パイプ破損エラーを無視）
+        if state_ref['vec_envs'] is not None:
+            try:
+                # タイムアウト付きで close を試みる
+                state_ref['vec_envs'].close(timeout=1.0)
+                print("[SHUTDOWN] Environments closed.", flush=True)
+            except (EOFError, BrokenPipeError, ConnectionResetError):
+                # パイプ破損エラーは無視（プロセスはどっちにしろ終了する）
+                print("[SHUTDOWN] Environment pipes already broken, forcing exit.", flush=True)
+            except Exception as e:
+                print(f"[SHUTDOWN] Error closing environments: {e}")
+        
+        sys.exit(0)
+    
+    # Signal ハンドラを登録
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     device = torch.device("cuda" if torch.cuda.is_available() and CUDA else "cpu")
+    state_ref['device'] = device
     run_time = int(time.time())
     run_id = f"{EXPERIMENT_NAME}_{TRAIN_TARGET}_{run_time}"
     
     if EXECUTION_MODE == "PLAY":
         print(f"--- Inference Mode (PLAY) ---")
+        print(f"[PLAY] MODE={MODE}, TRAIN_TARGET={TRAIN_TARGET}")
         env = TeamCosEnv(render_mode="human")
         model = Agent(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
-        load_model_safely(model, EXPERIMENT_BASE_NAME, TRAIN_TARGET)
+        print(f"[PLAY] Loading main model ({TRAIN_TARGET})...")
+        model_path = load_model_safely(model, EXPERIMENT_BASE_NAME, TRAIN_TARGET)
+        if model_path:
+            print(f"[PLAY] ✓ Main model loaded: {model_path}")
+        else:
+            print(f"[PLAY] ✗ Main model not found")
         model.eval()
+        print(f"[PLAY] Environment NPC models: (see above for details)")
         obs_history = ObsHistory(1, TRANSFORMER_SEQ_LEN, env.observation_space.shape[0], device)
         try:
             while True:
@@ -1193,6 +1728,7 @@ def main():
     print(f"--- [Parent] 1. Initializing {NUM_ENVS} workers ---", flush=True)
     try:
         vec_envs = gym.vector.AsyncVectorEnv([env_factory for _ in range(NUM_ENVS)])
+        state_ref['vec_envs'] = vec_envs  # Signal ハンドラからアクセス可能に
         print("--- [Parent] 2. Parallel environment ready ---", flush=True)
     except Exception as e:
         print(f"--- [Parent] startup failed: {e} ---", flush=True)
@@ -1203,14 +1739,17 @@ def main():
 
     writer = SummaryWriter(f"runs/{run_id}")
     agent = Agent(vec_envs.single_observation_space.shape[0], vec_envs.single_action_space.shape[0]).to(device)
+    state_ref['agent'] = agent  # Signal ハンドラからアクセス可能に
     optimizer = optim.Adam(agent.parameters(), lr=LEARNING_RATE, eps=1e-5)
     
     global_step = 0
     start_step = 0
     if LOAD_EXISTING_MODELS:
+        print(f"[Training] MODE={MODE}, TRAIN_TARGET={TRAIN_TARGET}")
+        print(f"[Training] Loading agent model...")
         model_path = load_model_safely(agent, EXPERIMENT_BASE_NAME, TRAIN_TARGET)
         if model_path:
-            print(f"★ Resumed learner from: {model_path}")
+            print(f"[Training] ✓ Agent model resumed: {model_path}")
             checkpoint_path = model_path.replace('.pt', '_checkpoint.json')
             if os.path.exists(checkpoint_path):
                 try:
@@ -1220,6 +1759,10 @@ def main():
                         start_step = global_step
                 except:
                     pass
+        else:
+            print(f"[Training] ✗ Agent model not found, training from scratch")
+    else:
+        print(f"[Training] LOAD_EXISTING_MODELS=False, training from scratch")
 
     # --- ROLLOUT BUFFER ---
     obs_history = ObsHistory(NUM_ENVS, TRANSFORMER_SEQ_LEN, 53, device)
@@ -1249,6 +1792,7 @@ def main():
         for u in tqdm(range(1, num_updates + 1), desc="Updates"):
             for step in range(S):
                 global_step = global_step + E
+                state_ref['global_step'] = global_step  # Signal ハンドラ用に同期
                 batch_obs[step] = obs_history.get()
                 batch_dones[step] = next_done
                 
