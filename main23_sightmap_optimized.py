@@ -139,8 +139,8 @@ MAX_STEPS = 300
 FOV_DEG = 135
 
 # キャッシュ閾値
-LIDAR_CACHE_POS_THRESH = 0.05
-LIDAR_CACHE_ANG_THRESH = np.deg2rad(2.0)
+LIDAR_CACHE_POS_THRESH = 0.25    # 25cm（毎フレーム再計算ほぼ不要）
+LIDAR_CACHE_ANG_THRESH = np.deg2rad(4.0)  # 4度
 RAYCAST_CACHE_POS_THRESH = 0.05
 
 # 視界外情報の外れ値マスク
@@ -160,6 +160,9 @@ HIDER_THRUST_LIMIT = 0.40
 SEEKER_THRUST_LIMIT = 0.35 
 SEEKER_RB_THRUST = 0.38
 SEEKER_RB_TURN_THRESH = np.pi / 6.0
+
+# Lidar レイキャスト方式選択
+USE_MUJOCO_RAY_FOR_LIDAR = True  # True: mujoco.mj_ray (高速), False: Sphere Tracing (精密)
 
 SAVE_MODEL_PATH = f"{EXPERIMENT_NAME}_{TRAIN_TARGET}.pt"
 
@@ -317,9 +320,9 @@ def create_cell_grid(bounds: float, cell_size: float) -> Tuple[np.ndarray, Dict]
     return cell_centers, metadata
 
 def build_visibility_cache(cell_centers: np.ndarray, wall_segments: List) -> np.ndarray:
-    """セル間の可視性をすべて計算してキャッシュ化（1次元インデックス配列）"""
+    """セル間の可視性をすべて計算してキャッシュ化（NumPy2D配列）"""
     num_cells = len(cell_centers)
-    # 1次元インデックスペア (i, j) をそのまま2次元配列に保存
+    # NumPy 2D配列：CPU キャッシュ効率が高い
     cache = np.ones((num_cells, num_cells), dtype=np.uint8)  # デフォルト可視
     print(f"Building visibility cache for {num_cells} cells...")
     for i in range(num_cells):
@@ -478,7 +481,7 @@ class VisibilityEngine:
     SDFとSphere Tracingを用いた視界観測エンジン
     静的壁はXMLから抽出、可動物はリアルタイム計算
     """
-    def __init__(self, model, data, epsilon=0.05, max_steps=15, max_dist=2.5):
+    def __init__(self, model, data, epsilon=0.1, max_steps=15, max_dist=2.5):
         self.model = model
         self.data = data
         self.epsilon = epsilon
@@ -697,7 +700,7 @@ class VisibilityEngine:
             # フォールバック：その場で計算（コストあり）
             return self.get_sdf_static(p)
         
-        # グリッド座標に変換
+        # グリッド座標に変換（最近傍補間）
         grid_size = self.sdf_field.shape
         cell_size = 12.0 / (grid_size[0] - 1)  # 12m環境
         grid_x = (p[0] + 6.0) / cell_size
@@ -707,23 +710,13 @@ class VisibilityEngine:
         if grid_x < 0 or grid_x >= grid_size[0] or grid_y < 0 or grid_y >= grid_size[1]:
             return 1e6  # 環境外
         
-        # 双線形補間
-        x0, x1 = int(grid_x), int(grid_x) + 1
-        y0, y1 = int(grid_y), int(grid_y) + 1
-        fx = grid_x - x0
-        fy = grid_y - y0
+        # ★最適化：単純な最近傍補間に簡略化
+        x = int(np.round(grid_x))
+        y = int(np.round(grid_y))
+        x = np.clip(x, 0, grid_size[0] - 1)
+        y = np.clip(y, 0, grid_size[1] - 1)
         
-        x0, x1 = np.clip([x0, x1], 0, grid_size[0] - 1)
-        y0, y1 = np.clip([y0, y1], 0, grid_size[1] - 1)
-        
-        v00 = self.sdf_field[x0, y0]
-        v10 = self.sdf_field[x1, y0]
-        v01 = self.sdf_field[x0, y1]
-        v11 = self.sdf_field[x1, y1]
-        
-        v0 = v00 * (1 - fx) + v10 * fx
-        v1 = v01 * (1 - fx) + v11 * fx
-        return v0 * (1 - fy) + v1 * fy
+        return float(self.sdf_field[x, y])
     
 # ==========================================
 # 2. クラス定義 (Agent / ObsHistory / Env)
@@ -1119,10 +1112,18 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         )
         return dist, self._raycast_geomid[0]
     
+    def _get_exclude_body_for_agent(self, agent_id):
+        """エージェント ID から除外する body_id を取得"""
+        if agent_id == 0:
+            return self.s0_body
+        elif agent_id == 1:
+            return self.h1_body
+        else:
+            return self.h2_body
+    
     def _is_visible(self, origin_pos, origin_rot, target_pos, target_body_id, agent_id):
         """
-        オブジェクトの可視性判定（Sightmap高速版）
-        静的壁はキャッシュから判定、動的障害物は2D投影で判定
+        オブジェクトの可視性判定（Sightmap高速版 - 静的壁キャッシュのみ）
         """
         pos_a = np.array(origin_pos[:2], dtype=np.float32)
         pos_b = np.array(target_pos[:2], dtype=np.float32)
@@ -1139,73 +1140,16 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         if abs(rel_angle) > np.deg2rad(FOV_DEG / 2.0):
             return False, -1
         
-        # 3. レイキャストによる遮蔽チェック
-        # 静的壁の可視性はキャッシュで高速化
+        # 3. 静的壁のキャッシュチェックのみ（動的障害物チェックは削除）
         idx_a = pos2idx(pos_a, self.sightmap_bounds, self.sightmap_cell_size, self.grid_n)
         idx_b = pos2idx(pos_b, self.sightmap_bounds, self.sightmap_cell_size, self.grid_n)
         
-        # デバッグ：キャッシュの値を確認
         try:
             cache_val = self.visibility_cache[idx_a, idx_b]
-        except Exception as e:
-            print(f"[DEBUG] Cache access error: idx_a={idx_a}, idx_b={idx_b}, cache shape={self.visibility_cache.shape}, error={e}")
-            return False, -1
+        except (IndexError, RuntimeError):
+            cache_val = 1
         
-        # キャッシュで (idx_a, idx_b) ペアの可視性をチェック
-        if cache_val == 0:
-            return False, -1
-        
-        # 動的障害物（box, ramp）のチェック：ターゲット方向の視線上にあるかを確認
-        # エージェント同士の遮蔽は無視（エージェントは動くため意味がない）
-        direction = diff / dist  # ターゲット方向の単位ベクトル
-        
-        # Sightmap で静的壁は clear なので、動的障害物だけチェック
-        box_bodies = self.visibility_engine.box_bodies
-        ramp_body = self.visibility_engine.ramp_body
-        
-        # 各障害物についてチェック
-        obstacles = []
-        
-        # Box1, Box2
-        for box_id in box_bodies:
-            box_pos = self.data.xpos[box_id][:2]
-            
-            # オブザーバーから障害物へのベクトル
-            to_obstacle = box_pos - pos_a
-            
-            # ターゲット方向への投影距離（direction 方向でどこまでか）
-            dist_along_direction = np.dot(to_obstacle, direction)
-            
-            # ターゲットより手前か
-            if dist_along_direction < dist - 0.5:  # 0.5m の余裕
-                # vision line からの横ずれ
-                # 投影点を計算
-                projected_point = pos_a + direction * dist_along_direction
-                lateral_dist = np.linalg.norm(box_pos - projected_point)
-                
-                # 横ずれがボックス半径（0.84m）より小さければ視線を遮る
-                if lateral_dist < 0.84:
-                    obstacles.append(('Box', box_id, dist_along_direction, lateral_dist))
-        
-        # Ramp
-        ramp_pos = self.data.xpos[ramp_body][:2]
-        to_obstacle = ramp_pos - pos_a
-        dist_along_direction = np.dot(to_obstacle, direction)
-        
-        if dist_along_direction < dist - 0.5:
-            projected_point = pos_a + direction * dist_along_direction
-            lateral_dist = np.linalg.norm(ramp_pos - projected_point)
-            
-            if lateral_dist < 0.836:  # ランプの半径
-                obstacles.append(('Ramp', ramp_body, dist_along_direction, lateral_dist))
-        
-        # デバッグ出力
-        if obstacles:
-            # ターゲット方向に障害物がある
-            return False, -1
-        else:
-            # 障害物がない
-            return True, target_body_id
+        return (cache_val == 1), target_body_id if cache_val == 1 else -1
     
     def _get_obs(self, agent_id):
         """ 個体固有の 53次元観測。自己状態変数の名称を統一。 """
@@ -1258,25 +1202,47 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
                     # キャッシュヒット：前フレームの Lidar 結果を再利用
                     lidar = cached_lidar.copy()
         
-        # キャッシュミス：毎フレーム Sphere Tracing で計算
+        # キャッシュミス：Lidar を計算
         if lidar is None:
             lidar = np.zeros(len(self.lidar_angles), dtype=np.float32)
             
-            for i, angle_offset in enumerate(self.lidar_angles):
-                beam_angle = angle_offset + yaw
-                
-                # ★最適化: バッファに直接書き込み（配列生成を削減）
-                self._lidar_dir[0] = np.cos(beam_angle)
-                self._lidar_dir[1] = np.sin(beam_angle)
-                
-                # 光線開始位置をバッファに書き込み
-                self._lidar_from_pos[0] = pos[0]
-                self._lidar_from_pos[1] = pos[1]
-                self._lidar_from_pos[2] = 0.5
-                
-                # Sphere Tracing で距離を測定（静的壁+動的障害物）
-                dist, _ = self.visibility_engine.cast_ray(self._lidar_from_pos, self._lidar_dir, exclude_agent_id=agent_id)
-                lidar[i] = min(dist, 2.5) / 2.5 if dist >= 0 else 1.0
+            if USE_MUJOCO_RAY_FOR_LIDAR:
+                # ★高速版：mujoco.mj_ray（C 実装）
+                for i, angle_offset in enumerate(self.lidar_angles):
+                    beam_angle = angle_offset + yaw
+                    self._lidar_dir[0] = np.cos(beam_angle)
+                    self._lidar_dir[1] = np.sin(beam_angle)
+                    
+                    self._lidar_from_pos[0] = pos[0]
+                    self._lidar_from_pos[1] = pos[1]
+                    self._lidar_from_pos[2] = 0.5
+                    
+                    # mujoco.mj_ray で距離を測定（引数は [3, 1] の列ベクトル形式）
+                    pnt = np.array([self._lidar_from_pos[0], self._lidar_from_pos[1], self._lidar_from_pos[2]], dtype=np.float64).reshape(3, 1)
+                    vec = np.array([self._lidar_dir[0], self._lidar_dir[1], 0.0], dtype=np.float64).reshape(3, 1)
+                    
+                    dist = mujoco.mj_ray(
+                        self.model, self.data,
+                        pnt, vec,
+                        None, 1,
+                        self._get_exclude_body_for_agent(agent_id),
+                        self._raycast_geomid
+                    )
+                    lidar[i] = min(dist, 2.4) / 2.5 if dist >= 0 else 1.0
+            else:
+                # ★精密版：Sphere Tracing
+                for i, angle_offset in enumerate(self.lidar_angles):
+                    beam_angle = angle_offset + yaw
+                    
+                    self._lidar_dir[0] = np.cos(beam_angle)
+                    self._lidar_dir[1] = np.sin(beam_angle)
+                    
+                    self._lidar_from_pos[0] = pos[0]
+                    self._lidar_from_pos[1] = pos[1]
+                    self._lidar_from_pos[2] = 0.5
+                    
+                    dist, _ = self.visibility_engine.cast_ray(self._lidar_from_pos, self._lidar_dir, exclude_agent_id=agent_id)
+                    lidar[i] = min(dist, 2.5) / 2.5 if dist >= 0 else 1.0
             
             # キャッシュに保存
             self.lidar_cache[agent_id] = (pos.copy(), yaw, lidar.copy())
@@ -1490,6 +1456,10 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         self.current_step = self.current_step + 1
         for i in [1, 2]:
             self.lock_cooldown[i] = max(0, self.lock_cooldown[i] - 1)
+        
+        # ★最適化: 動的オブジェクト位置の更新は step() 内で一度だけ実行
+        self.visibility_engine.update_dynamic_positions()
+        
         self._update_seeker_state()
         self.data.ctrl[:] = 0.0 
         
