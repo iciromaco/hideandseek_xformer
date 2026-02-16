@@ -803,7 +803,7 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         # ★ 属性初期化の順序厳守 (reset() 時の参照バグ防止)
         self.hider_pos = {1: None, 2: None}
         self.dist_to_seeker = {1: 0.0, 2: 0.0}
-        self.lidar_cache = {} 
+        self.lidar_cache = {}  # Lidar出力キャッシュ: {agent_id: (pos, yaw, lidar_array)}
         self.raycast_cache = {} 
         self.raycast_perf = {"hits": 0, "misses": 0}
         self.visible_map = {0: {}, 1: {}, 2: {}}
@@ -812,8 +812,6 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         self.caught_steps = 0 
         self.recovery_turn_dir = 1.0
         self.visible_names = {0: [], 1: [], 2: []}
-
-        self.lidar_cache = {} 
 
         # 親クラスの初期化
         super().__init__(render_mode=render_mode)
@@ -1185,24 +1183,39 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
             [yaw, np.cos(yaw), np.sin(yaw)]
         ])
         
-        # 1. Lidar データの生成 (毎フレーム Sphere Tracing で計算)
-        lidar = np.zeros(len(self.lidar_angles), dtype=np.float32)
+        # 1. Lidar データの生成 (キャッシュ活用で高速化)
+        lidar = None
+        if agent_id in self.lidar_cache:
+            cached_pos, cached_yaw, cached_lidar = self.lidar_cache[agent_id]
+            pos_diff = np.linalg.norm(pos - cached_pos)
+            if pos_diff < LIDAR_CACHE_POS_THRESH:
+                yaw_diff = (yaw - cached_yaw + np.pi) % (2.0 * np.pi) - np.pi
+                if abs(yaw_diff) < LIDAR_CACHE_ANG_THRESH:
+                    # キャッシュヒット：前フレームの Lidar 結果を再利用
+                    lidar = cached_lidar.copy()
         
-        for i, angle_offset in enumerate(self.lidar_angles):
-            beam_angle = angle_offset + yaw
+        # キャッシュミス：毎フレーム Sphere Tracing で計算
+        if lidar is None:
+            lidar = np.zeros(len(self.lidar_angles), dtype=np.float32)
             
-            # ★最適化: バッファに直接書き込み（配列生成を削減）
-            self._lidar_dir[0] = np.cos(beam_angle)
-            self._lidar_dir[1] = np.sin(beam_angle)
+            for i, angle_offset in enumerate(self.lidar_angles):
+                beam_angle = angle_offset + yaw
+                
+                # ★最適化: バッファに直接書き込み（配列生成を削減）
+                self._lidar_dir[0] = np.cos(beam_angle)
+                self._lidar_dir[1] = np.sin(beam_angle)
+                
+                # 光線開始位置をバッファに書き込み
+                self._lidar_from_pos[0] = pos[0]
+                self._lidar_from_pos[1] = pos[1]
+                self._lidar_from_pos[2] = 0.5
+                
+                # Sphere Tracing で距離を測定（静的壁+動的障害物）
+                dist, _ = self.visibility_engine.cast_ray(self._lidar_from_pos, self._lidar_dir, exclude_agent_id=agent_id)
+                lidar[i] = min(dist, 2.5) / 2.5 if dist >= 0 else 1.0
             
-            # 光線開始位置をバッファに書き込み
-            self._lidar_from_pos[0] = pos[0]
-            self._lidar_from_pos[1] = pos[1]
-            self._lidar_from_pos[2] = 0.5
-            
-            # Sphere Tracing で距離を測定（静的壁+動的障害物）
-            dist, _ = self.visibility_engine.cast_ray(self._lidar_from_pos, self._lidar_dir, exclude_agent_id=agent_id)
-            lidar[i] = min(dist, 2.5) / 2.5 if dist >= 0 else 1.0
+            # キャッシュに保存
+            self.lidar_cache[agent_id] = (pos.copy(), yaw, lidar.copy())
 
         # 2. オブジェクト視認情報の更新
         vis_lookup_record_dict_ref = self.visible_map[agent_id]
