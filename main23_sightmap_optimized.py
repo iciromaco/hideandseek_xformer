@@ -29,6 +29,20 @@ import multiprocessing
 from tqdm import tqdm
 from pathlib import Path
 from typing import List, Tuple, Dict
+import math
+
+# Numba（高速化）
+try:
+    from numba import njit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("Warning: numba not available. Using fallback implementation.")
+    # njit のダミー実装
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 # 強化学習・物理演算ライブラリのインポート (グローバルスコープ)
 import torch
@@ -101,7 +115,7 @@ if MODE == "refinement":
     LOAD_EXISTING_MODELS = True
 
 # 実行モードの設定
-EXECUTION_MODE = "TRAIN" # "TRAIN" / "PLAY"
+EXECUTION_MODE = "PLAY" # "TRAIN" / "PLAY"
 
 # モデル保存および記録の有無
 SAVE_MODEL = True
@@ -138,9 +152,13 @@ PREP_STEPS = 80
 MAX_STEPS = 300
 FOV_DEG = 135
 
+# FOV 計算用のグローバル定数（毎回計算を避けるため事前計算）
+FOV_HALF_RAD = FOV_DEG * 0.5 * math.pi / 180.0
+FOV_COS_HALF = math.cos(FOV_HALF_RAD)
+
 # キャッシュ閾値
-LIDAR_CACHE_POS_THRESH = 0.25    # 25cm（毎フレーム再計算ほぼ不要）
-LIDAR_CACHE_ANG_THRESH = np.deg2rad(4.0)  # 4度
+LIDAR_CACHE_POS_THRESH = 0.0 # 0.25    # 25cm（毎フレーム再計算ほぼ不要）
+LIDAR_CACHE_ANG_THRESH = 0.0 # np.deg2rad(4.0)  # 4度
 RAYCAST_CACHE_POS_THRESH = 0.05
 
 # Lidar 最大距離（正規化上限）
@@ -165,7 +183,7 @@ SEEKER_RB_THRUST = 0.38
 SEEKER_RB_TURN_THRESH = np.pi / 6.0
 
 # Lidar レイキャスト方式選択
-USE_MUJOCO_RAY_FOR_LIDAR = True  # True: mujoco.mj_ray (高速), False: Sphere Tracing (精密)
+USE_MUJOCO_RAY_FOR_LIDAR = False  # True: mujoco.mj_ray (高速), False: Sphere Tracing (精密)
 
 SAVE_MODEL_PATH = f"{EXPERIMENT_NAME}_{TRAIN_TARGET}.pt"
 
@@ -180,6 +198,134 @@ SDF_CELL_SIZE = 0.02            # SDF距離場用セルサイズ（細かい、�
 MAZE_PREFIX = "maze_"           # 内壁の接頭語
 VISIBILITY_CACHE_FILE = "visibility_cache.pkl"
 SDF_DISTANCE_FIELD_FILE = "sdf_distance_field.pkl"
+
+@njit(cache=True, fastmath=True)
+def ccw_numba(ax, ay, bx, by, cx, cy):
+    """時計回り判定（numba版）"""
+    return (cy - ay) * (bx - ax) > (by - ay) * (cx - ax)
+
+@njit(cache=True, fastmath=True)
+def segments_intersect_numba(ax, ay, bx, by, cx, cy, dx, dy):
+    """線分AB と CD が交差するかどうか（numba版）"""
+    ccw1 = ccw_numba(ax, ay, cx, cy, dx, dy)
+    ccw2 = ccw_numba(bx, by, cx, cy, dx, dy)
+    ccw3 = ccw_numba(ax, ay, bx, by, cx, cy)
+    ccw4 = ccw_numba(ax, ay, bx, by, dx, dy)
+    return (ccw1 != ccw2) and (ccw3 != ccw4)
+
+@njit(cache=True, fastmath=True)
+def is_visible_static_numba(p1x, p1y, p2x, p2y, wall_segments_array, num_walls):
+    """
+    2点が互いに見えるか判定（numba版）
+    
+    Args:
+        p1x, p1y: 点1の座標
+        p2x, p2y: 点2の座標
+        wall_segments_array: 壁の線分配列 (N, 2, 2) - N個の線分、各線分は2点
+        num_walls: 壁の数
+    
+    Returns:
+        可視性 (bool)
+    """
+    for i in range(num_walls):
+        seg_start_x = wall_segments_array[i, 0, 0]
+        seg_start_y = wall_segments_array[i, 0, 1]
+        seg_end_x = wall_segments_array[i, 1, 0]
+        seg_end_y = wall_segments_array[i, 1, 1]
+        
+        if segments_intersect_numba(p1x, p1y, p2x, p2y, seg_start_x, seg_start_y, seg_end_x, seg_end_y):
+            return False
+    return True
+
+@njit(cache=True, fastmath=True, parallel=False)
+def build_visibility_cache_numba(cell_centers, wall_segments_array, num_cells, num_walls):
+    """
+    可視性キャッシュのビルド（numba版）
+    
+    Args:
+        cell_centers: セル中心座標 (N, 2)
+        wall_segments_array: 壁の線分配列 (M, 2, 2)
+        num_cells: セル数
+        num_walls: 壁の数
+    
+    Returns:
+        可視性キャッシュ (N, N)
+    """
+    cache = np.ones((num_cells, num_cells), dtype=np.uint8)
+    
+    for i in range(num_cells):
+        p1x = cell_centers[i, 0]
+        p1y = cell_centers[i, 1]
+        
+        for j in range(i + 1, num_cells):
+            p2x = cell_centers[j, 0]
+            p2y = cell_centers[j, 1]
+            
+            visible = is_visible_static_numba(p1x, p1y, p2x, p2y, wall_segments_array, num_walls)
+            val = 1 if visible else 0
+            cache[i, j] = val
+            cache[j, i] = val
+    
+    return cache
+
+# 互換性のために残す（numpy版）
+@njit(cache=True, fastmath=True)
+def is_visible_numba(ax, ay, origin_rot, bx, by,
+                      visibility_cache, sightmap_bounds, sightmap_cell_size, grid_n,
+                      half_fov_rad, cos_half_fov):
+    """
+    Numba高速化版：オブジェクトの可視性判定
+    
+    Args:
+        ax, ay: 観渫者位置
+        origin_rot: 観渫者方向
+        bx, by: ターゲット位置
+        visibility_cache: 可視性キャッシュ
+        sightmap_bounds: sightmap範囲
+        sightmap_cell_size: sightmapセルサイズ
+        grid_n: グリッド数
+        half_fov_rad: FOV/2 (ラジアン)
+        cos_half_fov: cos(FOV/2)
+    
+    Returns:
+        (可視性, target_body_id or -1)
+    """
+    dx = bx - ax
+    dy = by - ay
+    dist_sq = dx*dx + dy*dy
+    
+    # 1. 距離チェック
+    if dist_sq < 0.01:  # 0.1m以下
+        return True, 1
+    
+    # 2. 視野角判定 (FOV)
+    forward_x = math.cos(origin_rot)
+    forward_y = math.sin(origin_rot)
+    dot = dx*forward_x + dy*forward_y
+    if dot < math.sqrt(dist_sq) * cos_half_fov:
+        return False, 0
+    
+    # 3. 静的壁キャッシュをルックアップ
+    # グリッド座標計算 (pos2idx 盤隆）
+    grid_x_a = int((ax + sightmap_bounds) / sightmap_cell_size)
+    grid_y_a = int((ay + sightmap_bounds) / sightmap_cell_size)
+    grid_x_a = max(0, min(grid_n - 1, grid_x_a))
+    grid_y_a = max(0, min(grid_n - 1, grid_y_a))
+    idx_a = grid_x_a * grid_n + grid_y_a
+    
+    grid_x_b = int((bx + sightmap_bounds) / sightmap_cell_size)
+    grid_y_b = int((by + sightmap_bounds) / sightmap_cell_size)
+    grid_x_b = max(0, min(grid_n - 1, grid_x_b))
+    grid_y_b = max(0, min(grid_n - 1, grid_y_b))
+    idx_b = grid_x_b * grid_n + grid_y_b
+    
+    # キャッシュアクセス
+    try:
+        cache_val = visibility_cache[idx_a, idx_b]
+    except:
+        cache_val = 1
+    
+    return cache_val == 1, 1
 
 def ccw(A: np.ndarray, B: np.ndarray, C: np.ndarray) -> bool:
     """時計回り判定"""
@@ -325,19 +471,22 @@ def create_cell_grid(bounds: float, cell_size: float) -> Tuple[np.ndarray, Dict]
 def build_visibility_cache(cell_centers: np.ndarray, wall_segments: List) -> np.ndarray:
     """セル間の可視性をすべて計算してキャッシュ化（NumPy2D配列）"""
     num_cells = len(cell_centers)
-    # NumPy 2D配列：CPU キャッシュ効率が高い
-    cache = np.ones((num_cells, num_cells), dtype=np.uint8)  # デフォルト可視
+    num_walls = len(wall_segments)
+    
     print(f"Building visibility cache for {num_cells} cells...")
-    for i in range(num_cells):
-        for j in range(i + 1, num_cells):
-            p1 = cell_centers[i]
-            p2 = cell_centers[j]
-            visible = is_visible_static(p1, p2, wall_segments)
-            val = 1 if visible else 0
-            cache[i, j] = val  # (i, j) ペア
-            cache[j, i] = val  # 対称性
-        if (i + 1) % max(1, num_cells // 10) == 0:
-            print(f"  Progress: {(i + 1) / num_cells * 100:.1f}%")
+    
+    # wall_segments を numpy 配列に変換 (N, 2, 2)
+    wall_segments_array = np.zeros((num_walls, 2, 2), dtype=np.float32)
+    for i, seg in enumerate(wall_segments):
+        wall_segments_array[i, 0, 0] = seg[0][0]  # start_x
+        wall_segments_array[i, 0, 1] = seg[0][1]  # start_y
+        wall_segments_array[i, 1, 0] = seg[1][0]  # end_x
+        wall_segments_array[i, 1, 1] = seg[1][1]  # end_y
+    
+    # numba 高速化関数を呼び出し
+    cache = build_visibility_cache_numba(cell_centers, wall_segments_array, num_cells, num_walls)
+    
+    print(f"  ✓ Visibility cache built ({num_cells}x{num_cells} cells)")
     return cache
 
 def save_visibility_cache(cache: np.ndarray, cell_centers: np.ndarray, metadata: Dict, output_file: str):
@@ -410,6 +559,102 @@ def pos2idx(point: np.ndarray, bounds: float, cell_size: float, grid_n: int) -> 
     grid_y = max(0, min(grid_n - 1, grid_y))
     # 1次元インデックスに変換（y軸優先）
     return grid_x * grid_n + grid_y
+
+@njit(cache=True, fastmath=True)
+def sdf_lookup_numba(p_x, p_y, sdf_field, grid_size_0, grid_size_1, cell_size):
+    """
+    Numba高速化版：SDF距離場のルックアップ（最近傍補間）
+    
+    Args:
+        p_x, p_y: 点のXY座標
+        sdf_field: SDF距離場 (grid_size_0, grid_size_1)
+        grid_size_0, grid_size_1: グリッドサイズ
+        cell_size: セルサイズ
+    
+    Returns:
+        SDF値 (float)
+    """
+    inv_float = 1.0 / cell_size
+    grid_x = (p_x + 6.0) * inv_float
+    grid_y = (p_y + 6.0) * inv_float
+    
+    # 境界チェック
+    if grid_x < 0 or grid_x >= grid_size_0 or grid_y < 0 or grid_y >= grid_size_1:
+        return 1e6
+    
+    # 最近傍補間
+    x = int(grid_x + 0.5)  # 0.5を加えて四捨五入
+    y = int(grid_y + 0.5)  # 0.5を加えて四捨五入
+    
+    # クランプ
+    if 0 <= x < grid_size_0 and 0 <= y < grid_size_1:
+        return sdf_field[x, y] 
+    else:
+        return 1e6
+
+@njit(cache=True, fastmath=True)
+def cast_ray_numba(start_x, start_y, dir_x, dir_y, 
+                   sdf_field, grid_size_0, grid_size_1, cell_size,
+                   positions, radii, body_ids, num_objects, 
+                   exclude_id1, exclude_id2,
+                   epsilon, max_steps, max_dist):
+    """
+    Numba高速化版：Sphere Tracing による光線距離計算
+    
+    Args:
+        start_x, start_y: 開始位置
+        dir_x, dir_y: 方向ベクトル
+        sdf_field: 静的SDF距離場
+        grid_size_0, grid_size_1: グリッドサイズ
+        cell_size: セルサイズ
+        positions: 動的オブジェクトの位置
+        radii: 動的オブジェクトの半径
+        body_ids: 動的オブジェクトのbody_id
+        num_objects: 動的オブジェクト数
+        exclude_id1, exclude_id2: 除外body_id
+        epsilon: 収束判定閾値
+        max_steps: 最大ステップ数
+        max_dist: 最大距離
+    
+    Returns:
+        (距離, ヒット判定)
+    """
+    curr_x = start_x
+    curr_y = start_y
+    total_d = 0.0
+    
+    for step in range(max_steps):
+        # 静的SDF
+        d_static = sdf_lookup_numba(curr_x, curr_y, sdf_field, grid_size_0, grid_size_1, cell_size)
+        
+        # 動的SDF
+        d_dynamic = 1e6
+        for i in range(num_objects):
+            bid = body_ids[i]
+            if bid != exclude_id1 and bid != exclude_id2:
+                dx = positions[i, 0] - curr_x
+                dy = positions[i, 1] - curr_y
+                dist = math.sqrt(dx * dx + dy * dy) - radii[i]
+                if dist < d_dynamic:
+                    d_dynamic = dist
+        
+        # 最小距離
+        d = min(d_static, d_dynamic)
+        
+        if d < epsilon:
+            return total_d, True
+        
+        total_d += d
+        curr_x += dir_x * d
+        curr_y += dir_y * d
+        
+        if total_d > max_dist:
+            break
+    
+    if total_d < max_dist:
+        return total_d, False
+    else:
+        return max_dist, False
 
 def get_2d_geom_segments(model: mujoco.MjModel, data: mujoco.MjData, geom_names: List[str]) -> List[Dict]:
     """MuJoCoのgeomの現在位置から2D線分を抽出（Lidar用に最適化）"""
@@ -549,6 +794,8 @@ class VisibilityEngine:
         self.num_dynamic_objects = len(self.dynamic_body_ids)
         self.dynamic_radii[:self.num_dynamic_objects] = self.dynamic_body_radii
         
+        # Numba用にbody_idsをnumpy配列に変換（int型）
+        self.dynamic_body_ids_array = np.array(self.dynamic_body_ids, dtype=np.int32)
     
     def update_dynamic_positions(self):
         """毎フレーム、動的オブジェクトの位置を更新（cast_ray呼び出し前に実行）"""
@@ -607,42 +854,6 @@ class VisibilityEngine:
             # 環境外：外壁までの距離
             return min(boundary_dist, min_wall_dist)
     
-    def get_sdf_dynamic(self, p, exclude_agent_id=None, exclude_body_id=None):
-        """
-        点pから可動物までの最小距離（リアルタイム計算）
-        事前割り当てされた配列を使用（毎フレーム update_dynamic_positions() で更新）
-        exclude_agent_id: 除外するエージェント ID（自分自身を除外）
-        exclude_body_id: 除外する body_id（target を除外）
-        """
-        if self.num_dynamic_objects == 0:
-            return 1e6
-        
-        # 除外対象の body_id を取得
-        exclude_body_ids = set()
-        if exclude_agent_id is not None:
-            if exclude_agent_id in self.agent_bodies:
-                exclude_body_ids.add(self.agent_bodies[exclude_agent_id])
-        if exclude_body_id is not None:
-            exclude_body_ids.add(exclude_body_id)
-        
-        # ベクトル化：全可動物の距離を一度に計算
-        positions = self.dynamic_positions[:self.num_dynamic_objects]  # (N, 2)
-        radii = self.dynamic_radii[:self.num_dynamic_objects]  # (N,)
-        
-        # 点pから各オブジェクトへのベクトル
-        diff = positions - p[:2]  # (N, 2)
-        
-        # 距離を計算
-        dists = np.linalg.norm(diff, axis=1) - radii  # (N,)
-        
-        # 除外対象がある場合、そのインデックスをマスク
-        if exclude_body_ids:
-            mask = np.array([body_id not in exclude_body_ids for body_id in self.dynamic_body_ids[:self.num_dynamic_objects]])
-            dists = dists * mask + (1e6 * (~mask))  # 除外対象を 1e6 に置き換え
-        
-        min_dist = float(np.min(dists))
-        return min_dist
-    
     def _point_to_segment_distance(self, p, seg_start, seg_end):
         """点pから線分(seg_start, seg_end)までの距離"""
         seg_vec = seg_end - seg_start
@@ -671,27 +882,39 @@ class VisibilityEngine:
         exclude_body_id: ターゲットのbody_idを指定（ターゲットを除外）
         target_body_id: デバッグ用（ターゲットの body_id）
         """
-        self.sp_curr_p[:] = start_pos  # バッファに位置をコピー
-        total_d = 0.0
+        # SDF フィールドがない場合はフォールバック
+        if self.sdf_field is None:
+            return self.max_dist, False
         
-        for step in range(self.max_steps):
-            # 静的SDF（テーブル）と動的距離を組み合わせる
-            d_static = self._sdf_lookup(self.sp_curr_p)  # ルックアップ
-            d_dynamic = self.get_sdf_dynamic(self.sp_curr_p, exclude_agent_id=exclude_agent_id, exclude_body_id=exclude_body_id)
-            
-            # get_sdf_static() は既に環境内で正の値を返すので、そのまま使う
-            d = min(d_static, d_dynamic)
-            
-            if d < self.epsilon:
-                return total_d, True
-            total_d += d
-            self.sp_curr_p[0] += direction[0] * d  # 全座標を更新（Z=0のため）
-            self.sp_curr_p[1] += direction[1] * d
-
-            if total_d > self.max_dist:
-                break
+        # 除外IDを取得
+        exclude_id1 = -1
+        exclude_id2 = -1
         
-        return total_d if total_d < self.max_dist else self.max_dist, False
+        if exclude_agent_id is not None:
+            if exclude_agent_id in self.agent_bodies:
+                exclude_id1 = self.agent_bodies[exclude_agent_id]
+        
+        if exclude_body_id is not None:
+            if exclude_id1 == -1:
+                exclude_id1 = exclude_body_id
+            else:
+                exclude_id2 = exclude_body_id
+        
+        # Numba高速化関数を呼び出し
+        grid_size = self.sdf_field.shape
+        cell_size = 12.0 / (grid_size[0] - 1)
+        
+        dist, hit = cast_ray_numba(
+            start_pos[0], start_pos[1],
+            direction[0], direction[1],
+            self.sdf_field, grid_size[0], grid_size[1], cell_size,
+            self.dynamic_positions, self.dynamic_radii, self.dynamic_body_ids_array,
+            self.num_dynamic_objects,
+            exclude_id1, exclude_id2,
+            self.epsilon, self.max_steps, self.max_dist
+        )
+        
+        return dist, hit
     
     def _sdf_lookup(self, p):
         """
@@ -978,6 +1201,12 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         # 静的なゼロベクトル
         self._zero_vec_2 = np.zeros(2, dtype=np.float64)
         
+        # 回転行列バッファ（2×2）
+        self._rot_mat = np.zeros((2, 2), dtype=np.float64)
+        
+        # 自己状態バッファ（vel_x, vel_y, yaw, cos_yaw, sin_yaw）
+        self._self_state = np.zeros(5, dtype=np.float64)
+        
         # ★ Sightmap: 可視性キャッシュのロード/ビルド
         self._init_sightmap()
 
@@ -1110,31 +1339,23 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         """
         オブジェクトの可視性判定（Sightmap高速版 - 静的壁キャッシュのみ）
         """
-        pos_a = np.array(origin_pos[:2], dtype=np.float32)
-        pos_b = np.array(target_pos[:2], dtype=np.float32)
+        ax = origin_pos[0]
+        ay = origin_pos[1]
+        bx = target_pos[0]
+        by = target_pos[1]
         
-        # 1. 距離チェック（近すぎたら即可視）
-        diff = pos_b - pos_a
-        dist = np.linalg.norm(diff)
-        if dist < 0.1:
-            return True, target_body_id
+        # Numba高速化関数を呼び出し（FOV計算はグローバル定数を使用）
+        visible, _ = is_visible_numba(
+            ax, ay, origin_rot, bx, by,
+            self.visibility_cache,
+            self.sightmap_bounds,
+            self.sightmap_cell_size,
+            self.grid_n,
+            FOV_HALF_RAD,
+            FOV_COS_HALF
+        )
         
-        # 2. 視野角判定 (FOV)
-        angle = np.arctan2(diff[1], diff[0])
-        rel_angle = (angle - origin_rot + np.pi) % (2.0 * np.pi) - np.pi
-        if abs(rel_angle) > np.deg2rad(FOV_DEG / 2.0):
-            return False, -1
-        
-        # 3. 静的壁のキャッシュチェックのみ（動的障害物チェックは削除）
-        idx_a = pos2idx(pos_a, self.sightmap_bounds, self.sightmap_cell_size, self.grid_n)
-        idx_b = pos2idx(pos_b, self.sightmap_bounds, self.sightmap_cell_size, self.grid_n)
-        
-        try:
-            cache_val = self.visibility_cache[idx_a, idx_b]
-        except (IndexError, RuntimeError):
-            cache_val = 1
-        
-        return (cache_val == 1), target_body_id if cache_val == 1 else -1
+        return visible, target_body_id if visible else -1
     
     def _get_obs(self, agent_id):
         """ 個体固有の 53次元観測。自己状態変数の名称を統一。 """
@@ -1158,23 +1379,29 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         joint_rot = self.model.joint(f'{prefix}_rot')
         yaw = self.data.qpos[self.model.jnt_qposadr[joint_rot.id]]
         
-        # 回転行列の算出
-        cos_yaw = np.cos(-yaw)
-        sin_yaw = np.sin(-yaw)
-        rot_mat = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+        # ★最適化: yaw三角関数を1度計算（回転行列と自己状態で統一）
+        cos_yaw = np.cos(yaw)
+        sin_yaw = np.sin(yaw)
+        # 回転行列: [[cos(-yaw), -sin(-yaw)], [sin(-yaw), cos(-yaw)]] = [[cos(yaw), sin(yaw)], [-sin(yaw), cos(yaw)]]
+        self._rot_mat[0, 0] = cos_yaw
+        self._rot_mat[0, 1] = sin_yaw
+        self._rot_mat[1, 0] = -sin_yaw
+        self._rot_mat[1, 1] = cos_yaw
         
         # 物理速度取得
         move_joint = self.model.joint(f'{prefix}_x')
         dof_addr = self.model.jnt_dofadr[move_joint.id]
         vel_global = self.data.qvel[dof_addr : dof_addr + 2]
-        vel_local = rot_mat @ vel_global
+        vel_local = self._rot_mat @ vel_global
         vel_norm = vel_local / 12.0
         
-        # ★ 修正: 変数名を self_state に統一
-        self_state = np.concatenate([
-            vel_norm, 
-            [yaw, np.cos(yaw), np.sin(yaw)]
-        ])
+        # ★最適化: 事前確保バッファに直接代入（concatenate削除）
+        self._self_state[0] = vel_norm[0]
+        self._self_state[1] = vel_norm[1]
+        self._self_state[2] = yaw
+        self._self_state[3] = cos_yaw
+        self._self_state[4] = sin_yaw
+        self_state = self._self_state
         
         # 1. Lidar データの生成 (キャッシュ活用で高速化)
         lidar = None
@@ -1231,8 +1458,9 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
                     self._lidar_from_pos[1] = pos[1]
                     
                     dist, _ = self.visibility_engine.cast_ray(self._lidar_from_pos, self._lidar_dir, exclude_agent_id=agent_id)
-                    lidar[i] = min(dist, LIDAR_MAX_DIST) / LIDAR_MAX_DIST if dist >= 0 else 1.0
+                    lidar[i] = min(dist, LIDAR_MAX_DIST) / LIDAR_MAX_DIST if dist >= 0 else 1.0 
             
+            # print(step_accumulator, end=", ", flush=True)  # デバッグ: 全ビームの平均ステップ数を出力    
             # キャッシュに保存
             self.lidar_cache[agent_id] = (pos.copy(), yaw, lidar.copy())
 
@@ -1257,6 +1485,7 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
                 vis_lookup_record_dict_ref[tid] = is_visible
                 if is_visible:
                     self.visible_names[agent_id].append(name)
+
         def get_rel_obs(target_id, lock=None):
             """ 視認情報に基づくベクトル生成。 """
             is_visible = vis_lookup_record_dict_ref.get(target_id, False)
@@ -1513,7 +1742,9 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
             is_visible = self.visible_map[0].get(bid, False)
             seeker_pos = self.data.xpos[self.s0_body][:2]
             hider_pos = self.data.xpos[bid][:2]
-            current_dist = np.linalg.norm(hider_pos - seeker_pos)
+            # ★最適化: 二乗距離で計算（sqrt回避）
+            dist_sq = np.sum((hider_pos - seeker_pos) ** 2)
+            current_dist = np.sqrt(dist_sq)
             
             if is_visible:
                 seeker_yaw = self.data.qpos[self.srot_adr]
