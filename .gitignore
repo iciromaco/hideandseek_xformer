@@ -5,6 +5,8 @@ optuna_temp/
 sensitivity_results/
 sensitivity_results_multiseed/
 optuna_temp/
+trial_initial_???/
+tiial_refinement_???/
 trial???/
 optuna_results/trial_*/*
 *.pt
