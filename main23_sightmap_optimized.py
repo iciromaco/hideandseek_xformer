@@ -101,7 +101,7 @@ if MODE == "refinement":
     LOAD_EXISTING_MODELS = True
 
 # 実行モードの設定
-EXECUTION_MODE = "TRAIN"  # "TRAIN" / "PLAY"
+EXECUTION_MODE = "TRAIN" # "TRAIN" / "PLAY"
 
 # モデル保存および記録の有無
 SAVE_MODEL = True
@@ -142,6 +142,9 @@ FOV_DEG = 135
 LIDAR_CACHE_POS_THRESH = 0.25    # 25cm（毎フレーム再計算ほぼ不要）
 LIDAR_CACHE_ANG_THRESH = np.deg2rad(4.0)  # 4度
 RAYCAST_CACHE_POS_THRESH = 0.05
+
+# Lidar 最大距離（正規化上限）
+LIDAR_MAX_DIST = 15.0
 
 # 視界外情報の外れ値マスク
 OUTLIER_VALUE = 2.0
@@ -481,7 +484,7 @@ class VisibilityEngine:
     SDFとSphere Tracingを用いた視界観測エンジン
     静的壁はXMLから抽出、可動物はリアルタイム計算
     """
-    def __init__(self, model, data, epsilon=0.1, max_steps=15, max_dist=2.5):
+    def __init__(self, model, data, epsilon=0.1, max_steps=15, max_dist=LIDAR_MAX_DIST):
         self.model = model
         self.data = data
         self.epsilon = epsilon
@@ -518,9 +521,7 @@ class VisibilityEngine:
             maze_walls = extract_maze_walls_from_xml(xml_string, from_string=True)
             # walls_to_segments()で線分に変換
             self.static_walls = walls_to_segments(maze_walls)
-            print(f"[VisibilityEngine] Built SDF from {len(maze_walls)} maze walls → {len(self.static_walls)} segments", flush=True)
         except Exception as e:
-            print(f"[VisibilityEngine] Warning: Failed to extract walls from XML: {e}")
             self.static_walls = []
     
     def set_bodies(self, s0_body, h1_body, h2_body, box1_body, box2_body, ramp_body):
@@ -548,7 +549,6 @@ class VisibilityEngine:
         self.num_dynamic_objects = len(self.dynamic_body_ids)
         self.dynamic_radii[:self.num_dynamic_objects] = self.dynamic_body_radii
         
-        print(f"[VisibilityEngine] Configured {len(self.agent_bodies)} agents, {len(self.box_bodies)} boxes, 1 ramp", flush=True)
     
     def update_dynamic_positions(self):
         """毎フレーム、動的オブジェクトの位置を更新（cast_ray呼び出し前に実行）"""
@@ -685,7 +685,9 @@ class VisibilityEngine:
             if d < self.epsilon:
                 return total_d, True
             total_d += d
-            self.sp_curr_p[:2] += direction * d  # XY座標のみ更新（Z=0のため）
+            self.sp_curr_p[0] += direction[0] * d  # 全座標を更新（Z=0のため）
+            self.sp_curr_p[1] += direction[1] * d
+
             if total_d > self.max_dist:
                 break
         
@@ -852,6 +854,12 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
 
         # 親クラスの初期化
         super().__init__(render_mode=render_mode)
+        # Lidar角度の事前計算（cos/sin）
+        self._lidar_angle_cos = np.cos(self.lidar_angles)
+        self._lidar_angle_sin = np.sin(self.lidar_angles)
+        self._beam_cos = np.zeros(self.lidar_angles.shape, dtype=np.float32)
+        self._beam_sin = np.zeros(self.lidar_angles.shape, dtype=np.float32)
+        self._beam_tmp = np.zeros(self.lidar_angles.shape, dtype=np.float32)
         
         # Body ID to Name マッピング (visible_names 更新用)
         self.body_id_to_name = {
@@ -954,8 +962,9 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         self._raycast_dir = np.zeros(3, dtype=np.float64)
         
         # Lidar用バッファ
-        self._lidar_dir = np.zeros(2, dtype=np.float64)
-        self._lidar_from_pos = np.zeros(3, dtype=np.float32)  # 光線の開始位置
+        self._lidar_dir = np.zeros(3, dtype=np.float64)
+        self._lidar_from_pos = np.zeros(3, dtype=np.float64)  # 光線の開始位置
+        self._lidar_from_pos[2] = 0.5  # Z座標は固定（地面からの高さ）
         
         # 報酬計算用バッファ
         self._reward_fwd_vec = np.zeros(2, dtype=np.float64)
@@ -974,93 +983,69 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
 
     def _init_sightmap(self):
         """可視性キャッシュの初期化（ロードまたはビルド）"""
-        print("[Sightmap] Initializing visibility cache...", flush=True)
-        
         # XMLから静的壁を抽出（base_configのXML_CONTENTを使用）
         try:
             xml_string = base_config.XML_CONTENT
-            print(f"[Sightmap] XML loaded from base_config (length: {len(xml_string)} chars)", flush=True)
         except AttributeError as e:
-            print(f"[Sightmap] ERROR: base_config.XML_CONTENT not found: {e}", flush=True)
-            print("[Sightmap] Falling back to empty wall list", flush=True)
             self.wall_segments = []
             self.visibility_cache = {}
             self.cell_centers = np.array([[0, 0]], dtype=np.float32)
             return
         
         maze_walls = extract_maze_walls_from_xml(xml_string, from_string=True)
-        print(f"[Sightmap] Found {len(maze_walls)} maze walls", flush=True)
         self.wall_segments = walls_to_segments(maze_walls)
-        print(f"[Sightmap] Converted to {len(self.wall_segments)} segments", flush=True)
         
         # キャッシュファイルの存在確認
         if os.path.exists(VISIBILITY_CACHE_FILE):
             try:
-                print(f"[Sightmap] Loading visibility cache from {VISIBILITY_CACHE_FILE}...", flush=True)
                 self.visibility_cache, self.cell_centers, cache_metadata = load_visibility_cache(VISIBILITY_CACHE_FILE)
                 self.sightmap_bounds = cache_metadata['bounds']
                 self.sightmap_cell_size = cache_metadata['cell_size']
                 self.grid_n = cache_metadata['grid_n']
-                print(f"[Sightmap] ✓ Loaded {len(self.visibility_cache)} visibility pairs", flush=True)
             except Exception as e:
-                print(f"[Sightmap] Warning: Failed to load cache ({e}). Rebuilding...", flush=True)
                 self.visibility_cache = None
         else:
             self.visibility_cache = None
         
         # キャッシュが存在しないか、ロード失敗した場合はビルド
         if self.visibility_cache is None:
-            print("[Sightmap] Building visibility cache (first time only)...", flush=True)
             self.cell_centers, cache_metadata = create_cell_grid(ENV_BOUNDS, SIGHTMAP_CELL_SIZE)
             self.sightmap_bounds = cache_metadata['bounds']
             self.sightmap_cell_size = cache_metadata['cell_size']
             self.grid_n = cache_metadata['grid_n']
-            print(f"[Sightmap] Created grid with {len(self.cell_centers)} cells", flush=True)
             self.visibility_cache = build_visibility_cache(self.cell_centers, self.wall_segments)
             save_visibility_cache(self.visibility_cache, self.cell_centers, cache_metadata, VISIBILITY_CACHE_FILE)
         
-        print("[Sightmap] ✓ Visibility cache ready", flush=True)
-        
         # ★ VisibilityEngine の初期化
-        # max_dist を環境サイズに合わせて設定 (12m x 12m 環境の対角線距離は約17m)
-        self.visibility_engine = VisibilityEngine(self.model, self.data, max_dist=20.0)
+        self.visibility_engine = VisibilityEngine(self.model, self.data, max_dist=LIDAR_MAX_DIST)
         self.visibility_engine.set_bodies(
             self.s0_body, self.h1_body, self.h2_body,
             self.box1_body, self.box2_body, self.ramp_body
         )
-        print("[VisibilityEngine] ✓ Initialized with max_dist=20.0m", flush=True)
         
         # ★ Lidar SDF キャッシュのロード/ビルド
         self._init_lidar_sdf_cache()
     
     def _init_lidar_sdf_cache(self):
         """SDF距離場の初期化（ロードまたはビルド）"""
-        print("[SDF] Initializing distance field...", flush=True)
-        
         # キャッシュファイルの存在確認
         if os.path.exists(SDF_DISTANCE_FIELD_FILE):
             try:
-                print(f"[SDF] Loading distance field from {SDF_DISTANCE_FIELD_FILE}...", flush=True)
                 sdf_field, sdf_cell_centers, metadata = load_sdf_distance_field(SDF_DISTANCE_FIELD_FILE)
                 self.visibility_engine.sdf_field = sdf_field
                 self.sdf_cell_centers = sdf_cell_centers
-                print(f"[SDF] ✓ Loaded SDF field shape: {sdf_field.shape}", flush=True)
                 return
             except Exception as e:
-                print(f"[SDF] Warning: Failed to load distance field ({e}). Rebuilding...", flush=True)
+                pass
         
         # キャッシュが存在しないか、ロード失敗した場合はビルド
-        print("[SDF] Building distance field (first time only - this may take a few minutes)...", flush=True)
         # SDF用に別のグリッドを作成（細かい間隔）
         sdf_cell_centers, cache_metadata = create_cell_grid(ENV_BOUNDS, SDF_CELL_SIZE)
         self.sdf_cell_centers = sdf_cell_centers
         cache_metadata['cell_size'] = SDF_CELL_SIZE
         sdf_field = build_sdf_distance_field(self.visibility_engine, sdf_cell_centers)
-        print(f"[SDF] Built SDF field shape: {sdf_field.shape}", flush=True)
         self.visibility_engine.sdf_field = sdf_field
-        print(f"[SDF] Saving to {SDF_DISTANCE_FIELD_FILE}...", flush=True)
         save_sdf_distance_field(sdf_field, sdf_cell_centers, cache_metadata, SDF_DISTANCE_FIELD_FILE)
-        print("[SDF] ✓ Distance field ready", flush=True)
 
     def _get_cached_ray(self, agent_id, origin, direction, beam_id):
         """ レイキャストの空間・角度キャッシュ制御。★最適化: バッファ再利用 """
@@ -1205,44 +1190,48 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         # キャッシュミス：Lidar を計算
         if lidar is None:
             lidar = np.zeros(len(self.lidar_angles), dtype=np.float32)
+
+            # 加法定理でビーム方向の cos/sin を一括計算
+            cy = np.cos(yaw)
+            sy = np.sin(yaw)
+            np.multiply(self._lidar_angle_cos, cy, out=self._beam_cos)
+            np.multiply(self._lidar_angle_sin, sy, out=self._beam_tmp)
+            np.subtract(self._beam_cos, self._beam_tmp, out=self._beam_cos)
+
+            np.multiply(self._lidar_angle_cos, sy, out=self._beam_sin)
+            np.multiply(self._lidar_angle_sin, cy, out=self._beam_tmp)
+            np.add(self._beam_sin, self._beam_tmp, out=self._beam_sin)
             
             if USE_MUJOCO_RAY_FOR_LIDAR:
                 # ★高速版：mujoco.mj_ray（C 実装）
-                for i, angle_offset in enumerate(self.lidar_angles):
-                    beam_angle = angle_offset + yaw
-                    self._lidar_dir[0] = np.cos(beam_angle)
-                    self._lidar_dir[1] = np.sin(beam_angle)
+                for i in range(len(self.lidar_angles)):
+                    self._lidar_dir[0] = self._beam_cos[i]
+                    self._lidar_dir[1] = self._beam_sin[i]
+                    # self._lidar_dir[2] = 0.0
                     
                     self._lidar_from_pos[0] = pos[0]
                     self._lidar_from_pos[1] = pos[1]
-                    self._lidar_from_pos[2] = 0.5
-                    
-                    # mujoco.mj_ray で距離を測定（引数は [3, 1] の列ベクトル形式）
-                    pnt = np.array([self._lidar_from_pos[0], self._lidar_from_pos[1], self._lidar_from_pos[2]], dtype=np.float64).reshape(3, 1)
-                    vec = np.array([self._lidar_dir[0], self._lidar_dir[1], 0.0], dtype=np.float64).reshape(3, 1)
-                    
+                    # self._lidar_from_pos[2] = 0.5
+                                      
                     dist = mujoco.mj_ray(
                         self.model, self.data,
-                        pnt, vec,
+                        self._lidar_from_pos, self._lidar_dir,
                         None, 1,
                         self._get_exclude_body_for_agent(agent_id),
                         self._raycast_geomid
                     )
-                    lidar[i] = min(dist, 2.4) / 2.5 if dist >= 0 else 1.0
+                    lidar[i] = min(dist, LIDAR_MAX_DIST) / LIDAR_MAX_DIST if dist >= 0 else 1.0
             else:
                 # ★精密版：Sphere Tracing
-                for i, angle_offset in enumerate(self.lidar_angles):
-                    beam_angle = angle_offset + yaw
-                    
-                    self._lidar_dir[0] = np.cos(beam_angle)
-                    self._lidar_dir[1] = np.sin(beam_angle)
+                for i in range(len(self.lidar_angles)):
+                    self._lidar_dir[0] = self._beam_cos[i]
+                    self._lidar_dir[1] = self._beam_sin[i]
                     
                     self._lidar_from_pos[0] = pos[0]
                     self._lidar_from_pos[1] = pos[1]
-                    self._lidar_from_pos[2] = 0.5
                     
                     dist, _ = self.visibility_engine.cast_ray(self._lidar_from_pos, self._lidar_dir, exclude_agent_id=agent_id)
-                    lidar[i] = min(dist, 2.5) / 2.5 if dist >= 0 else 1.0
+                    lidar[i] = min(dist, LIDAR_MAX_DIST) / LIDAR_MAX_DIST if dist >= 0 else 1.0
             
             # キャッシュに保存
             self.lidar_cache[agent_id] = (pos.copy(), yaw, lidar.copy())
