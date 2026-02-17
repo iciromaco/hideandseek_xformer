@@ -5,9 +5,11 @@ optuna_temp/
 sensitivity_results/
 sensitivity_results_multiseed/
 optuna_temp/
+trial???/
 optuna_results/trial_*/*
 *.pt
 *.json
 *.pkl
+*.db
 uv.lock
 
