@@ -115,7 +115,7 @@ if MODE == "refinement":
     LOAD_EXISTING_MODELS = True
 
 # 実行モードの設定
-EXECUTION_MODE = "PLAY" # "TRAIN" / "PLAY"
+EXECUTION_MODE = "TRAIN" # "TRAIN" / "PLAY"
 
 # モデル保存および記録の有無
 SAVE_MODEL = True
@@ -1201,11 +1201,13 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         # 静的なゼロベクトル
         self._zero_vec_2 = np.zeros(2, dtype=np.float64)
         
-        # 回転行列バッファ（2×2）
-        self._rot_mat = np.zeros((2, 2), dtype=np.float64)
+        # 自己状態バッファ（agent_id ごとに用意、vel_x, vel_y, yaw, cos_yaw, sin_yaw）
+        self._self_state = [np.zeros(5, dtype=np.float64) for _ in range(3)]
         
-        # 自己状態バッファ（vel_x, vel_y, yaw, cos_yaw, sin_yaw）
-        self._self_state = np.zeros(5, dtype=np.float64)
+        # ★最適化: 観測バッファ事前割り当て（53次元、agent_id ごとに用意）
+        # seeker: 5(self) + 24(lidar) + 7(box1) + 7(box2) + 7(ramp) + 3(zero_pad)
+        # hider:  5(self) + 24(lidar) + 7(box1) + 7(box2) + 7(ramp) + 5(enemy)[:5] + 8(partner) + 1(grasp)
+        self._obs_buffer = [np.zeros(53, dtype=np.float32) for _ in range(3)]
         
         # ★ Sightmap: 可視性キャッシュのロード/ビルド
         self._init_sightmap()
@@ -1380,28 +1382,27 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         yaw = self.data.qpos[self.model.jnt_qposadr[joint_rot.id]]
         
         # ★最適化: yaw三角関数を1度計算（回転行列と自己状態で統一）
-        cos_yaw = np.cos(yaw)
-        sin_yaw = np.sin(yaw)
-        # 回転行列: [[cos(-yaw), -sin(-yaw)], [sin(-yaw), cos(-yaw)]] = [[cos(yaw), sin(yaw)], [-sin(yaw), cos(yaw)]]
-        self._rot_mat[0, 0] = cos_yaw
-        self._rot_mat[0, 1] = sin_yaw
-        self._rot_mat[1, 0] = -sin_yaw
-        self._rot_mat[1, 1] = cos_yaw
+        cos_yaw = np.cos(-yaw)
+        sin_yaw = np.sin(-yaw)
+        # 回転行列はコピーで作成（バッファを上書きするのではなく毎回新規作成）
+        rot_mat = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
         
         # 物理速度取得
         move_joint = self.model.joint(f'{prefix}_x')
         dof_addr = self.model.jnt_dofadr[move_joint.id]
         vel_global = self.data.qvel[dof_addr : dof_addr + 2]
-        vel_local = self._rot_mat @ vel_global
+        vel_local = rot_mat @ vel_global
         vel_norm = vel_local / 12.0
         
         # ★最適化: 事前確保バッファに直接代入（concatenate削除）
-        self._self_state[0] = vel_norm[0]
-        self._self_state[1] = vel_norm[1]
-        self._self_state[2] = yaw
-        self._self_state[3] = cos_yaw
-        self._self_state[4] = sin_yaw
-        self_state = self._self_state
+        self_state_buf = self._self_state[agent_id]
+        self_state_buf[0] = vel_norm[0]
+        self_state_buf[1] = vel_norm[1]
+        self_state_buf[2] = yaw
+        # yaw の cos/sin も保存（元のコードに合わせる）
+        self_state_buf[3] = np.cos(yaw)
+        self_state_buf[4] = np.sin(yaw)
+        self_state = self_state_buf.copy()  # コピーして参照を避ける
         
         # 1. Lidar データの生成 (キャッシュ活用で高速化)
         lidar = None
@@ -1530,34 +1531,35 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
                 else:
                     return self._masked_vec_7.copy()
 
-        # 役割別合成。★不整合修正: すべて self_state を参照
+        # ★最適化: 役割別合成。バッファに直接埋め込み（concatenate削除）
+        obs_buf = self._obs_buffer[agent_id]
+        obs_buf[:5] = self_state
+        obs_buf[5:17] = lidar  # Lidarは12ビーム
+        
         if agent_id == 0:
-            obs = np.concatenate([
-                self_state, 
-                lidar, 
-                get_rel_obs(self.box1_body, self.locked_boxes[self.box1_body]), 
-                get_rel_obs(self.box2_body, self.locked_boxes[self.box2_body]), 
-                get_rel_obs(self.ramp_body), 
-                get_rel_obs(self.h1_body)[:5], 
-                get_rel_obs(self.h2_body)[:5], 
-                np.zeros(3, dtype=np.float32)
-            ])
+            # Seeker: [self(5) + lidar(12) + box1(8) + box2(8) + ramp(7) + h1[:5] + h2[:5] + pad(3)]
+            # 合計: 5 + 12 + 8 + 8 + 7 + 5 + 5 + 3 = 53
+            obs_buf[17:25] = get_rel_obs(self.box1_body, self.locked_boxes[self.box1_body])
+            obs_buf[25:33] = get_rel_obs(self.box2_body, self.locked_boxes[self.box2_body])
+            obs_buf[33:40] = get_rel_obs(self.ramp_body)
+            h1_info = get_rel_obs(self.h1_body)[:5]
+            h2_info = get_rel_obs(self.h2_body)[:5]
+            obs_buf[40:45] = h1_info
+            obs_buf[45:50] = h2_info
+            obs_buf[50:] = 0.0  # パディング
         else:
+            # Hider: [self(5) + lidar(12) + box1(8) + box2(8) + ramp(7) + enemy[:5] + partner(7) + grasp(1)]
+            # 合計: 5 + 12 + 8 + 8 + 7 + 5 + 7 + 1 = 53
+            obs_buf[17:25] = get_rel_obs(self.box1_body, self.locked_boxes[self.box1_body])
+            obs_buf[25:33] = get_rel_obs(self.box2_body, self.locked_boxes[self.box2_body])
+            obs_buf[33:40] = get_rel_obs(self.ramp_body)
+            obs_buf[40:45] = get_rel_obs(self.s0_body)[:5]
             partner = self.h2_body if agent_id == 1 else self.h1_body
-            enemy_info = get_rel_obs(self.s0_body)[:5]
             partner_info = get_rel_obs(partner)
-            grasp_state = 1.0 if self.grasping[agent_id] else 0.0
-            
-            obs = np.concatenate([
-                self_state, 
-                lidar, 
-                get_rel_obs(self.box1_body, self.locked_boxes[self.box1_body]), 
-                get_rel_obs(self.box2_body, self.locked_boxes[self.box2_body]), 
-                get_rel_obs(self.ramp_body), 
-                enemy_info, partner_info, [grasp_state]
-            ])
-
-        obs = obs.astype(np.float32)
+            obs_buf[45:52] = partner_info
+            obs_buf[52] = 1.0 if self.grasping[agent_id] else 0.0
+        
+        obs = obs_buf.astype(np.float32)
         self.obs_memo[agent_id] = obs
         return obs
 
@@ -1742,9 +1744,7 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
             is_visible = self.visible_map[0].get(bid, False)
             seeker_pos = self.data.xpos[self.s0_body][:2]
             hider_pos = self.data.xpos[bid][:2]
-            # ★最適化: 二乗距離で計算（sqrt回避）
-            dist_sq = np.sum((hider_pos - seeker_pos) ** 2)
-            current_dist = np.sqrt(dist_sq)
+            current_dist = np.linalg.norm(hider_pos - seeker_pos)
             
             if is_visible:
                 seeker_yaw = self.data.qpos[self.srot_adr]
