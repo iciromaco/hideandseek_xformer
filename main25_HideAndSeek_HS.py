@@ -1,21 +1,17 @@
-# main23_sightmap_optimized.py
-# 演習第23回：視界勾配（Cos）ペナルティと固定長エピソードによるチーム学習
+# main25_HideAndSeek_HS.py
+# 演習第25回：高速化技術
 # 
-# 【修正内容 (v25.64 - Sightmap統合版)】
-# 1. 可視性判定の大幅高速化（Sightmap統合）:
-#    - 静的壁の見通しをグリッドベースでルックアップテーブル化
-#    - 動的オブジェクト（box1, box2, ramp）の2D投影による高速判定
-#    - レイキャストの大幅削減（静的壁はキャッシュから即座に判定）
-#    - 初回起動時に可視性キャッシュを自動ビルド、2回目以降は高速ロード
-# 2. パフォーマンス最適化（v25.63より継承）:
-#    - レイキャスト用バッファの事前確保（NumPy配列生成の削減）
-#    - Lidar方向ベクトルのバッファ再利用
-#    - 視界外マスク配列の事前確保
-#    - 報酬計算用ベクトルのバッファ化
-# 3. 推定パフォーマンス:
-#    - Sightmap統合により可視性判定が約10-20倍高速化
-#    - 総合的なSPS: 1100
-# `` M4 initial
+# 【修正内容】
+# 1. SDF距離場の構築とキャッシュ保存
+# 2. SDF距離場の可視化
+# 3. Sphere Tracing を用いた Lidar レイキャストの実装
+# 4. Sphere Tracing のデバッグと最適化
+# 5. 可視性判定の高速化（Numbaによる静的壁キャッシュのビルドとルックアップ）
+# 6. 交差判定による可視点計算
+# 【比較対象】
+# - main23_sightmap_optimized.py の従来の実装（直接交差判定）
+# - main24_sphere_tracing.py の実装（MuJoCoのraycast関数を使用）
+# - main25_HideAndSeek_HS.py の実装（Sphere Tracing + SDF距離場 + Numba最適化）
 
 import os
 import sys
@@ -116,7 +112,7 @@ if MODE == "refinement":
     LOAD_EXISTING_MODELS = True
 
 # 実行モードの設定
-EXECUTION_MODE = "TRAIN" # "TRAIN" / "PLAY"
+EXECUTION_MODE = "PLAY" # "TRAIN" / "PLAY"
 
 # モデル保存および記録の有無
 SAVE_MODEL = True
@@ -183,8 +179,8 @@ SEEKER_THRUST_LIMIT = 0.35
 SEEKER_RB_THRUST = 0.38
 SEEKER_RB_TURN_THRESH = np.pi / 6.0
 
-# Lidar レイキャスト方式選択
-USE_MUJOCO_RAY_FOR_LIDAR = False  # True: mujoco.mj_ray (高速), False: Sphere Tracing (精密)
+# Lidar レイキャスト方式: "direct_intersection" | "sphere_tracing" | "mujoco_ray"
+LIDAR_RAYCAST_MODE = "direct_intersection" # "sphere_tracing" # "mujoco_ray" # "direct_intersection"
 
 SAVE_MODEL_PATH = f"{EXPERIMENT_NAME}_{TRAIN_TARGET}.pt"
 
@@ -385,7 +381,7 @@ def is_visible_static(point1: np.ndarray, point2: np.ndarray, wall_segments: Lis
     return True
 
 def extract_maze_walls_from_xml(xml_source: str, from_string: bool = False) -> List[Dict]:
-    """XMLから maze_ で始まる geom 要素を抽出"""
+    """XMLから maze_ で始まる geom 要素と wall_ で始まる外壁要素を抽出"""
     if from_string:
         root = ET.fromstring(xml_source)
     else:
@@ -395,7 +391,8 @@ def extract_maze_walls_from_xml(xml_source: str, from_string: bool = False) -> L
     maze_walls = []
     for geom in root.findall(".//geom"):
         name = geom.get("name", "")
-        if name.startswith(MAZE_PREFIX):
+        # 内壁（maze_）と外壁（wall_）を両方抽出
+        if name.startswith(MAZE_PREFIX) or name.startswith("wall_"):
             pos_str = geom.get("pos", "0 0 0")
             size_str = geom.get("size", "0 0 0")
             pos = list(map(float, pos_str.split()))
@@ -403,53 +400,34 @@ def extract_maze_walls_from_xml(xml_source: str, from_string: bool = False) -> L
             maze_walls.append({'name': name, 'pos': pos, 'size': size})
     return maze_walls
 
-def walls_to_segments(maze_walls: List[Dict]) -> List:
-    """MuJoCoの矩形壁情報をlineSegmentリストに変換（Lidar用に最適化）"""
-    wall_segments = []
+def walls_to_segments(maze_walls: List[Dict]) -> List[Dict]:
+    """MuJoCoの矩形壁情報をAABB矩形として保持（SDF計算用）
     
-    # 環境の境界を定義
-    ENV_BOUND = 12.0  # 想定される環境の範囲
+    内壁の内側/外側を正しく判定するため、矩形データそのものを保持
+    """
+    wall_boxes = []
     
     for wall in maze_walls:
         pos, size = wall['pos'], wall['size']
+        name = wall.get('name', '')
+        
+        # pos = [cx, cy, cz], size = [sx, sy, sz]
+        # AABB: [x_min, y_min, x_max, y_max]
         cx, cy = pos[0], pos[1]
-        x_min, x_max = cx - size[0], cx + size[0]
-        y_min, y_max = cy - size[1], cy + size[1]
+        sx, sy = size[0], size[1]
         
-        # 壁のタイプを判定
-        width = size[0] * 2
-        height = size[1] * 2
-        
-        # 四方の外壁判定（内側の面だけ）
-        is_left_wall = abs(x_min + ENV_BOUND) < 0.5  # 左壁
-        is_right_wall = abs(x_max - ENV_BOUND) < 0.5  # 右壁
-        is_bottom_wall = abs(y_min + ENV_BOUND) < 0.5  # 下壁
-        is_top_wall = abs(y_max - ENV_BOUND) < 0.5  # 上壁
-        
-        if is_left_wall:
-            # 左壁：右向き面（x=x_max）のみ
-            wall_segments.append(((x_max, y_min), (x_max, y_max)))
-        elif is_right_wall:
-            # 右壁：左向き面（x=x_min）のみ
-            wall_segments.append(((x_min, y_min), (x_min, y_max)))
-        elif is_bottom_wall:
-            # 下壁：上向き面（y=y_max）のみ
-            wall_segments.append(((x_min, y_max), (x_max, y_max)))
-        elif is_top_wall:
-            # 上壁：下向き面（y=y_min）のみ
-            wall_segments.append(((x_min, y_min), (x_max, y_min)))
-        else:
-            # 内部の壁：長辺のみ抽出
-            if width > height:
-                # 横長：上下の辺のみ
-                wall_segments.append(((x_min, y_min), (x_max, y_min)))  # 下辺
-                wall_segments.append(((x_min, y_max), (x_max, y_max)))  # 上辺
-            else:
-                # 縦長：左右の辺のみ
-                wall_segments.append(((x_min, y_min), (x_min, y_max)))  # 左辺
-                wall_segments.append(((x_max, y_min), (x_max, y_max)))  # 右辺
+        wall_boxes.append({
+            'name': name,
+            'pos': np.array([cx, cy]),
+            'size': np.array([sx, sy]),
+            'x_min': cx - sx,
+            'y_min': cy - sy,
+            'x_max': cx + sx,
+            'y_max': cy + sy,
+            'is_external': name.startswith("wall_")
+        })
     
-    return wall_segments
+    return wall_boxes
 
 def create_cell_grid(bounds: float, cell_size: float) -> Tuple[np.ndarray, Dict]:
     """セルグリッドを生成"""
@@ -507,24 +485,29 @@ def load_visibility_cache(cache_file: str) -> Tuple[np.ndarray, np.ndarray, Dict
 def build_sdf_distance_field(visibility_engine, cell_centers: np.ndarray) -> np.ndarray:
     """
     グリッド全体のSDF（静的環境のみ）を計算
-    ルックアップテーブル用にNumPy配列で返す [num_cells_x, num_cells_y]
+    ルックアップテーブル用にNumPy配列で返す [grid_size, grid_size]
+    
+    cell_centersの書き出し順、単純にgrid_index=iで簡潔化
     """
     num_cells = len(cell_centers)
-    sdf_field = np.zeros((int(np.sqrt(num_cells)), int(np.sqrt(num_cells))), dtype=np.float32)
+    grid_size = int(np.sqrt(num_cells))
+    sdf_field = np.zeros((grid_size, grid_size), dtype=np.float32)
     
-    print(f"[SDF] Building distance field for {num_cells} cells (this may take a few minutes)...", flush=True)
+    print(f"[SDF] Building distance field for {num_cells} cells ({grid_size}x{grid_size}) (this may take a few minutes)...", flush=True)
     start_time = time.time()
     
-    idx = 0
     for i, cell_pos in enumerate(cell_centers):
         # 静的環境のみでSDF計算（可動物は含めない）
         point_3d = np.array([cell_pos[0], cell_pos[1], 0.5], dtype=np.float32)
         sdf_value = visibility_engine.get_sdf_static(point_3d)
         
         # 2次元グリッド配列に格納
-        grid_x = i % sdf_field.shape[0]
-        grid_y = i // sdf_field.shape[0]
-        sdf_field[grid_x, grid_y] = sdf_value
+        # cell_centersは [x,y]の順で並んでいる。
+        # x方向が外人ループ => i // grid_size = x索引, i % grid_size = y索引
+        # NumPyは [行,列]=[y,x] なので sdf_field[y, x] でアクセス
+        grid_x = i // grid_size
+        grid_y = i % grid_size
+        sdf_field[grid_y, grid_x] = sdf_value
         
         if (i + 1) % max(1, num_cells // 20) == 0:
             elapsed = time.time() - start_time
@@ -568,7 +551,7 @@ def sdf_lookup_numba(p_x, p_y, sdf_field, grid_size_0, grid_size_1, cell_size):
     
     Args:
         p_x, p_y: 点のXY座標
-        sdf_field: SDF距離場 (grid_size_0, grid_size_1)
+        sdf_field: SDF距離場 (grid_size_0, grid_size_1) - [y, x] indexing
         grid_size_0, grid_size_1: グリッドサイズ
         cell_size: セルサイズ
     
@@ -576,22 +559,209 @@ def sdf_lookup_numba(p_x, p_y, sdf_field, grid_size_0, grid_size_1, cell_size):
         SDF値 (float)
     """
     inv_float = 1.0 / cell_size
-    grid_x = (p_x + 6.0) * inv_float
-    grid_y = (p_y + 6.0) * inv_float
+    # グリッド座標の計算：X方向はgrid_size_1（列数）に対応、Y方向はgrid_size_0（行数）に対応
+    grid_x = (p_x + 6.0) * inv_float  # X座標 → 列インデックス
+    grid_y = (p_y + 6.0) * inv_float  # Y座標 → 行インデックス
     
     # 境界チェック
-    if grid_x < 0 or grid_x >= grid_size_0 or grid_y < 0 or grid_y >= grid_size_1:
-        return 1e6
+    if grid_x < 0 or grid_x >= grid_size_1 or grid_y < 0 or grid_y >= grid_size_0:
+        # グリッド外の点：環境外を示す負の距離を返す
+        # 環境中心 (0, 0)、半径 6.0m からの距離
+        dist_from_center = math.sqrt(p_x * p_x + p_y * p_y)
+        return -(dist_from_center - 6.0)  # 外壁の外なので負の値
     
     # 最近傍補間
     x = int(grid_x + 0.5)  # 0.5を加えて四捨五入
     y = int(grid_y + 0.5)  # 0.5を加えて四捨五入
     
     # クランプ
-    if 0 <= x < grid_size_0 and 0 <= y < grid_size_1:
-        return sdf_field[x, y] 
+    if 0 <= x < grid_size_1 and 0 <= y < grid_size_0:
+        return sdf_field[y, x]  # NumPyは[行,列]=[y,x]の順序
     else:
         return 1e6
+@njit(cache=True, fastmath=True)
+def ray_circle_intersection_numba(start_x, start_y, dir_x, dir_y, 
+                                    circle_x, circle_y, radius):
+    """
+    直線と円の交点を計算（最短交点距離を返す）
+    2D 平面での XY 円との交点を計算
+    
+    Args:
+        start_x, start_y: レイ開始点 (XY平面)
+        dir_x, dir_y: レイ方向ベクトル（単位ベクトル想定、XY成分）
+        circle_x, circle_y: 円の中心 (XY平面)
+        radius: 円の半径
+    
+    Returns:
+        最短交点までの距離（交点なし時は1e6）
+    """
+    # 方向ベクトルを正規化
+    dir_mag = math.sqrt(dir_x * dir_x + dir_y * dir_y)
+    if dir_mag < 1e-10:
+        return 1e6  # 無効な方向ベクトル
+    
+    dir_x_norm = dir_x / dir_mag
+    dir_y_norm = dir_y / dir_mag
+    
+    # レイ開始点から円の中心へのベクトル
+    fx = start_x - circle_x
+    fy = start_y - circle_y
+    
+    # 二次方程式の係数：t^2 + 2bt + c = 0
+    # (start + t*dir - circle) · (start + t*dir - circle) = radius^2
+    b = fx * dir_x_norm + fy * dir_y_norm
+    c = fx * fx + fy * fy - radius * radius
+    
+    # 判別式
+    discriminant = b * b - c
+    
+    if discriminant < 0:
+        return 1e6  # 交点なし
+    
+    sqrt_disc = math.sqrt(discriminant)
+    t1 = -b - sqrt_disc
+    t2 = -b + sqrt_disc
+    
+    # 最短かつ正の距離を返す
+    eps = 1e-6
+    if t1 > eps:  # 数値誤差対策
+        return t1 * dir_mag
+    elif t2 > eps:
+        return t2 * dir_mag
+    else:
+        return 1e6
+
+@njit(cache=True, fastmath=True)
+def ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y,
+                                   seg_x1, seg_y1, seg_x2, seg_y2):
+    """
+    2つの直線 (p1-p2) と (p3-p4) の交点を求める
+    （ユーザー提示の標準公式を使用）
+    
+    Args:
+        start_x, start_y: レイ開始点 (p1)
+        dir_x, dir_y: レイ方向ベクトル (p1から p2 へのオフセット)
+        seg_x1, seg_y1: 線分開始点 (p3)
+        seg_x2, seg_y2: 線分終了点 (p4)
+    
+    Returns:
+        レイパラメータ t（交点までのパラメータ値。単位ベクトルなら距離）
+    """
+    # P1, P2 を計算（レイ上の2点）
+    p1_x = start_x
+    p1_y = start_y
+    p2_x = start_x + dir_x
+    p2_y = start_y + dir_y
+    
+    # P3, P4 は線分の両端
+    p3_x = seg_x1
+    p3_y = seg_y1
+    p4_x = seg_x2
+    p4_y = seg_y2
+    
+    # 分母を計算
+    denom = (p1_x - p2_x) * (p3_y - p4_y) - (p1_y - p2_y) * (p3_x - p4_x)
+    
+    eps = 1e-10
+    if abs(denom) < eps:
+        # 平行
+        return 1e6
+    
+    # 交点座標を計算（標準公式）
+    t1_num = (p1_x * p2_y - p1_y * p2_x) * (p3_x - p4_x) - (p1_x - p2_x) * (p3_x * p4_y - p3_y * p4_x)
+    t2_num = (p1_x * p2_y - p1_y * p2_x) * (p3_y - p4_y) - (p1_y - p2_y) * (p3_x * p4_y - p3_y * p4_x)
+    
+    intersect_x = t1_num / denom
+    intersect_y = t2_num / denom
+    
+    # レイパラメータ t を計算
+    # (intersect_x, intersect_y) = (start_x, start_y) + t * (dir_x, dir_y)
+    # より安定した計算：最も大きい成分を使用
+    abs_dx = abs(dir_x)
+    abs_dy = abs(dir_y)
+    
+    if abs_dx > abs_dy and abs_dx > eps:
+        t = (intersect_x - start_x) / dir_x
+    elif abs_dy > eps:
+        t = (intersect_y - start_y) / dir_y
+    elif abs_dx > eps:
+        t = (intersect_x - start_x) / dir_x
+    else:
+        return 1e6  # 方向ベクトルが 0
+    
+    if t < 1e-6:
+        return 1e6  # 後ろ側またはレイの開始点付近
+    
+    # 線分パラメータ u を計算
+    # (intersect_x, intersect_y) = (seg_x1, seg_y1) + u * (seg_dx, seg_dy)
+    seg_dx = seg_x2 - seg_x1
+    seg_dy = seg_y2 - seg_y1
+    
+    abs_seg_dx = abs(seg_dx)
+    abs_seg_dy = abs(seg_dy)
+    
+    if abs_seg_dx > abs_seg_dy and abs_seg_dx > eps:
+        u = (intersect_x - seg_x1) / seg_dx
+    elif abs_seg_dy > eps:
+        u = (intersect_y - seg_y1) / seg_dy
+    elif abs_seg_dx > eps:
+        u = (intersect_x - seg_x1) / seg_dx
+    else:
+        return 1e6  # 線分が退化
+    
+    # 線分の範囲内か（0 <= u <= 1）
+    if -1e-6 <= u <= 1.0 + 1e-6:
+        return t
+    else:
+        return 1e6
+
+@njit(cache=True, fastmath=True)
+def cast_ray_direct_numba(start_x, start_y, dir_x, dir_y,
+                          positions, radii, body_ids, num_objects,
+                          wall_segments, num_walls,
+                          exclude_id1, exclude_id2, max_dist):
+    """
+    直接交点計算によるレイキャスト（Sphere Tracingより高速）
+    
+    Args:
+        start_x, start_y: レイ開始点
+        dir_x, dir_y: レイ方向ベクトル
+        positions: 円の中心位置 (num_objects, 2)
+        radii: 円の半径 (num_objects,)
+        body_ids: body ID (num_objects,)
+        num_objects: 円の数
+        wall_segments: 壁線分 (num_walls, 4) [x1, y1, x2, y2]
+        num_walls: 壁の数
+        exclude_id1, exclude_id2: 除外ID
+        max_dist: 最大距離
+    
+    Returns:
+        (距離, ヒット判定)
+    """
+    min_dist = max_dist
+    
+    # 円（動的オブジェクト）との交点
+    for i in range(num_objects):
+        bid = body_ids[i]
+        if bid != exclude_id1 and bid != exclude_id2:
+            dist = ray_circle_intersection_numba(
+                start_x, start_y, dir_x, dir_y,
+                positions[i, 0], positions[i, 1], radii[i]
+            )
+            if dist < min_dist:
+                min_dist = dist
+    
+    # 壁との交点
+    for i in range(num_walls):
+        dist = ray_segment_intersection_numba(
+            start_x, start_y, dir_x, dir_y,
+            wall_segments[i, 0], wall_segments[i, 1],
+            wall_segments[i, 2], wall_segments[i, 3]
+        )
+        if dist < min_dist:
+            min_dist = dist
+    
+    return min_dist, min_dist < max_dist
 
 @njit(cache=True, fastmath=True)
 def cast_ray_numba(start_x, start_y, dir_x, dir_y, 
@@ -604,7 +774,7 @@ def cast_ray_numba(start_x, start_y, dir_x, dir_y,
     
     Args:
         start_x, start_y: 開始位置
-        dir_x, dir_y: 方向ベクトル
+        dir_x, dir_y: 方向ベクトル（単位ベクトル想定）
         sdf_field: 静的SDF距離場
         grid_size_0, grid_size_1: グリッドサイズ
         cell_size: セルサイズ
@@ -620,6 +790,14 @@ def cast_ray_numba(start_x, start_y, dir_x, dir_y,
     Returns:
         (距離, ヒット判定)
     """
+    # 方向ベクトルを正規化
+    dir_mag = math.sqrt(dir_x * dir_x + dir_y * dir_y)
+    if dir_mag < 1e-10:
+        return max_dist, False  # 無効な方向ベクトル
+    
+    dir_x_norm = dir_x / dir_mag
+    dir_y_norm = dir_y / dir_mag
+    
     curr_x = start_x
     curr_y = start_y
     total_d = 0.0
@@ -639,15 +817,16 @@ def cast_ray_numba(start_x, start_y, dir_x, dir_y,
                 if dist < d_dynamic:
                     d_dynamic = dist
         
-        # 最小距離
+        # 最小距離（符号付き距離なので負は内部を意味する）
         d = min(d_static, d_dynamic)
         
+        # 負の距離 → 障害物内部にいる → 衝突
         if d < epsilon:
             return total_d, True
         
         total_d += d
-        curr_x += dir_x * d
-        curr_y += dir_y * d
+        curr_x += dir_x_norm * d
+        curr_y += dir_y_norm * d
         
         if total_d > max_dist:
             break
@@ -731,6 +910,14 @@ class VisibilityEngine:
     静的壁はXMLから抽出、可動物はリアルタイム計算
     """
     def __init__(self, model, data, epsilon=0.1, max_steps=15, max_dist=LIDAR_MAX_DIST):
+        """
+        Visibility Engine の初期化
+        
+        Args:
+            epsilon: Sphere Tracing の衝突判定閾値
+                     セルサイズ (0.020374m) より大きくする必要があります
+                     デフォルト 0.1m は約5倍のマージンを持たせています
+        """
         self.model = model
         self.data = data
         self.epsilon = epsilon
@@ -754,6 +941,10 @@ class VisibilityEngine:
         self.dynamic_radii = np.zeros(6, dtype=np.float32)
         self.num_dynamic_objects = 0
         
+        # ★直線と円の交点計算用：壁線分配列（Numba用）
+        self.wall_segments = np.zeros((50, 4), dtype=np.float32)  # 最大50線分
+        self.num_wall_segments = 0
+        
         # Sphere Tracing 用バッファ
         self.sp_curr_p = np.zeros(3, dtype=np.float32)  # 現在位置
         
@@ -761,14 +952,18 @@ class VisibilityEngine:
         self.sdf_field = None
         
     def _build_static_walls_from_xml(self):
-        """XMLから内壁を抽出"""
+        """XMLから内壁を抽出（矩形AABB形式）"""
         try:
             xml_string = base_config.XML_CONTENT
             maze_walls = extract_maze_walls_from_xml(xml_string, from_string=True)
-            # walls_to_segments()で線分に変換
+            # walls_to_segments()で矩形データに変換（SDF計算用）
             self.static_walls = walls_to_segments(maze_walls)
+            
+            # Numba互換性のため num_wall_segments を設定
+            self.num_wall_segments = len(self.static_walls)
         except Exception as e:
             self.static_walls = []
+            self.num_wall_segments = 0
     
     def set_bodies(self, s0_body, h1_body, h2_body, box1_body, box2_body, ramp_body):
         """環境から body IDs を設定"""
@@ -785,6 +980,7 @@ class VisibilityEngine:
         for agent_id, body_id in self.agent_bodies.items():
             self.dynamic_body_ids.append(body_id)
             self.dynamic_body_radii.append(0.4)
+
         for box_body in self.box_bodies:
             self.dynamic_body_ids.append(box_body)
             self.dynamic_body_radii.append(np.sqrt(0.6**2 + 0.6**2))
@@ -854,6 +1050,7 @@ class VisibilityEngine:
         else:
             # 環境外：外壁までの距離
             return min(boundary_dist, min_wall_dist)
+
     
     def _point_to_segment_distance(self, p, seg_start, seg_end):
         """点pから線分(seg_start, seg_end)までの距離"""
@@ -876,17 +1073,16 @@ class VisibilityEngine:
 
     def cast_ray(self, start_pos, direction, exclude_agent_id=None, exclude_body_id=None, target_body_id=None):
         """
-        Sphere Tracingで光線の距離を計算
-        - 静的壁：事前計算SDF（ルックアップテーブル）
-        - 可動物：リアルタイム計算
+        光線の距離を計算（LIDAR_RAYCAST_MODE で方式を選択）
+        
+        - "direct_intersection"  : 直線-円交点計算（最速）
+        - "sphere_tracing"       : SDF + Sphere Tracing（精密）
+        - "mujoco_ray"           : MuJoCo mj_ray（高速）
+        
         exclude_agent_id: 自エージェントのIDを指定（自分を除外）
         exclude_body_id: ターゲットのbody_idを指定（ターゲットを除外）
         target_body_id: デバッグ用（ターゲットの body_id）
         """
-        # SDF フィールドがない場合はフォールバック
-        if self.sdf_field is None:
-            return self.max_dist, False
-        
         # 除外IDを取得
         exclude_id1 = -1
         exclude_id2 = -1
@@ -901,21 +1097,69 @@ class VisibilityEngine:
             else:
                 exclude_id2 = exclude_body_id
         
-        # Numba高速化関数を呼び出し
-        grid_size = self.sdf_field.shape
-        cell_size = 12.0 / (grid_size[0] - 1)
+        if LIDAR_RAYCAST_MODE == "direct_intersection":
+            # ★直線-円交点計算（最速）
+            dist, hit = cast_ray_direct_numba(
+                start_pos[0], start_pos[1],
+                direction[0], direction[1],
+                self.dynamic_positions, self.dynamic_radii, self.dynamic_body_ids_array,
+                self.num_dynamic_objects,
+                self.wall_segments, self.num_wall_segments,
+                exclude_id1, exclude_id2, self.max_dist
+            )
+            return dist, hit
         
-        dist, hit = cast_ray_numba(
-            start_pos[0], start_pos[1],
-            direction[0], direction[1],
-            self.sdf_field, grid_size[0], grid_size[1], cell_size,
-            self.dynamic_positions, self.dynamic_radii, self.dynamic_body_ids_array,
-            self.num_dynamic_objects,
-            exclude_id1, exclude_id2,
-            self.epsilon, self.max_steps, self.max_dist
-        )
+        elif LIDAR_RAYCAST_MODE == "sphere_tracing":
+            # ★SDF + Sphere Tracing（精密）
+            if self.sdf_field is None:
+                return self.max_dist, False
+            
+            grid_size = self.sdf_field.shape
+            cell_size = 12.0 / (grid_size[0] - 1)
+            
+            dist, hit = cast_ray_numba(
+                start_pos[0], start_pos[1],
+                direction[0], direction[1],
+                self.sdf_field, grid_size[0], grid_size[1], cell_size,
+                self.dynamic_positions, self.dynamic_radii, self.dynamic_body_ids_array,
+                self.num_dynamic_objects,
+                exclude_id1, exclude_id2,
+                self.epsilon, self.max_steps, self.max_dist
+            )
+            return dist, hit
         
-        return dist, hit
+        elif LIDAR_RAYCAST_MODE == "mujoco_ray":
+            # ★MuJoCo mj_ray
+            # 注: このメソッドは通常は直接呼び出されず、Lidar観測ループ内で直接実装
+            # フォールバック: sphere_tracing を使用
+            if self.sdf_field is None:
+                return self.max_dist, False
+            
+            grid_size = self.sdf_field.shape
+            cell_size = 12.0 / (grid_size[0] - 1)
+            
+            dist, hit = cast_ray_numba(
+                start_pos[0], start_pos[1],
+                direction[0], direction[1],
+                self.sdf_field, grid_size[0], grid_size[1], cell_size,
+                self.dynamic_positions, self.dynamic_radii, self.dynamic_body_ids_array,
+                self.num_dynamic_objects,
+                exclude_id1, exclude_id2,
+                self.epsilon, self.max_steps, self.max_dist
+            )
+            return dist, hit
+        
+        else:
+            # デフォルト: direct_intersection
+            dist, hit = cast_ray_direct_numba(
+                start_pos[0], start_pos[1],
+                direction[0], direction[1],
+                self.dynamic_positions, self.dynamic_radii, self.dynamic_body_ids_array,
+                self.num_dynamic_objects,
+                self.wall_segments, self.num_wall_segments,
+                exclude_id1, exclude_id2, self.max_dist
+            )
+            return dist, hit
     
     def _sdf_lookup(self, p):
         """
@@ -942,7 +1186,7 @@ class VisibilityEngine:
         x = np.clip(x, 0, grid_size[0] - 1)
         y = np.clip(y, 0, grid_size[1] - 1)
         
-        return float(self.sdf_field[x, y])
+        return float(self.sdf_field[y, x])  # NumPy は [行,列]=[y,x] の順序
     
 # ==========================================
 # 2. クラス定義 (Agent / ObsHistory / Env)
@@ -1419,7 +1663,7 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
         # キャッシュミス：Lidar を計算
         if lidar is None:
             lidar = np.zeros(len(self.lidar_angles), dtype=np.float32)
-
+            
             # 加法定理でビーム方向の cos/sin を一括計算
             cy = np.cos(yaw)
             sy = np.sin(yaw)
@@ -1431,36 +1675,16 @@ class TeamCosEnv(base_config.HideAndSeekEnv):
             np.multiply(self._lidar_angle_sin, cy, out=self._beam_tmp)
             np.add(self._beam_sin, self._beam_tmp, out=self._beam_sin)
             
-            if USE_MUJOCO_RAY_FOR_LIDAR:
-                # ★高速版：mujoco.mj_ray（C 実装）
-                for i in range(len(self.lidar_angles)):
-                    self._lidar_dir[0] = self._beam_cos[i]
-                    self._lidar_dir[1] = self._beam_sin[i]
-                    # self._lidar_dir[2] = 0.0
-                    
-                    self._lidar_from_pos[0] = pos[0]
-                    self._lidar_from_pos[1] = pos[1]
-                    # self._lidar_from_pos[2] = 0.5
-                                      
-                    dist = mujoco.mj_ray(
-                        self.model, self.data,
-                        self._lidar_from_pos, self._lidar_dir,
-                        None, 1,
-                        self._get_exclude_body_for_agent(agent_id),
-                        self._raycast_geomid
-                    )
-                    lidar[i] = min(dist, LIDAR_MAX_DIST) / LIDAR_MAX_DIST if dist >= 0 else 1.0
-            else:
-                # ★精密版：Sphere Tracing
-                for i in range(len(self.lidar_angles)):
-                    self._lidar_dir[0] = self._beam_cos[i]
-                    self._lidar_dir[1] = self._beam_sin[i]
-                    
-                    self._lidar_from_pos[0] = pos[0]
-                    self._lidar_from_pos[1] = pos[1]
-                    
-                    dist, _ = self.visibility_engine.cast_ray(self._lidar_from_pos, self._lidar_dir, exclude_agent_id=agent_id)
-                    lidar[i] = min(dist, LIDAR_MAX_DIST) / LIDAR_MAX_DIST if dist >= 0 else 1.0 
+            # 全モード共通：位置設定
+            self._lidar_from_pos[0] = pos[0]
+            self._lidar_from_pos[1] = pos[1]
+            
+            for i in range(len(self.lidar_angles)):
+                self._lidar_dir[0] = self._beam_cos[i]
+                self._lidar_dir[1] = self._beam_sin[i]
+                
+                dist, _ = self.visibility_engine.cast_ray(self._lidar_from_pos, self._lidar_dir, exclude_agent_id=agent_id)
+                lidar[i] = min(dist, LIDAR_MAX_DIST) / LIDAR_MAX_DIST if dist >= 0 else 1.0 
             
             # print(step_accumulator, end=", ", flush=True)  # デバッグ: 全ビームの平均ステップ数を出力    
             # キャッシュに保存
@@ -2220,21 +2444,21 @@ if __name__ == "__main__":
         "--mode", "-m",
         type=str,
         choices=["TRAIN", "PLAY"],
-        default="TRAIN",
+        default=EXECUTION_MODE,
         help="Execution mode: TRAIN (learning) or PLAY (inference with rendering)"
     )
     parser.add_argument(
         "--target", "-t",
         type=str,
         choices=["SEEKER", "HIDER"],
-        default="HIDER",
+        default=TRAIN_TARGET,
         help="Training target agent: SEEKER or HIDER"
     )
     parser.add_argument(
         "--stage", "-s",
         type=str,
         choices=["initial", "refinement"],
-        default="initial",
+        default=MODE,
         help="Training stage: initial or refinement"
     )
     
@@ -2247,5 +2471,5 @@ if __name__ == "__main__":
     current_module.TRAIN_TARGET = args.target
     current_module.MODE = args.stage
     
-    print(f"[Config] Mode: {args.mode}, Target: {args.target}, Stage: {args.stage}")
+    print(f"[Config] Mode: {args.mode}, Target: {args.target}, Stage: {args.stage}, Lidar: {LIDAR_RAYCAST_MODE}")
     main()

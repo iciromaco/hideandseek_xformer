@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
 """
+# test_lidar_validation.py
 Lidar Raycast Methods Validation
 3つのレイキャスト方法の出力を比較するプログラム
 """
