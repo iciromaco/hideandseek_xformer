@@ -15,4 +15,5 @@ optuna_results/trial_*/*
 *.db
 temp*.*
 uv.lock
+.DS_Store
 
