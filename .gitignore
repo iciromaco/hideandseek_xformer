@@ -13,5 +13,6 @@ optuna_results/trial_*/*
 *.json
 *.pkl
 *.db
+temp*.*
 uv.lock
 
