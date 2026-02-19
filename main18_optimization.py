@@ -780,6 +780,7 @@ class HideAndSeekEnv(gym.Env):
         self.data.eq_active[eq_id] = 1
 
     def _apply_action(self, agent_id, action):
+        print(agent_id, action)
         if agent_id == 0: return 0
         b_id, c_idx = (self.h1_body, 2) if agent_id == 1 else (self.h2_body, 4)
         hp = self.data.xpos[b_id]
