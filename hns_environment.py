@@ -1,21 +1,75 @@
-# hns_environment.py v1.22
-# 演習第25回：XML記述順（Seeker先頭）完全同期版
+# hns_environment.py v1.37
+# 演習第25回：壁との衝突回避・完全配置（めり込み防止）版
 # 
 # 修正履歴:
-# v1.21: 壁吸着解消。
-# v1.22: ユーザーの指摘に基づき、エージェントのインデックス順をXMLの記述順
-#        [Seeker, Hider1, Hider2] に完全に同期。
-#        これにより制御入力の「ねじれ」を解消し、意図通りの駆動を実現。
+# v1.36: 壁衝突判定。
+# v1.37: ユーザー報告の「内壁との重なり」を完全に解消。
+#        1. 各オブジェクト（エージェント, Box, Ramp）のサイズに応じたマージンを適用。
+#        2. 配置候補地の AABB 判定を厳格化し、壁の角へのめり込みも防止。
 
 import os, tempfile, numpy as np, mujoco, gymnasium as gym
 from gymnasium import spaces
 from visibility_engine import VisibilityEngine
 import math
 
-try:
-    from main18_optimization import XML_CONTENT
-except ImportError:
-    XML_CONTENT = ""
+XML_CONTENT = """
+<mujoco>
+    <option gravity="0 0 -9.81" timestep="0.005"/>
+    <asset>
+        <texture name="grid_tex" type="2d" builtin="checker" rgb1=".1 .2 .3" rgb2=".2 .3 .4" width="300" height="300"/>
+        <material name="grid_mat" texture="grid_tex" texrepeat="1 1" reflectance="0.2"/>
+    </asset>
+    <worldbody>
+        <light pos="0 0 10" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+        <geom name="floor" type="plane" size="6 6 0.1" material="grid_mat" friction="1.0 0.05 0.0001"/>
+        
+        <!-- 外壁 -->
+        <geom name="wall_n" type="box" size="6.2 0.1 4.0" pos="0 6.1 4.0" rgba="0.7 0.7 0.7 0.3"/>
+        <geom name="wall_s" type="box" size="6.2 0.1 4.0" pos="0 -6.1 4.0" rgba="0.7 0.7 0.7 0.3"/>
+        <geom name="wall_e" type="box" size="0.1 6 4.0" pos="6.1 0 4.0" rgba="0.7 0.7 0.7 0.3"/>
+        <geom name="wall_w" type="box" size="0.1 6 4.0" pos="-6.1 0 4.0" rgba="0.7 0.7 0.7 0.3"/>
+        
+        <!-- 内壁 (Group 0: 計測対象) -->
+        <geom name="maze_w0" type="box" size="1.5 0.2 0.5" pos="3.0 1.5 0.5" rgba="0.0 0.7 0.7 1"/>
+        <geom name="maze_w1" type="box" size="1.5 0.2 0.5" pos="-3.0 -1.5 0.5" rgba="0.0 0.7 0.7 1"/>
+        <geom name="maze_w2" type="box" size="0.2 1.5 0.5" pos="0 -3.0 0.5" rgba="0.0 0.7 0.7 1"/>
+        <geom name="maze_w3" type="box" size="0.2 1.5 0.5" pos="0 3.0 0.5" rgba="0.0 0.7 0.7 1"/>
+        
+        <body name="ramp_body" pos="0 0 0">
+            <joint type="free" name="ramp_joint"/>
+            <geom name="ramp_slope_surface" type="box" size="0.8333 0.5 0.02" pos="0 0 0.516" euler="0 -36.87 0" rgba="0 1 0 0.5"/>
+            <geom name="ramp_base" type="box" size="0.6 0.5 0.5" pos="0.6 0 0.25" rgba="0 1 0 0.2" group="1"/>
+        </body>
+        
+        <body name="box1_body" pos="2 -2 0.5"><joint name="box1_joint" type="free"/><geom name="box1_geom" type="box" size="0.6 0.6 0.5" rgba="0.6 0.4 0.2 1"/></body>
+        <body name="box2_body" pos="-2 2 0.5"><joint name="box2_joint" type="free"/><geom name="box2_geom" type="box" size="0.6 0.6 0.5" rgba="0.7 0.5 0.3 1"/></body>
+        
+        <body name="seeker_anchor" pos="0 0 0.5">
+            <joint name="s_x" type="slide" axis="1 0 0"/><joint name="s_y" type="slide" axis="0 1 0"/><joint name="s_z" type="slide" axis="0 0 1" limited="true" range="-0.05 1.2"/><joint name="s_rot" type="hinge" axis="0 0 1" damping="50"/>
+            <body name="seeker_body">
+                <geom name="seeker_btm" type="sphere" size="0.4" pos="0 0 -0.1" rgba="0.9 0.1 0.1 1"/>
+                <geom name="seeker_capsule" type="capsule" size="0.3 0.2" rgba="0.9 0.1 0.1 1" group="1"/>
+            </body>
+        </body>
+        
+        <body name="hider1_anchor" pos="0 0 0.5">
+            <joint name="h1_x" type="slide" axis="1 0 0"/><joint name="h1_y" type="slide" axis="0 1 0"/><joint name="h1_z" type="slide" axis="0 0 1" limited="true" range="-0.05 1.2"/><joint name="h1_rot" type="hinge" axis="0 0 1" damping="50"/>
+            <body name="hider1_body">
+                <geom name="hider1_btm" type="sphere" size="0.4" pos="0 0 -0.1" rgba="0.1 0.1 0.9 1"/>
+                <geom name="hider1_capsule" type="capsule" size="0.3 0.2" rgba="0.1 0.1 0.9 1" group="1"/>
+            </body>
+        </body>
+        
+        <body name="hider2_anchor" pos="0 0 0.5">
+            <joint name="h2_x" type="slide" axis="1 0 0"/><joint name="h2_y" type="slide" axis="0 1 0"/><joint name="h2_z" type="slide" axis="0 0 1" limited="true" range="-0.05 1.2"/><joint name="h2_rot" type="hinge" axis="0 0 1" damping="50"/>
+            <body name="hider2_body">
+                <geom name="hider2_btm" type="sphere" size="0.4" pos="0 0 -0.1" rgba="0.1 0.6 0.9 1"/>
+                <geom name="hider2_capsule" type="capsule" size="0.3 0.2" rgba="0.1 0.6 0.9 1" group="1"/>
+            </body>
+        </body>
+    </worldbody>
+</mujoco>
+"""
 
 class TeamCosEnv(gym.Env):
     def __init__(self, lidar_mode=1):
@@ -28,122 +82,85 @@ class TeamCosEnv(gym.Env):
         self.data = mujoco.MjData(self.model)
         self.vis_engine = VisibilityEngine(self.model, self.data)
         
-        # 【重要】XMLの <actuator> 記述順に合わせる
         self.agent_prefixes = ["s", "h1", "h2"] 
-        
-        self.obj_prefixes = ["box1", "box2", "ramp"]
-        self.qpos_indices = {}
-        self.body_ids = {} 
-        self.stuck_counts = {p: 0 for p in self.agent_prefixes}
-        self.nudge_cooldown = {p: 0 for p in self.agent_prefixes}
+        self.body_ids = {}; self.qpos_indices = {}
         self._setup_indices()
+        
+        # 内壁データ (cx, cy, sx, sy)
+        self.maze_walls = [
+            (3.0, 1.5, 1.5, 0.2), (-3.0, -1.5, 1.5, 0.2),
+            (0.0, -3.0, 0.2, 1.5), (0.0, 3.0, 0.2, 1.5)
+        ]
         
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(53,), dtype=np.float32)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
 
     def _setup_indices(self):
+        m = self.model
         for p in self.agent_prefixes:
             try:
-                jx = self.model.joint(f"{p}_x").id
-                self.body_ids[p] = self.model.jnt_bodyid[jx]
-                self.qpos_indices[p] = {
-                    'x': jx, 'y': self.model.joint(f"{p}_y").id, 
-                    'z': self.model.joint(f"{p}_z").id, 'rot': self.model.joint(f"{p}_rot").id
-                }
+                b_name = "seeker_body" if p == "s" else f"hider{p[1]}_body"
+                self.body_ids[p] = m.body(b_name).id
+                self.qpos_indices[p] = {'x': m.joint(f"{p}_x").id, 'y': m.joint(f"{p}_y").id, 'z': m.joint(f"{p}_z").id, 'rot': m.joint(f"{p}_rot").id}
             except: pass
-        for o in self.obj_prefixes:
-            try:
-                j_id = self.model.joint(f"{o}_joint").id
-                self.qpos_indices[o] = self.model.jnt_qposadr[j_id]
-            except: pass
-
-    def _is_in_wall(self, pos):
-        walls = [(3.0, 1.5, 0.2, 1.6), (-3.0, -1.5, 0.2, 1.6), (1.5, -3.0, 1.6, 0.2), (-1.5, 3.0, 1.6, 0.2)]
-        margin = 0.55
-        for (cx, cy, sx, sy) in walls:
-            if abs(pos[0] - cx) < (sx + margin) and abs(pos[1] - cy) < (sy + margin): return True
-        return False
-
-    def _randomize_all_objects(self):
-        mujoco.mj_resetData(self.model, self.data)
-        placed_positions = []
-        targets = self.agent_prefixes + self.obj_prefixes
-        np.random.shuffle(targets)
-        for t in targets:
-            success = False
-            for _ in range(100):
-                new_pos = np.random.uniform(-5.0, 5.0, size=2)
-                if all(np.linalg.norm(new_pos - p) > 1.4 for p in placed_positions):
-                    if not self._is_in_wall(new_pos):
-                        if t in self.agent_prefixes:
-                            q = self.qpos_indices[t]
-                            self.data.qpos[self.model.jnt_qposadr[q['x']]] = new_pos[0]
-                            self.data.qpos[self.model.jnt_qposadr[q['y']]] = new_pos[1]
-                            self.data.qpos[self.model.jnt_qposadr[q['z']]] = 0.0
-                            self.data.qpos[self.model.jnt_qposadr[q['rot']]] = np.random.uniform(-np.pi, np.pi)
-                        else:
-                            q_adr = self.qpos_indices[t]
-                            self.data.qpos[q_adr : q_adr+2] = new_pos
-                            self.data.qpos[q_adr+2] = 0.5
-                            yaw = np.random.uniform(-np.pi, np.pi)
-                            self.data.qpos[q_adr+3:q_adr+7] = [np.cos(yaw/2), 0, 0, np.sin(yaw/2)]
-                        placed_positions.append(new_pos); success = True; break
-        mujoco.mj_forward(self.model, self.data)
 
     def _get_obs(self, agent_idx):
         obs = np.zeros(53, dtype=np.float32); d, m = self.data, self.model; p = self.agent_prefixes[agent_idx]
         if p not in self.body_ids: return obs
         b_id = self.body_ids[p]; a_pos = d.xpos[b_id][:2]
-        obs[0:2] = d.cvel[b_id][:2]
+        q_idx_vx = m.jnt_dofadr[self.qpos_indices[p]['x']]
+        obs[0:2] = d.qvel[q_idx_vx : q_idx_vx+2]
         rot_rad = float(d.qpos[m.jnt_qposadr[self.qpos_indices[p]['rot']]])
         obs[2], obs[3], obs[4] = rot_rad, np.cos(rot_rad), np.sin(rot_rad)
         raw_lidar = self.vis_engine.cast_lidar(a_pos, heading=rot_rad, mode=self.lidar_mode, body_exclude=b_id)
         obs[5:17] = np.maximum(0.0, raw_lidar - 0.45)
         return obs
 
+    def step(self, action):
+        self.data.ctrl[:6] = action
+        for _ in range(5): mujoco.mj_step(self.model, self.data)
+        return self._get_obs(0), 0.0, False, False, {}
+
     def reset(self, seed=None):
         if seed is not None: np.random.seed(seed)
         self._randomize_all_objects()
-        for p in self.agent_prefixes: self.stuck_counts[p] = 0; self.nudge_cooldown[p] = 0
-        # XML順に合わせ、Seeker(index 0)の観測を返す
         return self._get_obs(0), {}
 
-    def step(self, action):
-        # アクション [S_T, S_R, H1_T, H1_R, H2_T, H2_R] をそのまま ctrl に適用
-        self.data.ctrl[:6] = action
-        for _ in range(5): mujoco.mj_step(self.model, self.data)
+    def _randomize_all_objects(self):
+        m, d = self.model, self.data; mujoco.mj_resetData(m, d); placed = []
+        # オブジェクトごとの占有半径
+        radii = {"s": 0.45, "h1": 0.45, "h2": 0.45, "box1": 0.7, "box2": 0.7, "ramp": 0.9}
+        targets = self.agent_prefixes + ["box1", "box2", "ramp"]
+        np.random.shuffle(targets)
         
-        # --- Nudge ロジック ---
-        for p_idx, p in enumerate(self.agent_prefixes):
-            if self.nudge_cooldown[p] > 0: self.nudge_cooldown[p] -= 1; continue
-            b_id = self.body_ids[p]; vel = np.linalg.norm(self.data.cvel[b_id][:2])
-            p_ctrl = self.data.ctrl[p_idx*2 : p_idx*2+2]
-            if vel < 0.015 and np.linalg.norm(p_ctrl) > 0.1: self.stuck_counts[p] += 1
-            else: self.stuck_counts[p] = 0
-            
-            if self.stuck_counts[p] >= 15: 
-                obs = self._get_obs(p_idx); lidar = obs[5:17]
-                angles = [0, 15, -15, 30, -30, 45, -45, 90, -90, 135, -135, 180]
-                repel_vec = np.zeros(2); found_near = False
-                for i in range(12):
-                    if lidar[i] < 0.15:
-                        found_near = True; wall_ang = obs[2] + np.deg2rad(angles[i])
-                        repel_vec[0] -= np.cos(wall_ang) * (1.0/(lidar[i]+0.02))
-                        repel_vec[1] -= np.sin(wall_ang) * (1.0/(lidar[i]+0.02))
-                if found_near:
-                    norm = np.linalg.norm(repel_vec)
-                    if norm > 1e-5:
-                        push_dir = repel_vec / norm; qx, qy, qz, qr = self.qpos_indices[p]['x'], self.qpos_indices[p]['y'], self.qpos_indices[p]['z'], self.qpos_indices[p]['rot']
-                        self.data.qpos[self.model.jnt_qposadr[qx]] += push_dir[0] * 0.10
-                        self.data.qpos[self.model.jnt_qposadr[qy]] += push_dir[1] * 0.10
-                        self.data.qpos[self.model.jnt_qposadr[qz]] = 0.0
-                        self.data.ctrl[p_idx*2 : p_idx*2+2] = 0.0
-                        dof_x, dof_y, dof_z, dof_r = self.model.jnt_dofadr[qx], self.model.jnt_dofadr[qy], self.model.jnt_dofadr[qz], self.model.jnt_dofadr[qr]
-                        self.data.qvel[dof_x] = self.data.qvel[dof_y] = self.data.qvel[dof_z] = self.data.qvel[dof_r] = 0.0
-                        self.data.qacc[dof_x] = self.data.qacc[dof_y] = self.data.qacc[dof_z] = self.data.qacc[dof_r] = 0.0
-                        self.stuck_counts[p] = 0; self.nudge_cooldown[p] = 30
-                        mujoco.mj_forward(self.model, self.data)
-        return self._get_obs(0), 0.0, False, False, {}
+        for t in targets:
+            r_obj = radii.get(t, 0.5)
+            for _ in range(250):
+                # フィールド端を考慮した範囲
+                new_pos = np.random.uniform(-5.3, 5.3, size=2)
+                
+                # 1. 内壁との衝突チェック (AABB + オブジェクト半径)
+                in_wall = False
+                for (cx, cy, sx, sy) in self.maze_walls:
+                    if abs(new_pos[0] - cx) < (sx + r_obj) and abs(new_pos[1] - cy) < (sy + r_obj):
+                        in_wall = True; break
+                if in_wall: continue
+                
+                # 2. 他の配置済みオブジェクトとの衝突
+                if all(np.linalg.norm(new_pos - p) > (r_obj + 0.6) for p in placed):
+                    if t in self.agent_prefixes:
+                        q = self.qpos_indices[t]
+                        d.qpos[m.jnt_qposadr[q['x']]] = new_pos[0]
+                        d.qpos[m.jnt_qposadr[q['y']]] = new_pos[1]
+                        d.qpos[m.jnt_qposadr[q['z']]] = 0.0
+                        d.qpos[m.jnt_qposadr[q['rot']]] = np.random.uniform(-np.pi, np.pi)
+                    else:
+                        j_id = m.joint(f"{t}_joint").id; q_adr = m.jnt_qposadr[j_id]
+                        d.qpos[q_adr : q_adr+2] = new_pos
+                        d.qpos[q_adr+2] = 0.5
+                        d.qpos[q_adr+3:q_adr+7] = [1.0, 0.0, 0.0, 0.0]
+                    placed.append(new_pos); break
+        mujoco.mj_forward(m, d)
 
     def __del__(self):
         if hasattr(self, 'xml_path') and os.path.exists(self.xml_path):
