@@ -1,17 +1,18 @@
-# scripted_agents.py v1.69
-# 演習第26回：ルールベースHider（生存優先） ＆ シーカー統合版
+# scripted_agents.py v1.70
+# 演習第26回：【最終完全版】NPCエージェント・ライブラリ統合
 # 
 # 修正履歴:
-# v1.68: 非干渉追跡シーカー。
-# v1.69: 1. AI学習のブートストラップ用に RuleBasedHider を追加。
-#        2. シーカーから遠ざかる方向へ逃げつつ、壁を回避する「賢い獲物」を実装。
-#        3. シーカーとの距離が 3.0m 以下で警戒、1.5m 以下で全力逃走。
+# v1.69: RuleBasedHider 追加。
+# v1.70: ユーザー指摘の AttributeError を解消するため SimpleWanderer を統合。
+#        1. SimpleWanderer クラスを追加し、get_action メソッドを実装。
+#        2. スタック検知（物理的本能）を備えたランダム放浪ロジックを提供。
+#        3. これにより、この1ファイルで「シーカー」「賢いハイダー」「アホなハイダー」が揃う。
 
 import numpy as np
 import math
 
 class RuleBasedSeeker:
-    """ハイダーを追い詰めるプロフェッショナル・シーカー"""
+    """ハイダーを精密に追い詰めるプロフェッショナル・シーカー"""
     def __init__(self):
         self.last_target_pos = None
         self.target_lost_timer = 0
@@ -124,11 +125,9 @@ class RuleBasedHider:
             dist = np.linalg.norm(diff)
             if dist < 3.0: # 3m以内で警戒
                 self.status = "DANGER"
-                # シーカーと反対の方向（背中を向ける方向）
                 escape_angle = math.atan2(diff[1], diff[0])
                 err = (escape_angle - current_heading + math.pi) % (2 * math.pi) - math.pi
-                
-                fwd = 0.25 if dist > 1.2 else 0.35 # 近ければ全力
+                fwd = 0.25 if dist > 1.2 else 0.35
                 turn = np.clip(err * 2.0, -0.8, 0.8)
                 return np.array([fwd, turn])
 
@@ -137,5 +136,50 @@ class RuleBasedHider:
         self.timer -= 1
         if self.timer <= 0:
             self.timer = np.random.randint(60, 120)
+            self.action = np.array([0.18, np.random.uniform(-0.4, 0.4)])
+        return self.action
+
+class SimpleWanderer:
+    """知恵を持たない、純粋なランダム放浪者（スタック回避機能付き）"""
+    def __init__(self, agent_id=0):
+        self.agent_id = agent_id
+        self.timer = 0
+        self.mode = "WANDER"
+        self.action = np.array([0.15, 0.0])
+        self.last_pos = np.zeros(2)
+        self.stuck_counter = 0
+        np.random.seed(42 + agent_id)
+    
+    def get_action(self, obs, current_pos):
+        lidar = obs[5:17]; front_dist = min(lidar[0:3])
+        
+        # スタック検知
+        dist_moved = np.linalg.norm(current_pos - self.last_pos)
+        self.last_pos = current_pos.copy()
+        if dist_moved < 0.005: self.stuck_counter += 1
+        else: self.stuck_counter = 0
+
+        # 緊急回避 (物理的本能)
+        if self.mode == "BRAKE":
+            self.timer -= 1
+            if self.timer <= 0:
+                self.mode = "ESCAPE"; self.timer = 30
+                best_idx = np.argmax(lidar)
+                angles_deg = [0, 15, -15, 30, -30, 45, -45, 90, -90, 135, -135, 180]
+                self.action = np.array([-0.05, np.clip(np.deg2rad(angles_deg[best_idx]), -0.5, 0.5)])
+            return np.array([0.0, 0.0])
+
+        if self.mode == "ESCAPE":
+            self.timer -= 1; 
+            if self.timer <= 0 or front_dist > 0.8: self.mode = "WANDER"
+            return self.action
+
+        if front_dist < 0.22 or self.stuck_counter > 40:
+            self.mode = "BRAKE"; self.timer = 8; return np.array([0.0, 0.0])
+
+        # 通常巡回
+        self.timer -= 1
+        if self.timer <= 0:
+            self.timer = np.random.randint(80, 150)
             self.action = np.array([0.18, np.random.uniform(-0.4, 0.4)])
         return self.action

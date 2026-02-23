@@ -1,12 +1,11 @@
-# verify_scripted_match.py v1.1
-# 演習第26回：ルールベース最強対決（AI学習前の最終環境監査）
+# verify_scripted_match.py v1.2
+# 演習第26回：ルールベース最強対決（ライブラリ統合 ＆ 監査環境完遂版）
 # 
 # 修正履歴:
-# v1.0: Seeker(追跡) vs Hider(逃避) の相互作用を確認。
-# v1.1: ユーザー指摘を反映。
-#       1. シードをランダム化し、毎回異なる展開を提供。
-#       2. カメラ初期位置を俯瞰（遠景）に固定し、手動調整の手間を解消。
-#       3. 狭い場所でのスタック対策としてリセット間隔とエージェント行動を微調整。
+# v1.1: ランダムシード ＆ カメラ最適化。
+# v1.2: scripted_agents.py v1.70 への完全移行。
+#       1. 外部インポートの依存を排除し、管理を容易化。
+#       2. H1(緑): 賢いHider, H2(青): ランダムHider の対比を明確化。
 
 import mujoco
 import mujoco.viewer
@@ -15,14 +14,14 @@ import time
 import math
 
 from envs.hns_environment import TeamCosEnv
-from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
+from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider, SimpleWanderer
 
 # --- 監査設定 ---
 ACTION_REPEAT = 2
 TARGET_FPS = 15.0
 FRAME_DURATION = 1.0 / TARGET_FPS
 FOV_HALF_RAD = 135 * 0.5 * math.pi / 180.0
-RESET_INTERVAL = 3000 # スタック対策として少し短めに設定
+RESET_INTERVAL = 3000
 
 def can_see(engine, p1, h1, p2, b_exclude, t_id):
     diff = p2 - p1; dist = np.linalg.norm(diff)
@@ -33,15 +32,12 @@ def can_see(engine, p1, h1, p2, b_exclude, t_id):
 
 def run_match():
     print("="*120)
-    print("🚀 Rule-Based Final Match: Diversity & Camera Optimized")
+    print("🚀 Rule-Based Final Match: Seeker vs Smart Hider vs Random Hider")
     print("="*120)
     
     env = TeamCosEnv(); m, d = env.model, env.data
     s_agent = RuleBasedSeeker()
-    h1_smart = RuleBasedHider() # 賢い逃亡者
-    
-    # H2は以前のランダムクラス（スタック検知付き）を使用
-    from scripts.verify.verify_seeker_rule import SimpleWanderer
+    h1_smart = RuleBasedHider() 
     h2_random = SimpleWanderer(1) 
 
     s_id = env.body_ids['s']; h1_id = env.body_ids['h1']; h2_id = env.body_ids['h2']
@@ -50,28 +46,22 @@ def run_match():
     h2_geom = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "hider2_btm")
 
     with mujoco.viewer.launch_passive(m, d) as viewer:
-        # 💡 カメラの初期位置を俯瞰に設定
+        # カメラの初期位置を俯瞰に設定
         viewer.cam.lookat[:] = [0.0, 0.0, 0.5]
-        viewer.cam.distance = 18.0     # 遠めに引く
-        viewer.cam.elevation = -75.0   # 上から見下ろす
-        viewer.cam.azimuth = 90.0
+        viewer.cam.distance = 18.0
+        viewer.cam.elevation = -75.0
         
         step = 0
         while viewer.is_running():
             t_start = time.perf_counter()
-            
-            # 💡 シードをランダム化してリセット
             if step % RESET_INTERVAL == 0: 
                 new_seed = int(time.time() * 1000) % 100000
                 env.reset(seed=new_seed)
-                print(f"🔄 Environment Reset (Seed: {new_seed})")
             
-            # 状態取得
             s_pos = d.geom_xpos[s_geom][:2].copy(); s_rot = d.qpos[m.jnt_qposadr[env.qpos_indices['s']['rot']]]
             h1_pos = d.geom_xpos[h1_geom][:2].copy(); h1_rot = d.qpos[m.jnt_qposadr[env.qpos_indices['h1']['rot']]]
             h2_pos = d.geom_xpos[h2_geom][:2].copy()
             
-            # アクション決定
             act_s = s_agent.get_action(env._get_obs(0), env.vis_engine, s_pos, s_rot, [h1_pos, h2_pos], s_id, [h1_id, h2_id])
             act_h1 = h1_smart.get_action(env._get_obs(1), h1_pos, h1_rot, s_pos)
             act_h2 = h2_random.get_action(env._get_obs(2), h2_pos)
@@ -80,12 +70,10 @@ def run_match():
             
             if hasattr(viewer, 'user_scn'):
                 ctx = viewer.user_scn; ctx.ngeom = 0
-                # ラベル表示（各キャラの頭上）
                 for bid, label, col in [(s_id, f"S:{s_agent.status}", [1,0,0,1]), (h1_id, f"H1:{h1_smart.status}", [0,1,0,1]), (h2_id, f"H2:RAND", [0,0.7,1,1])]:
                     mujoco.mjv_initGeom(ctx.geoms[ctx.ngeom], type=mujoco.mjtGeom.mjGEOM_LABEL, size=[0,0,0], pos=d.xpos[bid]+[0,0,1.2], mat=np.eye(3).flatten(), rgba=col)
                     ctx.geoms[ctx.ngeom].label = label; ctx.ngeom += 1
                 
-                # 視界線の描画
                 s_c = d.geom_xpos[s_geom].copy(); s_c[2]=0.4
                 for tid, gid, col in [(h1_id, h1_geom, [1,0,0,1]), (h2_id, h2_geom, [0,0.7,1,1])]:
                     t_c = d.geom_xpos[gid].copy(); t_c[2]=0.4
@@ -94,11 +82,7 @@ def run_match():
                         ctx.geoms[ctx.ngeom].rgba = col; ctx.ngeom += 1
             
             viewer.sync(); step += 1
-            
-            # FPSウェイト処理
             elapsed = time.perf_counter() - t_start
-            if elapsed < FRAME_DURATION: 
-                time.sleep(FRAME_DURATION - elapsed)
+            if elapsed < FRAME_DURATION: time.sleep(FRAME_DURATION - elapsed)
 
-if __name__ == "__main__": 
-    run_match()
+if __name__ == "__main__": run_match()
