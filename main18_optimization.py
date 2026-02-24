@@ -364,18 +364,26 @@ XML_CONTENT = """
 
     <!-- 等価拘束: 物体を掴む/ロックする機能の実装 -->
     <equality>
-        <!-- Hider1がBox1/Box2を掴むための溶接拘束 -->
-        <weld name="eq_grasp1_b1" body1="hider1_body" body2="box1_body" active="false" relpose="0 0 0 1 0 0 0" solref="0.08 1" solimp="0.9 0.95 0.001"/>
-        <weld name="eq_grasp1_b2" body1="hider1_body" body2="box2_body" active="false" relpose="0 0 0 1 0 0 0" solref="0.08 1" solimp="0.9 0.95 0.001"/>
+        <!-- Grasp: Hider 1 が Box 1/2 / Ramp を掴むための拘束 -->
+        <weld name="eq_grasp1_b1" body1="hider1_body" body2="box1_body" active="false" solref="0.08 1" solimp="0.9 0.95 0.001"/>
+        <weld name="eq_grasp1_b2" body1="hider1_body" body2="box2_body" active="false" solref="0.08 1" solimp="0.9 0.95 0.001"/>
+        <weld name="eq_grasp1_ramp" body1="hider1_body" body2="ramp_body" active="false" solref="0.08 1" solimp="0.9 0.95 0.001"/>
         
-        <!-- Hider2がBox1/Box2を掴むための溶接拘束 -->
-        <weld name="eq_grasp2_b1" body1="hider2_body" body2="box1_body" active="false" relpose="0 0 0 1 0 0 0" solref="0.08 1" solimp="0.9 0.95 0.001"/>
-        <weld name="eq_grasp2_b2" body1="hider2_body" body2="box2_body" active="false" relpose="0 0 0 1 0 0 0" solref="0.08 1" solimp="0.9 0.95 0.001"/>
+        <!-- Grasp: Hider 2 が Box 1/2 / Ramp を掴むための拘束 -->
+        <weld name="eq_grasp2_b1" body1="hider2_body" body2="box1_body" active="false" solref="0.08 1" solimp="0.9 0.95 0.001"/>
+        <weld name="eq_grasp2_b2" body1="hider2_body" body2="box2_body" active="false" solref="0.08 1" solimp="0.9 0.95 0.001"/>
+        <weld name="eq_grasp2_ramp" body1="hider2_body" body2="ramp_body" active="false" solref="0.08 1" solimp="0.9 0.95 0.001"/>
+
+        <!-- 💡 [NEW] Grasp: Seeker が Box 1/2 / Ramp を掴むための拘束 -->
+        <weld name="eq_grasp_s_b1" body1="seeker_body" body2="box1_body" active="false" solref="0.08 1" solimp="0.9 0.95 0.001"/>
+        <weld name="eq_grasp_s_b2" body1="seeker_body" body2="box2_body" active="false" solref="0.08 1" solimp="0.9 0.95 0.001"/>
+        <weld name="eq_grasp_s_ramp" body1="seeker_body" body2="ramp_body" active="false" solref="0.08 1" solimp="0.9 0.95 0.001"/>
         
-        <!-- Box1/Box2を空間に固定（ロック）するための溶接拘束 -->
+        <!-- Lock: Box 1/2 / Ramp を空間に固定（ロック）するための拘束 -->
         <weld name="eq_lock_b1" body1="world" body2="box1_body" active="false" solref="0.02 1" solimp="0.95 0.99 0.001"/>
         <weld name="eq_lock_b2" body1="world" body2="box2_body" active="false" solref="0.02 1" solimp="0.95 0.99 0.001"/>
-    </equality>
+        <weld name="ramp_lock" body1="world" body2="ramp_body" active="false" solref="0.02 1" solimp="0.95 0.99 0.001"/>
+    </equality> 
 
     <!-- アクチュエータ: エージェントの動きを制御 -->
     <actuator>

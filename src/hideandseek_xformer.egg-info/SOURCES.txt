@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 src/__init__.py
+src/agents/__init__.py
 src/agents/scripted_agents.py
 src/core/__init__.py
 src/core/visibility_engine.py
@@ -12,3 +13,4 @@ src/hideandseek_xformer.egg-info/dependency_links.txt
 src/hideandseek_xformer.egg-info/requires.txt
 src/hideandseek_xformer.egg-info/top_level.txt
 src/models/__init__.py
+src/models/ppo_transformer_v2.py
