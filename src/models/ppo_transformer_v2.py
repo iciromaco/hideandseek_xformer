@@ -1,11 +1,11 @@
-# ppo_transformer_v2.py v2.14
-# 演習第26回：【完全展開・省略一切禁止】エントロピー爆発防止クランプ ＆ 形状整合性完遂版
+# ppo_transformer_v2.py v2.16.1
+# 演習第26回：【構文エラー是正版】言語タグを修正し、行動飽和制御（Tanh）を維持
 # 
-# 遵守事項:
-# 1. 処理の完全展開: 1行1命令を徹底。計算プロセスを一行に詰め込む圧縮や省略を完全に禁止。
-# 2. 形状変形エラー修正: すべての .view() を .reshape() に全置換。不連続テンソルでも安全。
-# 3. エントロピー制御: actor_logstd を [-5, 2] の範囲にクランプし、ランダム化への逃避を物理的に遮断。
-# 4. 詳細コメント: 各ネットワーク層の役割とテンソル形状の変遷を詳細に記述。
+# 修正内容:
+# 1. 構文エラーの解消: 前回のブロック形式によるコンパイルエラーを修正するため、python形式で再生成。
+# 2. 処理の完全展開: 1行1命令の原則を遵守し、可読性を確保。
+# 3. 飽和活性化（Tanh）: actor_mean の終端に nn.Tanh() を適用し、[-1, 1] の出力を保証。
+# 4. Transformer構成: PyTorch標準の TransformerEncoderLayer を使用し、時系列コンテキストを処理。
 
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ import numpy as np
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     """
-    ニューラルネットワーク層の重みを直交初期化する補助関数。
+    層の重みを直交初期化し、バイアスを定数で初期化する補助関数。
     """
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -23,19 +23,18 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class AgentV2(nn.Module):
     """
     Transformerをバックボーンに持つPPOエージェント。
-    [移動, 旋回, ロック, 掴み] の多次元アクションを制御可能。
+    [移動, 旋回, ロック, 掴み] の多次元アクションを制御。
     """
     def __init__(self, obs_dim, action_dim, hidden_dim, seq_len):
         super(AgentV2, self).__init__()
         
-        # ハイパーパラメータの保存
+        # ハイパーパラメータの保持
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.seq_len = seq_len
 
         # --- [1] 入力エンコーディング層 ---
-        # 53次元の観測ベクトルを内部表現へ投影
         self.obs_encoder = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden_dim)),
             nn.LayerNorm(hidden_dim),
@@ -45,7 +44,6 @@ class AgentV2(nn.Module):
         )
 
         # --- [2] Transformer バックボーン ---
-        # 過去のコンテキストを考慮するためのマルチヘッドアテンション
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=4,
@@ -64,100 +62,77 @@ class AgentV2(nn.Module):
         )
 
         # --- [4] 方策（Actor）ヘッド ---
+        # 出力を [-1, 1] に制限することで、環境側の 0.5 閾値判定との整合性を高める
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(hidden_dim, hidden_dim)),
             nn.ReLU(),
-            layer_init(nn.Linear(hidden_dim, action_dim), std=0.01)
+            layer_init(nn.Linear(hidden_dim, action_dim), std=0.01),
+            nn.Tanh()
         )
         
-        # 各アクション次元ごとの学習可能な分散（探索範囲）
-        # 初期値 0 は exp(0) = 1.0 の標準偏差を意味する
+        # 学習可能な分散パラメータ
         self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
 
     def get_value(self, x):
         """
-        GAE計算に使用するための状態価値のみを取得。
+        状態価値 V(s) を算出。GAE計算に使用。
         """
-        # 特徴抽出
         batch_size = x.shape[0]
-        
-        # 入力をフラット化してエンコード
-        # 💡 view ではなく reshape を使用して不連続テンソルに対応
+        # 1. 観測値の形状変換（フラット化）
         flat_x = x.reshape(-1, self.obs_dim)
-        
-        # エンコーダの適用
+        # 2. 特徴量抽出
         encoded = self.obs_encoder(flat_x)
-        
-        # 時系列形状 (batch, seq, hidden) へ復元
+        # 3. シーケンス形状へ復元 (batch, seq, hidden)
         encoded_sequence = encoded.reshape(batch_size, self.seq_len, self.hidden_dim)
-        
-        # Transformerによる時間相関の解析
+        # 4. Transformerによるコンテキスト解析
         context = self.transformer(encoded_sequence)
-        
-        # 最新ステップ（インデックス -1）の情報を抽出
+        # 5. 最終ステップ（最新状態）のコンテキストを抽出
         last_step_context = context[:, -1, :]
-        
-        # 状態価値の算出
+        # 6. 状態価値の算出
         value = self.critic(last_step_context)
-        
         return value
 
     def get_action_and_value(self, x, action=None):
         """
-        行動のサンプリング、対数確率、エントロピー、状態価値を計算。
+        行動サンプリング、対数確率、エントロピー、および状態価値を算出。
         """
-        # バッチサイズの取得
         batch_size = x.shape[0]
         
-        # 1. 特徴抽出（バックボーン）
-        # 💡 view ではなく reshape を使用
+        # 1. 共通バックボーン演算
         flat_x_eval = x.reshape(-1, self.obs_dim)
-        
-        # エンコーダによる特徴投影
         encoded_eval = self.obs_encoder(flat_x_eval)
-        
-        # 時系列形状へ復元
         encoded_eval_seq = encoded_eval.reshape(batch_size, self.seq_len, self.hidden_dim)
-        
-        # 2. Transformer による文脈解析
         context_eval = self.transformer(encoded_eval_seq)
-        
-        # 3. 最新の文脈（隠れ状態）を抽出
         latent_eval = context_eval[:, -1, :]
         
-        # 4. 分布パラメータの算出
-        # 平均値(Mean)の計算
+        # 2. 行動平均値の算出 (Tanh活性化済み)
         action_mean = self.actor_mean(latent_eval)
         
-        # 💡 【核心修正】探索範囲（エントロピー）の暴走を物理的にクランプ
-        # -5.0 (std ≒ 0.006) から 2.0 (std ≒ 7.38) の範囲に制限
-        # これにより、エージェントが学習を諦めて「ランダム化」に向かうのを防ぐ
+        # 3. 行動分散の算出
+        # 数値的安定性のために logstd をクランプ
         logstd_clamped = torch.clamp(self.actor_logstd, -5.0, 2.0)
-        
-        # 対数標準偏差を全バッチに拡張
         action_logstd_eval = logstd_clamped.expand_as(action_mean)
-        
-        # exp による標準偏差の算出
         action_std_eval = torch.exp(action_logstd_eval)
         
-        # 5. 多変量正規分布の構築
-        action_distribution = distributions.Normal(action_mean, action_std_eval)
+        # 4. 正規分布に基づく確率分布の構築
+        probs = distributions.Normal(action_mean, action_std_eval)
         
-        # 6. 行動の決定
+        # 5. 行動の決定
         if action is None:
-            # 推論時：再パラメータ化を行わないサンプリング
-            action = action_distribution.sample()
+            # 学習時はサンプリング、推論時は mean を使うなどの使い分けが可能だが、
+            # PPOの標準に従いここではサンプリングを行う
+            action = probs.sample()
         
-        # 7. 各種統計量の計算
-        # 各アクション軸の対数確率を算出し、全次元で合算
-        log_prob_eval = action_distribution.log_prob(action)
-        log_prob_sum = log_prob_eval.sum(1)
+        # 6. 各種統計量の計算
+        log_prob = probs.log_prob(action)
+        # 全アクション次元の対数確率を合計
+        log_prob_sum = log_prob.sum(dim=1)
         
-        # 探索を維持するためのエントロピー
-        entropy_eval = action_distribution.entropy()
-        entropy_sum = entropy_eval.sum(1)
+        # エントロピー（探索の多様性指標）
+        entropy = probs.entropy()
+        entropy_sum = entropy.sum(dim=1)
         
-        # 状態価値（Critic出力）
-        value_eval = self.critic(latent_eval)
+        # 状態価値
+        value = self.critic(latent_eval)
         
-        return action, log_prob_sum, entropy_sum, value_eval
+        return action, log_prob_sum, entropy_sum, value
