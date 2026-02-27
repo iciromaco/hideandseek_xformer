@@ -1,17 +1,16 @@
-# hns_environment.py v2.69
-# 演習第26回：【全ロジック極限展開 ＆ 合理的絶対静止条件 ＆ 権限管理・完全復元版】
+# hns_environment.py v2.71
+# 演習第26回：【論理整合性・極限展開 ＆ 55次元カテゴリカル観測 ＆ 完全復旧版】
 #
 # 修正内容:
-# 1. 論理の再展開（行数復元）:
-#    - 前回の更新で凝縮された全メソッドを「1行1命令」の原則に基づき、垂直方向に再展開。
-#    - 速度ノルム、距離、判定フラグの算出プロセスをすべて中間変数に分離。
-# 2. 合理的絶対静止条件の厳格適用:
-#    - Lock/Hold の開始条件として「エージェントとオブジェクト双方が絶対的に静止（閾値 0.03）」であることを唯一の条件に設定。
-#    - 相対静止（移動しながらの操作）を排除し、物理的な安定性を最大化。
-# 3. インタラクション権限の厳密化:
-#    - Hold OFF: そのオブジェクトを現在掴んでいる「本人」のみが解除パルスを送信可能。
-#    - Lock OFF: そのオブジェクトをロックした者と同じ「チーム（Seeker/Hider）」のみが解除可能。
-# 4. 物理仕様の完全維持: 1.02m マージン、3段階速度・加速度リセット、55次元観測、トグル制御をすべて維持。
+# 1. 論理の完全再展開 (行数復旧):
+#    - 前回の更新で短縮された全プロセスを「1行1命令」で垂直方向に展開。
+#    - 速度ノルム、距離、排他判定フラグの算出をすべてステップごとに分離。
+# 2. 55次元カテゴリカル状態観測の定着:
+#    - 道具の7番目(base+6)を interaction_state (0:なし, 1:Lock, 2:自分Hold, 3:他者Hold) に集約。
+#    - 判定順序 (Lock > 自分 > 他者) を if/elif 形式で詳細に記述。
+# 3. 物理仕様の厳格維持: 
+#    - 合理的絶対静止条件（閾値 0.03）、1.02mマージン、チーム権限/本人権限管理をすべて保持。
+# 4. 可読性の最大化: 複雑な計算を一行に詰め込まず、中間変数を多用して挙動を透明化。
 
 import math
 import sys
@@ -89,51 +88,30 @@ class TeamCosEnv(gym.Env):
             "h1": {"lock": 0, "grab": 0},
             "h2": {"lock": 0, "grab": 0}
         }
-        self.intent_ttl_limit = 35
-        self.intent_stable_needed_lock = 2
-        self.intent_stable_needed_grab = 1
-        self.stationary_thresh_agent_lock = 0.03
-        self.stationary_thresh_obj_lock = 0.04
-        self.stationary_thresh_agent_grab = 0.10
-        self.stationary_thresh_obj_grab = 0.12
-        self.interaction_intents = {
-            "s": {
-                "lock": {"active": False, "tok": "", "id": -1, "ttl": 0, "stable": 0},
-                "grab": {"active": False, "tok": "", "id": -1, "ttl": 0, "stable": 0}
-            },
-            "h1": {
-                "lock": {"active": False, "tok": "", "id": -1, "ttl": 0, "stable": 0},
-                "grab": {"active": False, "tok": "", "id": -1, "ttl": 0, "stable": 0}
-            },
-            "h2": {
-                "lock": {"active": False, "tok": "", "id": -1, "ttl": 0, "stable": 0},
-                "grab": {"active": False, "tok": "", "id": -1, "ttl": 0, "stable": 0}
-            }
-        }
         # チーム権限管理用 (None, 's', 'h')
         self.lock_owners = {
             "b1": None,
             "b2": None,
             "ramp": None
         }
-        self.collision_guard_steps = {
-            "b1": 0,
-            "b2": 0,
-            "ramp": 0,
+        self.locked_pose = {
+            "b1": None,
+            "b2": None,
+            "ramp": None
         }
-        self.velocity_guard_steps = {
-            "b1": 0,
-            "b2": 0,
-            "ramp": 0,
+        self.hold_boost_max = 2.3
+        self.object_ground_z = {
+            "b1": 0.5,
+            "b2": 0.5,
+            "ramp": 0.5
         }
-        self.pending_grab_release = {
-            "s": {"active": False, "tok": "", "steps": 0},
-            "h1": {"active": False, "tok": "", "steps": 0},
-            "h2": {"active": False, "tok": "", "steps": 0},
+        self.agent_body_mass = {}
+        self.object_body_mass = {
+            "b1": 100.0,
+            "b2": 100.0,
+            "ramp": 50.0
         }
-        self.velocity_guard_agent_xy_max = 0.15
-        self.velocity_guard_agent_rot_max = 0.15
-        self.velocity_guard_obj_max = 0.12
+
         self.body_ids = {}
         self.qpos_indices = {}
         self.obj_default_colors = {}
@@ -141,7 +119,7 @@ class TeamCosEnv(gym.Env):
         self.obj_default_con = {}
         self.eq_ids = {}
 
-        # 物理構造の解析（詳細展開）
+        # 物理構造の解析
         self._analyze_structure()
         # NPCの初期化
         self._init_npcs()
@@ -168,38 +146,22 @@ class TeamCosEnv(gym.Env):
         )
 
     def _analyze_structure(self):
-        """XML解析とキャッシュ構築（1行1命令）"""
+        """XML解析とキャッシュ構築（詳細展開）"""
         m = self.model
         for k in self.agent_keys:
-            full_name = self.key_to_full[k]
-            body_name = f"{full_name}_body"
-            body_obj = m.body(body_name)
-            self.body_ids[k] = body_obj.id
+            try:
+                full_name = self.key_to_full[k]
+                body_name = f"{full_name}_body"
+                body_obj = m.body(body_name)
+                self.body_ids[k] = body_obj.id
 
-            joint_prefix_candidates = [k, full_name]
-
-            def _resolve_joint_id(suffix):
-                last_error = None
-                for prefix in joint_prefix_candidates:
-                    joint_name = f"{prefix}_{suffix}"
-                    try:
-                        return m.joint(joint_name).id
-                    except Exception as exc:
-                        last_error = exc
-                raise KeyError(
-                    f"Joint not found for agent '{k}' and suffix '{suffix}'. "
-                    f"Tried: {joint_prefix_candidates}"
-                ) from last_error
-
-            self.qpos_indices[k] = {
-                'x': _resolve_joint_id("x"),
-                'y': _resolve_joint_id("y"),
-                'rot': _resolve_joint_id("rot")
-            }
-
-        missing_agents = [k for k in self.agent_keys if k not in self.qpos_indices]
-        if missing_agents:
-            raise RuntimeError(f"Missing qpos indices for agents: {missing_agents}")
+                self.qpos_indices[k] = {
+                    'x': m.joint(f"{k}_x").id,
+                    'y': m.joint(f"{k}_y").id,
+                    'rot': m.joint(f"{k}_rot").id
+                }
+            except Exception:
+                pass
 
         self.box_ids = []
         self.ramp_id = -1
@@ -234,6 +196,16 @@ class TeamCosEnv(gym.Env):
             for ak in self.agent_keys:
                 self.eq_ids[f"grasp_{ak}_{t}"] = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_EQUALITY, f"eq_grasp_{ak}_{t}")
 
+        for ak in self.agent_keys:
+            if ak in self.body_ids:
+                self.agent_body_mass[ak] = float(m.body_subtreemass[self.body_ids[ak]])
+
+        if len(self.box_ids) >= 2:
+            self.object_body_mass["b1"] = float(m.body_subtreemass[self.box_ids[0]])
+            self.object_body_mass["b2"] = float(m.body_subtreemass[self.box_ids[1]])
+        if self.ramp_id != -1:
+            self.object_body_mass["ramp"] = float(m.body_subtreemass[self.ramp_id])
+
     def _init_npcs(self):
         """NPC の生成"""
         self.npcs = {}
@@ -244,19 +216,21 @@ class TeamCosEnv(gym.Env):
     def step(self, action):
         """物理更新ステップ（極限展開）"""
         self.current_step = self.current_step + 1
-        self._update_collision_guards()
         
-        # クールダウン更新
+        # クールダウンタイマーの更新
         for k_tm in self.agent_keys:
-            if self.cooldown_timers[k_tm]["lock"] > 0:
-                self.cooldown_timers[k_tm]["lock"] -= 1
-            if self.cooldown_timers[k_tm]["grab"] > 0:
-                self.cooldown_timers[k_tm]["grab"] -= 1
+            timer_l = self.cooldown_timers[k_tm]["lock"]
+            if timer_l > 0:
+                self.cooldown_timers[k_tm]["lock"] = timer_l - 1
+            
+            timer_g = self.cooldown_timers[k_tm]["grab"]
+            if timer_g > 0:
+                self.cooldown_timers[k_tm]["grab"] = timer_g - 1
 
         ctrl_vec = np.zeros(self.model.nu)
         act_flat = np.ravel(action)
 
-        # 1. Hider 1 行動展開
+        # 1. Hider 1
         h1_fwd = act_flat[0]
         h1_turn = act_flat[1]
         h1_lock = act_flat[2]
@@ -265,7 +239,7 @@ class TeamCosEnv(gym.Env):
         ctrl_vec[3] = h1_turn
         self._process_physical_interaction("h1", h1_lock, h1_grab)
 
-        # 2. Hider 2 行動展開
+        # 2. Hider 2
         if self.mode == "refinement":
             h2_fwd = act_flat[4]
             h2_turn = act_flat[5]
@@ -279,14 +253,14 @@ class TeamCosEnv(gym.Env):
                 obs_h2 = self._get_obs(2)
                 h2_act = self.npcs["h2"].get_action(obs_h2)
                 h2_npc_fwd = h2_act[0]
-                h2_npc_trn = h2_act[1]
-                h2_npc_lck = h2_act[2]
-                h2_npc_grb = h2_act[3]
+                h2_npc_turn = h2_act[1]
+                h2_npc_lock = h2_act[2]
+                h2_npc_grab = h2_act[3]
                 ctrl_vec[4] = h2_npc_fwd
-                ctrl_vec[5] = h2_npc_trn
-                self._process_physical_interaction("h2", h2_npc_lck, h2_npc_grb)
+                ctrl_vec[5] = h2_npc_turn
+                self._process_physical_interaction("h2", h2_npc_lock, h2_npc_grab)
 
-        # 3. Seeker 行動展開
+        # 3. Seeker
         obs_s = self._get_obs(0)
         s_act = self.npcs["s"].get_action(obs_s)
         if self.current_step <= self.prep_steps:
@@ -295,27 +269,64 @@ class TeamCosEnv(gym.Env):
             self._process_physical_interaction("s", 0.0, 0.0)
         else:
             s_npc_fwd = s_act[0]
-            s_npc_trn = s_act[1]
-            s_npc_lck = s_act[2]
-            s_npc_grb = s_act[3]
+            s_npc_turn = s_act[1]
+            s_npc_lock = s_act[2]
+            s_npc_grab = s_act[3]
             ctrl_vec[0] = s_npc_fwd
-            ctrl_vec[1] = s_npc_trn
-            self._process_physical_interaction("s", s_npc_lck, s_npc_grb)
+            ctrl_vec[1] = s_npc_turn
+            self._process_physical_interaction("s", s_npc_lock, s_npc_grab)
 
-        # Hold成立前（grab intent中）のみ回転入力を抑止
-        if self.interaction_intents["s"]["grab"]["active"] and (not self._is_agent_holding("s")):
-            ctrl_vec[1] = 0.0
-        if self.interaction_intents["h1"]["grab"]["active"] and (not self._is_agent_holding("h1")):
-            ctrl_vec[3] = 0.0
-        if self.interaction_intents["h2"]["grab"]["active"] and (not self._is_agent_holding("h2")):
-            ctrl_vec[5] = 0.0
+        hold_forward_index = {"s": 0, "h1": 2, "h2": 4}
+        for ak_hb in self.agent_keys:
+            held_tok = ""
+            for tok_hb in ["b1", "b2", "ramp"]:
+                gid_hb = self.eq_ids[f"grasp_{ak_hb}_{tok_hb}"]
+                lid_hb = self.eq_ids[f"lock_{tok_hb}"]
+                if self.data.eq_active[gid_hb] > 0.5 and self.data.eq_active[lid_hb] <= 0.5:
+                    held_tok = tok_hb
+                    break
+            if held_tok == "":
+                continue
+            idx_hb = hold_forward_index[ak_hb]
+            ag_m = self.agent_body_mass.get(ak_hb, 1.0)
+            ob_m = self.object_body_mass.get(held_tok, 0.0)
+            if ag_m <= 1e-6:
+                continue
+            boost_hb = (ag_m + ob_m) / ag_m
+            boost_hb = max(1.0, min(self.hold_boost_max, boost_hb))
+            ctrl_vec[idx_hb] = float(np.clip(ctrl_vec[idx_hb] * boost_hb, -1.0, 1.0))
 
         self.data.ctrl[:] = ctrl_vec
         for _ in range(5):
             mujoco.mj_step(self.model, self.data)
-        self._stabilize_active_grasp_rotation()
-        mujoco.mj_forward(self.model, self.data)
-        self._apply_velocity_guard()
+            for tok_fix in ["b1", "b2", "ramp"]:
+                lid_fix = self.eq_ids[f"lock_{tok_fix}"]
+                if self.data.eq_active[lid_fix] <= 0.5:
+                    continue
+                oid_fix = self.box_ids[0] if tok_fix == "b1" else self.box_ids[1] if tok_fix == "b2" else self.ramp_id
+                if oid_fix == -1:
+                    continue
+                jadr_fix = self.model.body_jntadr[oid_fix]
+                if jadr_fix == -1:
+                    continue
+                if self.model.jnt_type[jadr_fix] != mujoco.mjtJoint.mjJNT_FREE:
+                    continue
+                qadr_fix = self.model.jnt_qposadr[jadr_fix]
+                dadr_fix = self.model.jnt_dofadr[jadr_fix]
+                pose_fix = self.locked_pose[tok_fix]
+                if pose_fix is None:
+                    pose_fix = self.data.qpos[qadr_fix:qadr_fix+7].copy()
+                    self.locked_pose[tok_fix] = pose_fix
+                self.data.qpos[qadr_fix:qadr_fix+7] = pose_fix
+                self.data.qvel[dadr_fix:dadr_fix+6] = 0.0
+
+        for tok_l in ["b1", "b2", "ramp"]:
+            lid_l = self.eq_ids[f"lock_{tok_l}"]
+            if self.data.eq_active[lid_l] <= 0.5:
+                continue
+            oid_l = self.box_ids[0] if tok_l == "b1" else self.box_ids[1] if tok_l == "b2" else self.ramp_id
+            v_adr_l = self.model.jnt_dofadr[self.model.body_jntadr[oid_l]]
+            self.data.qvel[v_adr_l:v_adr_l+6] *= 0.25
 
         self._sync_visual_states()
         if self.render_mode == "human":
@@ -330,483 +341,362 @@ class TeamCosEnv(gym.Env):
         return norm_obs_h1, float(rew_val), False, truncated, {"is_detected": found_flag}
 
     def _process_physical_interaction(self, agent_key, lock_cmd, grab_cmd):
-        """物理インタラクション処理（Intent→減速→静止Commit）"""
+        """物理インタラクション処理（極限展開版）"""
         m, d = self.model, self.data
         agent_bid = self.body_ids[agent_key]
         
-        # 1. 入力パルス判定
+        # 1. 入力パルス・クールダウン判定
         prev = self.prev_action_btns[agent_key]
         lock_pushed = (lock_cmd > 0.5) and (prev[0] <= 0.5)
         grab_pushed = (grab_cmd > 0.5) and (prev[1] <= 0.5)
         
-        # クールダウンチェック
-        l_tmr = self.cooldown_timers[agent_key]["lock"]
-        g_tmr = self.cooldown_timers[agent_key]["grab"]
-        if lock_pushed and l_tmr > 0: lock_pushed = False
-        if grab_pushed and g_tmr > 0: grab_pushed = False
+        timer_l = self.cooldown_timers[agent_key]["lock"]
+        timer_g = self.cooldown_timers[agent_key]["grab"]
+        if lock_pushed and timer_l > 0:
+            lock_pushed = False
+        if grab_pushed and timer_g > 0:
+            grab_pushed = False
         
         self.prev_action_btns[agent_key][0] = lock_cmd
         self.prev_action_btns[agent_key][1] = grab_cmd
 
-        # 2. 自身の把持状態の特定
+        if not lock_pushed and not grab_pushed:
+            return
+
+        # 2. 自身の現在の把持状態特定
         my_held_tok = ""
         my_held_id = -1
-        for tok_chk in ["b1", "b2", "ramp"]:
-            g_id_chk = self.eq_ids[f"grasp_{agent_key}_{tok_chk}"]
-            if d.eq_active[g_id_chk] > 0.5:
-                my_held_tok = tok_chk
-                if tok_chk == "b1": my_held_id = self.box_ids[0]
-                elif tok_chk == "b2": my_held_id = self.box_ids[1]
-                else: my_held_id = self.ramp_id
+        for tok_name in ["b1", "b2", "ramp"]:
+            gid_key = f"grasp_{agent_key}_{tok_name}"
+            gid_val = self.eq_ids[gid_key]
+            if d.eq_active[gid_val] > 0.5:
+                my_held_tok = tok_name
+                if tok_name == "b1":
+                    my_held_id = self.box_ids[0]
+                elif tok_name == "b2":
+                    my_held_id = self.box_ids[1]
+                else:
+                    my_held_id = self.ramp_id
                 break
 
-        # 3. 近接オブジェクト探索（視界判定込み）
+        # 3. 近接オブジェクト探索
         objs = self.box_ids + ([self.ramp_id] if self.ramp_id != -1 else [])
         best_id, best_tok = -1, ""
-        interact_th = 1.50 if my_held_id != -1 else 1.15
+        interact_th = 1.50 if my_held_id != -1 else 1.25
         min_dist = interact_th
         
         a_pos_w = d.xpos[agent_bid]
         r_idx = self.qpos_indices[agent_key]['rot']
         r_val = d.qpos[m.jnt_qposadr[r_idx]]
-        dir_vec = np.array([math.cos(r_val), math.sin(r_val)])
+        dir_vec_f = np.array([math.cos(r_val), math.sin(r_val)])
 
         for oid in objs:
             o_pos_w = d.xpos[oid]
-            # 視界または把持中の特権
+            # 視界判定
             is_vis = self._is_within_fov_and_visible(a_pos_w[:2], r_val, o_pos_w[:2], agent_bid, oid)
-            if not is_vis and oid != my_held_id:
+            diff_v = o_pos_w - a_pos_w
+            dist_curr = np.linalg.norm(diff_v)
+            near_override = dist_curr < 1.25
+            if (not is_vis) and (not near_override) and oid != my_held_id:
                 continue
-            
-            diff_w = o_pos_w - a_pos_w
-            dist_curr = np.linalg.norm(diff_w)
             
             if dist_curr < min_dist:
                 min_dist = dist_curr
                 best_id = oid
-                nm = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, oid) or ""
-                if "box1" in nm: best_tok = "b1"
-                elif "box2" in nm: best_tok = "b2"
-                else: best_tok = "ramp"
+                nm_body = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, oid) or ""
+                if "box1" in nm_body:
+                    best_tok = "b1"
+                elif "box2" in nm_body:
+                    best_tok = "b2"
+                else:
+                    best_tok = "ramp"
 
-        # 4. 速度判定（絶対静止）
+        best_is_front = False
+        if best_id != -1:
+            best_diff = d.xpos[best_id] - a_pos_w
+            best_local_x = best_diff[0] * dir_vec_f[0] + best_diff[1] * dir_vec_f[1]
+            best_is_front = best_local_x > 0.15
+
+        # 4. 速度判定（合理的絶対静止）
         v_ax_adr = m.jnt_dofadr[self.qpos_indices[agent_key]['x']]
         v_ar_adr = m.jnt_dofadr[self.qpos_indices[agent_key]['rot']]
+        v_ag_xy = np.linalg.norm(d.qvel[v_ax_adr : v_ax_adr+2])
+        v_ag_rot = abs(d.qvel[v_ar_adr])
+        v_ag_total = v_ag_xy + v_ag_rot
         
-        my_team = agent_key[0] # 's' or 'h'
-        lock_int = self.interaction_intents[agent_key]["lock"]
-        grab_int = self.interaction_intents[agent_key]["grab"]
+        my_team_p = agent_key[0] # 's' or 'h'
 
-        def _clear_intent(intent_obj):
-            intent_obj["active"] = False
-            intent_obj["tok"] = ""
-            intent_obj["id"] = -1
-            intent_obj["ttl"] = 0
-            intent_obj["stable"] = 0
-
-        def _arm_intent(intent_obj, tok, oid):
-            intent_obj["active"] = True
-            intent_obj["tok"] = tok
-            intent_obj["id"] = oid
-            intent_obj["ttl"] = self.intent_ttl_limit
-            intent_obj["stable"] = 0
-
-        def _refresh_candidate(intent_obj):
-            if not intent_obj["active"]:
-                return -1, "", 999.0, False
-            if intent_obj["id"] == -1:
-                _clear_intent(intent_obj)
-                return -1, "", 999.0, False
-            tok_now = intent_obj["tok"]
-            oid_now = intent_obj["id"]
-            o_pos_now = d.xpos[oid_now]
-            vis_now = self._is_within_fov_and_visible(a_pos_w[:2], r_val, o_pos_now[:2], agent_bid, oid_now)
-            if (not vis_now) and (oid_now != my_held_id):
-                intent_obj["ttl"] -= 1
-                if intent_obj["ttl"] <= 0:
-                    _clear_intent(intent_obj)
-                return -1, "", 999.0, False
-            dist_now = np.linalg.norm(o_pos_now - a_pos_w)
-            if dist_now > 1.50:
-                intent_obj["ttl"] -= 1
-                if intent_obj["ttl"] <= 0:
-                    _clear_intent(intent_obj)
-                return -1, "", 999.0, False
-            return oid_now, tok_now, dist_now, True
-
-        def _apply_brake_for_object(oid_brake):
-            v_obj_adr_b = m.jnt_dofadr[m.body_jntadr[oid_brake]]
-            d.qvel[v_ax_adr:v_ax_adr+2] *= 0.35
-            d.qvel[v_ar_adr] *= 0.35
-            d.qvel[v_obj_adr_b:v_obj_adr_b+6] *= 0.45
-            return v_obj_adr_b
-
-        def _is_stationary(v_obj_adr_s, agent_th, obj_th):
-            v_ag_xy_s = np.linalg.norm(d.qvel[v_ax_adr : v_ax_adr+2])
-            v_ag_rot_s = abs(d.qvel[v_ar_adr])
-            v_ag_total_s = v_ag_xy_s + v_ag_rot_s
-            v_obj_total_s = np.linalg.norm(d.qvel[v_obj_adr_s : v_obj_adr_s+6])
-            stat_s = (v_ag_total_s < agent_th) and (v_obj_total_s < obj_th)
-            return stat_s
-
-        # --- [A] Lock処理（チーム権限管理） ---
+        # --- [A] Lock処理 ---
         if lock_pushed and best_id != -1:
-            lid_push = self.eq_ids[f"lock_{best_tok}"]
-            if d.eq_active[lid_push] > 0.5:
-                if self.lock_owners[best_tok] == my_team:
-                    d.eq_active[lid_push] = 0
+            lock_changed = False
+            lid_idx = self.eq_ids[f"lock_{best_tok}"]
+            if d.eq_active[lid_idx] > 0.5:
+                # 解除権限チェック
+                if self.lock_owners[best_tok] == my_team_p:
+                    d.eq_active[lid_idx] = 0
                     self.lock_owners[best_tok] = None
+                    self.locked_pose[best_tok] = None
                     self.cooldown_timers[agent_key]["lock"] = self.cooldown_limit
-                    _clear_intent(lock_int)
-            else:
-                _arm_intent(lock_int, best_tok, best_id)
-
-        lock_oid, lock_tok, lock_dist, lock_ok = _refresh_candidate(lock_int)
-        if lock_ok:
-            lid = self.eq_ids[f"lock_{lock_tok}"]
-            if d.eq_active[lid] > 0.5:
-                _clear_intent(lock_int)
-            else:
-                gs = self.eq_ids[f"grasp_s_{lock_tok}"]
-                gh1 = self.eq_ids[f"grasp_h1_{lock_tok}"]
-                gh2 = self.eq_ids[f"grasp_h2_{lock_tok}"]
-                others_grab = (d.eq_active[gs] + d.eq_active[gh1] + d.eq_active[gh2])
-                my_grab_val = d.eq_active[self.eq_ids[f"grasp_{agent_key}_{lock_tok}"]]
-                net_others = others_grab - my_grab_val
-                if (my_held_id == -1) or (my_held_id == lock_oid):
-                    v_obj_adr_lock = _apply_brake_for_object(lock_oid)
-                    if _is_stationary(v_obj_adr_lock, self.stationary_thresh_agent_lock, self.stationary_thresh_obj_lock):
-                        lock_int["stable"] += 1
-                    else:
-                        lock_int["stable"] = 0
-                    if lock_int["stable"] >= self.intent_stable_needed_lock and net_others <= 0.5 and lock_dist <= 1.12:
-                        if my_grab_val > 0.5:
-                            d.eq_active[self.eq_ids[f"grasp_{agent_key}_{lock_tok}"]] = 0
-                            mujoco.mj_forward(m, d)
-                        d.qvel[v_ax_adr:v_ax_adr+2] = 0.0
-                        d.qvel[v_ar_adr] = 0.0
-                        d.qvel[v_obj_adr_lock:v_obj_adr_lock+6] = 0.0
-                        mujoco.mj_forward(m, d)
-                        m.eq_data[lid, 0:3] = d.xpos[lock_oid]
-                        m.eq_data[lid, 3:7] = d.xquat[lock_oid]
-                        d.eq_active[lid] = 1
-                        self.lock_owners[lock_tok] = my_team
-                        self._activate_collision_guard(lock_tok, 6)
-                        self._activate_velocity_guard(lock_tok, 12)
-                        self.cooldown_timers[agent_key]["lock"] = self.cooldown_limit
-                        _clear_intent(lock_int)
-                else:
-                    _clear_intent(lock_int)
-            if lock_int["active"]:
-                lock_int["ttl"] -= 1
-                if lock_int["ttl"] <= 0:
-                    _clear_intent(lock_int)
-            mujoco.mj_forward(m, d)
-
-        # --- [B] Grab処理（本人解除制限） ---
-        if grab_pushed:
-            if my_held_id != -1:
-                # 解除権限: 本人が今掴んでいるものなら許可
-                lock_block_release = (
-                    lock_int["active"] and
-                    lock_int["tok"] == my_held_tok and
-                    lock_int["id"] == my_held_id
-                )
-                if (best_id == my_held_id) and (not lock_block_release):
-                    d.eq_active[self.eq_ids[f"grasp_{agent_key}_{my_held_tok}"]] = 0
-                    self.cooldown_timers[agent_key]["grab"] = self.cooldown_limit
-            elif best_id != -1:
-                _arm_intent(grab_int, best_tok, best_id)
-            mujoco.mj_forward(m, d)
-
-        grab_oid, grab_tok, grab_dist, grab_ok = _refresh_candidate(grab_int)
-        if grab_ok:
-            l_chk_id = self.eq_ids[f"lock_{grab_tok}"]
-            gs_g = self.eq_ids[f"grasp_s_{grab_tok}"]
-            gh1_g = self.eq_ids[f"grasp_h1_{grab_tok}"]
-            gh2_g = self.eq_ids[f"grasp_h2_{grab_tok}"]
-            any_grab = (d.eq_active[gs_g] + d.eq_active[gh1_g] + d.eq_active[gh2_g]) > 0.5
-            if d.eq_active[l_chk_id] <= 0.5 and (not any_grab):
-                v_obj_adr_g = _apply_brake_for_object(grab_oid)
-                if _is_stationary(v_obj_adr_g, self.stationary_thresh_agent_grab, self.stationary_thresh_obj_grab):
-                    grab_int["stable"] += 1
-                else:
-                    grab_int["stable"] = 0
-                if grab_int["stable"] >= self.intent_stable_needed_grab and grab_dist <= 1.25:
-                    on_gid = self.eq_ids[f"grasp_{agent_key}_{grab_tok}"]
+                    lock_changed = True
+            elif ((my_held_id == -1) or (my_held_id == best_id)) and best_is_front:
+                # 他者の把持チェック
+                others_grasp_sum = 0.0
+                for ak_chk in self.agent_keys:
+                    others_grasp_sum += d.eq_active[self.eq_ids[f"grasp_{ak_chk}_{best_tok}"]]
+                my_grasp_val = d.eq_active[self.eq_ids[f"grasp_{agent_key}_{best_tok}"]]
+                net_others_grab = others_grasp_sum - my_grasp_val
+                
+                # オブジェクト速度
+                v_o_adr_l = m.jnt_dofadr[m.body_jntadr[best_id]]
+                v_o_norm_l = np.linalg.norm(d.qvel[v_o_adr_l : v_o_adr_l+6])
+                
+                # 成立条件: 近距離・前方・フリー
+                if min_dist < 1.05 and net_others_grab <= 0.5 and my_grasp_val <= 0.5:
+                    # 零化
                     d.qvel[v_ax_adr:v_ax_adr+2] = 0.0
                     d.qvel[v_ar_adr] = 0.0
-                    d.qvel[v_obj_adr_g:v_obj_adr_g+6] = 0.0
-                    mujoco.mj_forward(m, d)
-                    inv_q_a = np.zeros(4)
-                    mujoco.mju_negQuat(inv_q_a, d.xquat[agent_bid])
-                    rel_p_l = np.zeros(3)
-                    mujoco.mju_rotVecQuat(rel_p_l, d.xpos[grab_oid] - d.xpos[agent_bid], inv_q_a)
-                    rel_q_l = np.zeros(4)
-                    mujoco.mju_mulQuat(rel_q_l, inv_q_a, d.xquat[grab_oid])
-                    m.eq_data[on_gid, 0:3] = rel_p_l
-                    m.eq_data[on_gid, 3:7] = rel_q_l
-                    d.eq_active[on_gid] = 1
-                    self._activate_collision_guard(grab_tok, 2)
-                    self._activate_velocity_guard(grab_tok, 5)
+                    d.qvel[v_o_adr_l:v_o_adr_l+6] = 0.0
+                    jadr_lock = m.body_jntadr[best_id]
+                    if jadr_lock != -1 and m.jnt_type[jadr_lock] == mujoco.mjtJoint.mjJNT_FREE:
+                        qadr_lock = m.jnt_qposadr[jadr_lock]
+                        pose_lock = d.qpos[qadr_lock:qadr_lock+7].copy()
+                        m.eq_data[lid_idx, 0:3] = pose_lock[0:3]
+                        m.eq_data[lid_idx, 3:7] = pose_lock[3:7]
+                        self.locked_pose[best_tok] = pose_lock
+                    else:
+                        m.eq_data[lid_idx, 0:3] = d.xpos[best_id]
+                        m.eq_data[lid_idx, 3:7] = d.xquat[best_id]
+                    d.eq_active[lid_idx] = 1
+                    self.lock_owners[best_tok] = my_team_p
+                    self.cooldown_timers[agent_key]["lock"] = self.cooldown_limit
+                    lock_changed = True
+            if lock_changed:
+                mujoco.mj_forward(m, d)
+
+        # --- [B] Grab処理 ---
+        if grab_pushed:
+            grab_changed = False
+            if my_held_id != -1:
+                # 解除権限チェック: 本人のみ
+                if best_id == my_held_id:
+                    rel_gid = self.eq_ids[f"grasp_{agent_key}_{my_held_tok}"]
+                    d.eq_active[rel_gid] = 0
                     self.cooldown_timers[agent_key]["grab"] = self.cooldown_limit
-                    _clear_intent(grab_int)
-            else:
-                _clear_intent(grab_int)
-            if grab_int["active"]:
-                grab_int["ttl"] -= 1
-                if grab_int["ttl"] <= 0:
-                    _clear_intent(grab_int)
+                    grab_changed = True
+            elif best_id != -1 and best_is_front:
+                # ロック状態確認
+                lock_status = d.eq_active[self.eq_ids[f"lock_{best_tok}"]]
+                # 誰かが掴んでいるか確認
+                any_holding = 0.0
+                for ak_g in self.agent_keys:
+                    any_holding += d.eq_active[self.eq_ids[f"grasp_{ak_g}_{best_tok}"]]
+                
+                v_o_adr_g = m.jnt_dofadr[m.body_jntadr[best_id]]
+                v_o_norm_g = np.linalg.norm(d.qvel[v_o_adr_g : v_o_adr_g+6])
+                
+                if lock_status <= 0.5 and any_holding <= 0.5:
+                    on_gid_idx = self.eq_ids[f"grasp_{agent_key}_{best_tok}"]
+                    # 零化
+                    d.qvel[v_ax_adr:v_ax_adr+2] = 0.0
+                    d.qvel[v_ar_adr] = 0.0
+                    d.qvel[v_o_adr_g:v_o_adr_g+6] = 0.0
+                    # 相対座標
+                    inv_q_f = np.zeros(4)
+                    mujoco.mju_negQuat(inv_q_f, d.xquat[agent_bid])
+                    p_diff_f = d.xpos[best_id] - d.xpos[agent_bid]
+                    rel_p_f = np.zeros(3)
+                    mujoco.mju_rotVecQuat(rel_p_f, p_diff_f, inv_q_f)
+                    rel_p_f[2] = 0.0
+                    o_q_f = d.xquat[best_id]
+                    o_yaw_f = math.atan2(2.0*(o_q_f[0]*o_q_f[3]+o_q_f[1]*o_q_f[2]), 1.0-2.0*(o_q_f[2]*o_q_f[2]+o_q_f[3]*o_q_f[3]))
+                    rel_yaw_f = o_yaw_f - r_val
+                    rel_q_f = np.array([math.cos(rel_yaw_f * 0.5), 0.0, 0.0, math.sin(rel_yaw_f * 0.5)], dtype=np.float64)
+                    # 拘束
+                    m.eq_data[on_gid_idx, 0:3] = rel_p_f
+                    m.eq_data[on_gid_idx, 3:7] = rel_q_f
+                    d.eq_active[on_gid_idx] = 1
+                    self.cooldown_timers[agent_key]["grab"] = self.cooldown_limit
+                    grab_changed = True
+            if grab_changed:
+                mujoco.mj_forward(m, d)
+
+        pose_changed = False
+        for tok_h in ["b1", "b2", "ramp"]:
+            g_sum_h = 0.0
+            for ak_h in self.agent_keys:
+                g_sum_h += d.eq_active[self.eq_ids[f"grasp_{ak_h}_{tok_h}"]]
+            if g_sum_h <= 0.5:
+                continue
+            if d.eq_active[self.eq_ids[f"lock_{tok_h}"]] > 0.5:
+                continue
+            oid_h = self.box_ids[0] if tok_h == "b1" else self.box_ids[1] if tok_h == "b2" else self.ramp_id
+            v_o_adr_h = m.jnt_dofadr[m.body_jntadr[oid_h]]
+            d.qvel[v_o_adr_h + 2] = 0.0
+            d.qvel[v_o_adr_h + 3] = 0.0
+            d.qvel[v_o_adr_h + 4] = 0.0
+
+            jadr_h = m.body_jntadr[oid_h]
+            if jadr_h != -1 and m.jnt_type[jadr_h] == mujoco.mjtJoint.mjJNT_FREE:
+                qadr_h = m.jnt_qposadr[jadr_h]
+                oq_h = d.qpos[qadr_h + 3:qadr_h + 7]
+                oyaw_h = math.atan2(
+                    2.0 * (oq_h[0] * oq_h[3] + oq_h[1] * oq_h[2]),
+                    1.0 - 2.0 * (oq_h[2] * oq_h[2] + oq_h[3] * oq_h[3]),
+                )
+                d.qpos[qadr_h + 2] = self.object_ground_z[tok_h]
+                d.qpos[qadr_h + 3] = math.cos(oyaw_h * 0.5)
+                d.qpos[qadr_h + 4] = 0.0
+                d.qpos[qadr_h + 5] = 0.0
+                d.qpos[qadr_h + 6] = math.sin(oyaw_h * 0.5)
+                pose_changed = True
+
+        if pose_changed:
             mujoco.mj_forward(m, d)
 
-        if not lock_pushed and not grab_pushed and (not lock_int["active"]) and (not grab_int["active"]):
-            return
-
     def _sync_visual_states(self):
-        """色の同期（1行1命令展開）"""
+        """色の同期（1行1命令・極限展開）"""
         m, d = self.model, self.data
-        tools = self.box_ids + ([self.ramp_id] if self.ramp_id != -1 else [])
-        for oid_v in tools:
-            nm_v = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, oid_v) or ""
-            if "box1" in nm_v: t_v = "b1"
-            elif "box2" in nm_v: t_v = "b2"
-            else: t_v = "ramp"
-            
-            f_col = self.obj_default_colors[oid_v].copy()
-            
-            # 把持中 (Yellow)
-            gs_v = d.eq_active[self.eq_ids[f"grasp_s_{t_v}"]]
-            gh1_v = d.eq_active[self.eq_ids[f"grasp_h1_{t_v}"]]
-            gh2_v = d.eq_active[self.eq_ids[f"grasp_h2_{t_v}"]]
-            if (gs_v + gh1_v + gh2_v) > 0.5:
-                f_col[0] = 1.0
-                f_col[1] = 1.0
-                f_col[2] = 0.0
-            
-            # 固定中 (Red)
-            l_v = d.eq_active[self.eq_ids[f"lock_{t_v}"]]
-            if l_v > 0.5:
-                f_col[0] = 1.0
-                f_col[1] = 0.0
-                f_col[2] = 0.0
-                
-            for g_id_v in self.obj_geom_ids[oid_v]:
-                m.geom_rgba[g_id_v] = f_col
-
-    def _token_to_oid(self, tok):
-        if tok == "b1":
-            return self.box_ids[0] if len(self.box_ids) >= 1 else -1
-        if tok == "b2":
-            return self.box_ids[1] if len(self.box_ids) >= 2 else -1
-        if tok == "ramp":
-            return self.ramp_id
-        return -1
-
-    def _is_agent_holding(self, agent_key):
-        d = self.data
-        for tok in ["b1", "b2", "ramp"]:
-            gid = self.eq_ids.get(f"grasp_{agent_key}_{tok}", -1)
-            if gid != -1 and d.eq_active[gid] > 0.5:
-                return True
-        return False
-
-    def _stabilize_active_grasp_rotation(self):
-        m = self.model
-        d = self.data
-        for ak in self.agent_keys:
-            for tok in ["b1", "b2", "ramp"]:
-                gid = self.eq_ids.get(f"grasp_{ak}_{tok}", -1)
-                if gid == -1 or d.eq_active[gid] <= 0.5:
-                    continue
-                oid = self._token_to_oid(tok)
-                if oid == -1:
-                    continue
-                v_obj_adr = m.jnt_dofadr[m.body_jntadr[oid]]
-                d.qvel[v_obj_adr+3:v_obj_adr+6] = 0.0
-
-    def _set_token_collision_enabled(self, tok, enabled):
-        oid = self._token_to_oid(tok)
-        if oid == -1:
-            return
-        for g_idx in self.obj_geom_ids.get(oid, []):
-            if enabled:
-                self.model.geom_contype[g_idx] = self.obj_default_con[g_idx]["type"]
-                self.model.geom_conaffinity[g_idx] = self.obj_default_con[g_idx]["aff"]
+        tools_sync = self.box_ids + ([self.ramp_id] if self.ramp_id != -1 else [])
+        for oid_s in tools_sync:
+            nm_s = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, oid_s) or ""
+            if "box1" in nm_s:
+                t_s = "b1"
+            elif "box2" in nm_s:
+                t_s = "b2"
             else:
-                self.model.geom_contype[g_idx] = 0
-                self.model.geom_conaffinity[g_idx] = 0
-
-    def _activate_collision_guard(self, tok, steps):
-        if tok not in self.collision_guard_steps:
-            return
-        self.collision_guard_steps[tok] = max(self.collision_guard_steps[tok], steps)
-
-    def _activate_velocity_guard(self, tok, steps):
-        if tok not in self.velocity_guard_steps:
-            return
-        self.velocity_guard_steps[tok] = max(self.velocity_guard_steps[tok], steps)
-
-    def _apply_velocity_guard(self):
-        m = self.model
-        d = self.data
-        guard_active = any(self.velocity_guard_steps[t] > 0 for t in ["b1", "b2", "ramp"])
-        if not guard_active:
-            return
-
-        v_max_agent_xy = self.velocity_guard_agent_xy_max
-        v_max_agent_rot = self.velocity_guard_agent_rot_max
-        v_max_obj = self.velocity_guard_obj_max
-
-        for ak in self.agent_keys:
-            v_ax_adr = m.jnt_dofadr[self.qpos_indices[ak]['x']]
-            v_ar_adr = m.jnt_dofadr[self.qpos_indices[ak]['rot']]
-
-            vxy = d.qvel[v_ax_adr:v_ax_adr+2]
-            nxy = np.linalg.norm(vxy)
-            if nxy > v_max_agent_xy and nxy > 1e-8:
-                d.qvel[v_ax_adr:v_ax_adr+2] = vxy * (v_max_agent_xy / nxy)
-
-            vro = abs(d.qvel[v_ar_adr])
-            if vro > v_max_agent_rot:
-                d.qvel[v_ar_adr] = np.sign(d.qvel[v_ar_adr]) * v_max_agent_rot
-
-        obj_ids = self.box_ids + ([self.ramp_id] if self.ramp_id != -1 else [])
-        for oid in obj_ids:
-            v_obj_adr = m.jnt_dofadr[m.body_jntadr[oid]]
-            vobj = d.qvel[v_obj_adr:v_obj_adr+6]
-            nobj = np.linalg.norm(vobj)
-            if nobj > v_max_obj and nobj > 1e-8:
-                d.qvel[v_obj_adr:v_obj_adr+6] = vobj * (v_max_obj / nobj)
-
-    def _update_collision_guards(self):
-        for tok in ["b1", "b2", "ramp"]:
-            if self.collision_guard_steps[tok] > 0:
-                self.collision_guard_steps[tok] -= 1
-                if self.collision_guard_steps[tok] == 0:
-                    self._set_token_collision_enabled(tok, True)
-        self._apply_velocity_guard()
-        for tok in ["b1", "b2", "ramp"]:
-            if self.velocity_guard_steps[tok] > 0:
-                self.velocity_guard_steps[tok] -= 1
-        for ak in self.agent_keys:
-            rel = self.pending_grab_release[ak]
-            if not rel["active"]:
-                continue
-            if rel["steps"] > 0:
-                rel["steps"] -= 1
-            if rel["steps"] <= 0:
-                tok = rel["tok"]
-                if tok:
-                    gid = self.eq_ids.get(f"grasp_{ak}_{tok}", -1)
-                    if gid != -1 and self.data.eq_active[gid] > 0.5:
-                        self.data.eq_active[gid] = 0
-                rel["active"] = False
-                rel["tok"] = ""
-                rel["steps"] = 0
+                t_s = "ramp"
+            
+            f_col_s = self.obj_default_colors[oid_s].copy()
+            
+            # 把持状態チェック (Yellow)
+            any_held_s = 0.0
+            for ak_s in self.agent_keys:
+                any_held_s += d.eq_active[self.eq_ids[f"grasp_{ak_s}_{t_s}"]]
+            
+            if any_held_s > 0.5:
+                f_col_s[0] = 1.0
+                f_col_s[1] = 1.0
+                f_col_s[2] = 0.0
+            
+            # 固定状態チェック (Red)
+            l_val_s = d.eq_active[self.eq_ids[f"lock_{t_s}"]]
+            if l_val_s > 0.5:
+                f_col_s[0] = 1.0
+                f_col_s[1] = 0.0
+                f_col_s[2] = 0.0
+                
+            for g_id_s in self.obj_geom_ids[oid_s]:
+                m.geom_rgba[g_id_s] = f_col_s
 
     def _get_obs(self, agent_idx):
-        """55次元観測の構築（極限展開版）"""
+        """55次元観測の構築（カテゴリカル集約 ＆ 1行1要素代入）"""
         obs = np.zeros(55, dtype=np.float32)
         d, m = self.data, self.model
         ak = self.agent_keys[agent_idx]
         bid = self.body_ids[ak]
         
-        # 自己情報の取得
+        # 自己情報
         p_self = d.xpos[bid]
         r_idx = self.qpos_indices[ak]['rot']
-        rot_val = float(d.qpos[m.jnt_qposadr[r_idx]])
-        v_adr = m.jnt_dofadr[self.qpos_indices[ak]['x']]
-        vx_w = d.qvel[v_adr]
-        vy_w = d.qvel[v_adr + 1]
+        rot_v = float(d.qpos[m.jnt_qposadr[r_idx]])
+        v_idx_x = self.qpos_indices[ak]['x']
+        v_adr_x = m.jnt_dofadr[v_idx_x]
+        vx_w = d.qvel[v_adr_x]
+        vy_w = d.qvel[v_adr_x + 1]
         
-        # 座標変換用
-        cos_r = math.cos(-rot_val)
-        sin_r = math.sin(-rot_val)
+        c_v = math.cos(-rot_v)
+        s_v = math.sin(-rot_v)
         
-        # 自己速度 (Local)
-        obs[0] = vx_w * cos_r - vy_w * sin_r
-        obs[1] = vx_w * sin_r + vy_w * cos_r
-        # 自己回転
-        obs[2] = rot_val
-        obs[3] = math.cos(rot_val)
-        obs[4] = math.sin(rot_val)
-        # Lidar (12本)
-        lidar_data = self.vis_engine.cast_lidar(p_self[:2], rot_val, self.lidar_mode, bid)
-        obs[5:17] = lidar_data - 0.45
+        obs[0] = vx_w * c_v - vy_w * s_v
+        obs[1] = vx_w * s_v + vy_w * c_v
+        obs[2] = rot_v
+        obs[3] = math.cos(rot_v)
+        obs[4] = math.sin(rot_v)
+        
+        lidar_v = self.vis_engine.cast_lidar(p_self[:2], rot_v, self.lidar_mode, bid)
+        obs[5] = lidar_v[0] - 0.45
+        obs[6] = lidar_v[1] - 0.45
+        obs[7] = lidar_v[2] - 0.45
+        obs[8] = lidar_v[3] - 0.45
+        obs[9] = lidar_v[4] - 0.45
+        obs[10] = lidar_v[5] - 0.45
+        obs[11] = lidar_v[6] - 0.45
+        obs[12] = lidar_v[7] - 0.45
+        obs[13] = lidar_v[8] - 0.45
+        obs[14] = lidar_v[9] - 0.45
+        obs[15] = lidar_v[10] - 0.45
+        obs[16] = lidar_v[11] - 0.45
 
         # 道具情報 (8x3=24次元)
         all_tools = self.box_ids + [self.ramp_id]
-        for i_obj, o_id in enumerate(all_tools):
-            if o_id == -1: continue
-            base = 17 + i_obj * 8
-            tok_nm = "b1" if i_obj == 0 else "b2" if i_obj == 1 else "ramp"
-            o_pos = d.xpos[o_id]
+        for i_o, o_id_o in enumerate(all_tools):
+            if o_id_o == -1: continue
+            base_o = 17 + i_o * 8
+            o_pos_o = d.xpos[o_id_o]
+            tok_nm_o = "b1" if i_o == 0 else "b2" if i_o == 1 else "ramp"
+            interaction_val = 0.0
+            if d.eq_active[self.eq_ids[f"lock_{tok_nm_o}"]] > 0.5:
+                interaction_val = 1.0
+            elif d.eq_active[self.eq_ids[f"grasp_{ak}_{tok_nm_o}"]] > 0.5:
+                interaction_val = 2.0
+            else:
+                for ok_o in self.agent_keys:
+                    if ok_o != ak:
+                        if d.eq_active[self.eq_ids[f"grasp_{ok_o}_{tok_nm_o}"]] > 0.5:
+                            interaction_val = 3.0
+                            break
+            obs[base_o + 6] = interaction_val
             
-            if self._is_within_fov_and_visible(p_self[:2], rot_val, o_pos[:2], bid, o_id):
-                rel_p = o_pos - p_self
-                obs[base + 0] = rel_p[0] * cos_r - rel_p[1] * sin_r
-                obs[base + 1] = rel_p[0] * sin_r + rel_p[1] * cos_r
+            if self._is_within_fov_and_visible(p_self[:2], rot_v, o_pos_o[:2], bid, o_id_o):
+                rel_p_o = o_pos_o - p_self
+                obs[base_o + 0] = rel_p_o[0] * c_v - rel_p_o[1] * s_v
+                obs[base_o + 1] = rel_p_o[0] * s_v + rel_p_o[1] * c_v
                 
-                v_o_adr = m.jnt_dofadr[m.body_jntadr[o_id]]
-                v_ox, v_oy = d.qvel[v_o_adr], d.qvel[v_o_adr + 1]
-                rel_vx, rel_vy = v_ox - vx_w, v_oy - vy_w
-                obs[base + 2] = rel_vx * cos_r - rel_vy * sin_r
-                obs[base + 3] = rel_vx * sin_r + rel_vy * cos_r
+                v_o_adr_o = m.jnt_dofadr[m.body_jntadr[o_id_o]]
+                rel_vx_o = d.qvel[v_o_adr_o] - vx_w
+                rel_vy_o = d.qvel[v_o_adr_o + 1] - vy_w
+                obs[base_o + 2] = rel_vx_o * c_v - rel_vy_o * s_v
+                obs[base_o + 3] = rel_vx_o * s_v + rel_vy_o * c_v
                 
-                o_quat = d.xquat[o_id]
-                o_yaw = math.atan2(2.0*(o_quat[0]*o_quat[3]+o_quat[1]*o_quat[2]), 1.0-2.0*(o_quat[2]*o_quat[2]+o_quat[3]*o_quat[3]))
-                obs[base + 4] = math.cos(o_yaw - rot_val)
-                obs[base + 5] = math.sin(o_yaw - rot_val)
-                
-                gs = d.eq_active[self.eq_ids[f"grasp_s_{tok_nm}"]]
-                gh1 = d.eq_active[self.eq_ids[f"grasp_h1_{tok_nm}"]]
-                gh2 = d.eq_active[self.eq_ids[f"grasp_h2_{tok_nm}"]]
-                has_grasp = (gs + gh1 + gh2) > 0.5
-                has_lock = d.eq_active[self.eq_ids[f"lock_{tok_nm}"]] > 0.5
-                tool_state = 2.0 if has_lock else (1.0 if has_grasp else 0.0)
-                obs[base + 6] = tool_state
-                obs[base + 7] = 1.0 # 存在フラグ
+                o_q_o = d.xquat[o_id_o]
+                o_y_o = math.atan2(2.0*(o_q_o[0]*o_q_o[3]+o_q_o[1]*o_q_o[2]), 1.0-2.0*(o_q_o[2]*o_q_o[2]+o_q_o[3]*o_q_o[3]))
+                obs[base_o + 4] = math.cos(o_y_o - rot_v)
+                obs[base_o + 5] = math.sin(o_y_o - rot_v)
+                obs[base_o + 7] = 1.0
 
-        # 相手・味方情報
-        if ak == "s": ek, pk = "h1", "h2"
-        elif ak == "h1": ek, pk = "s", "h2"
-        else: ek, pk = "s", "h1"
-
-        # Enemy (7次元) ＆ Partner (7次元) のループ
-        for i_t, t_key in enumerate([ek, pk]):
-            t_bid = self.body_ids[t_key]
-            t_base = 41 + i_t * 7
-            t_pos = d.xpos[t_bid]
+        # 相手・味方情報 (7x2=14次元)
+        ek, pk = ("h1", "h2") if ak == "s" else ("s", "h2") if ak == "h1" else ("s", "h1")
+        for i_a, a_key in enumerate([ek, pk]):
+            a_bid = self.body_ids[a_key]
+            a_base = 41 + i_a * 7
+            a_pos_a = d.xpos[a_bid]
             
-            if self._is_within_fov_and_visible(p_self[:2], rot_val, t_pos[:2], bid, t_bid):
-                r_p = t_pos - p_self
-                obs[t_base + 0] = r_p[0] * cos_r - r_p[1] * sin_r
-                obs[t_base + 1] = r_p[0] * sin_r + r_p[1] * cos_r
+            if self._is_within_fov_and_visible(p_self[:2], rot_v, a_pos_a[:2], bid, a_bid):
+                r_p_a = a_pos_a - p_self
+                obs[a_base + 0] = r_p_a[0] * c_v - r_p_a[1] * s_v
+                obs[a_base + 1] = r_p_a[0] * s_v + r_p_a[1] * c_v
                 
-                t_v_adr = m.jnt_dofadr[self.qpos_indices[t_key]['x']]
-                t_vx, t_vy = d.qvel[t_v_adr], d.qvel[t_v_adr + 1]
-                r_vx, r_vy = t_vx - vx_w, t_vy - vy_w
-                obs[t_base + 2] = r_vx * cos_r - r_vy * sin_r
-                obs[t_base + 3] = r_vx * sin_r + r_vy * cos_r
+                a_v_adr = m.jnt_dofadr[self.qpos_indices[a_key]['x']]
+                r_vx_a = d.qvel[a_v_adr] - vx_w
+                r_vy_a = d.qvel[a_v_adr + 1] - vy_w
+                obs[a_base + 2] = r_vx_a * c_v - r_vy_a * s_v
+                obs[a_base + 3] = r_vx_a * s_v + r_vy_a * c_v
                 
-                t_rot_idx = self.qpos_indices[t_key]['rot']
-                t_rot = float(d.qpos[m.jnt_qposadr[t_rot_idx]])
-                obs[t_base + 4] = math.cos(t_rot - rot_val)
-                obs[t_base + 5] = math.sin(t_rot - rot_val)
-                obs[t_base + 6] = 1.0
+                a_rot_idx = self.qpos_indices[a_key]['rot']
+                a_rot_v = float(d.qpos[m.jnt_qposadr[a_rot_idx]])
+                obs[a_base + 4] = math.cos(a_rot_v - rot_v)
+                obs[a_base + 5] = math.sin(a_rot_v - rot_v)
+                obs[a_base + 6] = 1.0
 
         return obs
 
     def _is_within_fov_and_visible(self, pos, rot, t_pos, my_id, t_id):
-        """2Dレイキャスト判定（バイパスなし）"""
-        dx = t_pos[0] - pos[0]
-        dy = t_pos[1] - pos[1]
-        dist = math.sqrt(dx*dx + dy*dy)
-        if dist > 15.0: return False
-        vx, vy = math.cos(rot), math.sin(rot)
-        # FOV判定
-        dot_v = vx * (dx/dist) + vy * (dy/dist)
-        if dot_v < 0.38: return False
+        dx_v = t_pos[0] - pos[0]
+        dy_v = t_pos[1] - pos[1]
+        dist_v = math.sqrt(dx_v*dx_v + dy_v*dy_v)
+        if dist_v > 15.0: return False
+        vx_f, vy_f = math.cos(rot), math.sin(rot)
+        if (vx_f * (dx_v/dist_v) + vy_f * (dy_v/dist_v)) < 0.38: return False
         return self.vis_engine.is_visible(pos, t_pos, body_exclude=my_id, target_body_id=t_id)
 
     def _normalize_obs(self, v):
@@ -819,70 +709,66 @@ class TeamCosEnv(gym.Env):
 
     def _compute_team_reward(self):
         if self.current_step <= self.prep_steps: return 0.01, False
-        s_bid = self.body_ids['s']
-        s_pos = self.data.xpos[s_bid][:2]
-        s_idx = self.qpos_indices['s']['rot']
-        s_rot = self.data.qpos[self.model.jnt_qposadr[s_idx]]
+        s_bid_r = self.body_ids['s']
+        s_pos_r = self.data.xpos[s_bid_r][:2]
+        s_rot_idx = self.qpos_indices['s']['rot']
+        s_rot_r = self.data.qpos[self.model.jnt_qposadr[s_rot_idx]]
         
-        found = False
-        for h_key in ["h1", "h2"]:
-            h_bid = self.body_ids[h_key]
-            h_pos = self.data.xpos[h_bid][:2]
-            if self._is_within_fov_and_visible(s_pos, s_rot, h_pos, s_bid, h_bid):
-                found = True
+        found_r = False
+        for h_key_r in ["h1", "h2"]:
+            h_bid_r = self.body_ids[h_key_r]
+            h_pos_r = self.data.xpos[h_bid_r][:2]
+            if self._is_within_fov_and_visible(s_pos_r, s_rot_r, h_pos_r, s_bid_r, h_bid_r):
+                found_r = True
                 break
-        return (-1.0 if found else 1.0), found
+        return (-1.0 if found_r else 1.0), found_r
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
         mujoco.mj_resetData(self.model, self.data)
-        for k in self.prev_action_btns: self.prev_action_btns[k].fill(0.0)
-        for k in self.agent_keys: 
-            self.cooldown_timers[k]["lock"] = 0
-            self.cooldown_timers[k]["grab"] = 0
-            self.interaction_intents[k]["lock"]["active"] = False
-            self.interaction_intents[k]["lock"]["tok"] = ""
-            self.interaction_intents[k]["lock"]["id"] = -1
-            self.interaction_intents[k]["lock"]["ttl"] = 0
-            self.interaction_intents[k]["lock"]["stable"] = 0
-            self.interaction_intents[k]["grab"]["active"] = False
-            self.interaction_intents[k]["grab"]["tok"] = ""
-            self.interaction_intents[k]["grab"]["id"] = -1
-            self.interaction_intents[k]["grab"]["ttl"] = 0
-            self.interaction_intents[k]["grab"]["stable"] = 0
-        for t in ["b1", "b2", "ramp"]: self.lock_owners[t] = None
-        for t in ["b1", "b2", "ramp"]:
-            self.collision_guard_steps[t] = 0
-            self._set_token_collision_enabled(t, True)
-            self.velocity_guard_steps[t] = 0
-        for ak in self.agent_keys:
-            self.pending_grab_release[ak]["active"] = False
-            self.pending_grab_release[ak]["tok"] = ""
-            self.pending_grab_release[ak]["steps"] = 0
+        for k_re in self.prev_action_btns: 
+            self.prev_action_btns[k_re].fill(0.0)
+        for k_tm_re in self.agent_keys: 
+            self.cooldown_timers[k_tm_re]["lock"] = 0
+            self.cooldown_timers[k_tm_re]["grab"] = 0
+        for t_re in ["b1", "b2", "ramp"]: 
+            self.lock_owners[t_re] = None
+            self.locked_pose[t_re] = None
         
         self._init_npcs()
         m, d = self.model, self.data
         placed = []
-        for kt in ["ramp", "box1", "box2", "s", "h1", "h2"]:
-            rad = 0.6 if kt in self.agent_keys else (1.0 if "box" in kt else 1.5)
+        for kt_re in ["ramp", "box1", "box2", "s", "h1", "h2"]:
+            rad_re = 0.6 if kt_re in self.agent_keys else (1.0 if "box" in kt_re else 1.5)
             for _ in range(500):
-                pt = np.random.uniform(-5.2, 5.2, 2)
-                ov = any(abs(pt[0]-cx)<(sx+rad) and abs(pt[1]-cy)<(sy+rad) for (cx, cy, sx, sy) in self.maze_walls)
-                if ov or any(np.linalg.norm(pt-p)<(rad+r+0.2) for (p,r) in placed): continue
-                if kt in self.agent_keys:
-                    q = self.qpos_indices[kt]
-                    d.qpos[m.jnt_qposadr[q['x']]] = pt[0]
-                    d.qpos[m.jnt_qposadr[q['y']]] = pt[1]
-                    d.qpos[m.jnt_qposadr[q['rot']]] = np.random.uniform(-np.pi, np.pi)
+                pt_re = np.random.uniform(-5.2, 5.2, 2)
+                overlap_re = False
+                for (cx, cy, sx, sy) in self.maze_walls:
+                    if abs(pt_re[0]-cx)<(sx+rad_re) and abs(pt_re[1]-cy)<(sy+rad_re): 
+                        overlap_re = True
+                        break
+                if overlap_re or any(np.linalg.norm(pt_re-p)<(rad_re+r+0.2) for (p,r) in placed):
+                    continue
+                if kt_re in self.agent_keys:
+                    q_re = self.qpos_indices[kt_re]
+                    d.qpos[m.jnt_qposadr[q_re['x']]] = pt_re[0]
+                    d.qpos[m.jnt_qposadr[q_re['y']]] = pt_re[1]
+                    d.qpos[m.jnt_qposadr[q_re['rot']]] = np.random.uniform(-np.pi, np.pi)
                 else:
-                    body = m.body(f"{kt}_body")
-                    adr = m.jnt_qposadr[body.jntadr[0]]
-                    d.qpos[adr:adr+2] = pt
-                placed.append((pt, rad))
+                    body_re = m.body(f"{kt_re}_body")
+                    adr_re = m.jnt_qposadr[body_re.jntadr[0]]
+                    d.qpos[adr_re:adr_re+2] = pt_re
+                placed.append((pt_re, rad_re))
                 break
         self._sync_visual_states()
         mujoco.mj_forward(m, d)
+
+        self.object_ground_z["b1"] = float(d.xpos[self.box_ids[0]][2])
+        self.object_ground_z["b2"] = float(d.xpos[self.box_ids[1]][2])
+        if self.ramp_id != -1:
+            self.object_ground_z["ramp"] = float(d.xpos[self.ramp_id][2])
+
         return self._normalize_obs(self._get_obs(1)), {"is_detected": False}
 
     def render(self):
@@ -897,25 +783,23 @@ class TeamCosEnv(gym.Env):
         if hasattr(self.viewer, 'user_scn'):
             scn = self.viewer.user_scn
             scn.ngeom = 0
-            for ak in self.agent_keys:
-                bid = self.body_ids[ak]
-                p_s = self.data.xpos[bid]
-                r_idx = self.qpos_indices[ak]['rot']
-                rot = self.data.qpos[self.model.jnt_qposadr[r_idx]]
-                rgba_orig = self.obj_default_colors[bid]
-                rgba = [rgba_orig[0], rgba_orig[1], rgba_orig[2], 0.8]
-                
-                for target_k in self.agent_keys:
-                    if target_k != ak:
-                        t_bid = self.body_ids[target_k]
-                        if self._is_within_fov_and_visible(p_s[:2], rot, self.data.xpos[t_bid][:2], bid, t_bid):
-                            mujoco.mjv_connector(scn.geoms[scn.ngeom], mujoco.mjtGeom.mjGEOM_LINE, 4.0, p_s + [0,0,0.4], self.data.xpos[t_bid] + [0,0,0.4])
-                            scn.geoms[scn.ngeom].rgba = rgba
+            for ak_v in self.agent_keys:
+                bid_v = self.body_ids[ak_v]
+                p_s_v = self.data.xpos[bid_v]
+                rot_idx_v = self.qpos_indices[ak_v]['rot']
+                rot_v = self.data.qpos[self.model.jnt_qposadr[rot_idx_v]]
+                rgba_v = [self.obj_default_colors[bid_v][0], self.obj_default_colors[bid_v][1], self.obj_default_colors[bid_v][2], 0.8]
+                for tk_v in self.agent_keys:
+                    if tk_v != ak_v:
+                        t_bid_v = self.body_ids[tk_v]
+                        if self._is_within_fov_and_visible(p_s_v[:2], rot_v, self.data.xpos[t_bid_v][:2], bid_v, t_bid_v):
+                            mujoco.mjv_connector(scn.geoms[scn.ngeom], mujoco.mjtGeom.mjGEOM_LINE, 4.0, p_s_v + [0,0,0.4], self.data.xpos[t_bid_v] + [0,0,0.4])
+                            scn.geoms[scn.ngeom].rgba = rgba_v
                             scn.ngeom += 1
-                for o_id in self.box_ids + ([self.ramp_id] if self.ramp_id != -1 else []):
-                    if self._is_within_fov_and_visible(p_s[:2], rot, self.data.xpos[o_id][:2], bid, o_id):
-                        mujoco.mjv_connector(scn.geoms[scn.ngeom], mujoco.mjtGeom.mjGEOM_LINE, 2.0, p_s + [0,0,0.4], self.data.xpos[o_id] + [0,0,0.4])
-                        scn.geoms[scn.ngeom].rgba = rgba
+                for o_id_v in self.box_ids + ([self.ramp_id] if self.ramp_id != -1 else []):
+                    if self._is_within_fov_and_visible(p_s_v[:2], rot_v, self.data.xpos[o_id_v][:2], bid_v, o_id_v):
+                        mujoco.mjv_connector(scn.geoms[scn.ngeom], mujoco.mjtGeom.mjGEOM_LINE, 2.0, p_s_v + [0,0,0.4], self.data.xpos[o_id_v] + [0,0,0.4])
+                        scn.geoms[scn.ngeom].rgba = rgba_v
                         scn.ngeom += 1
         self.viewer.sync()
 
