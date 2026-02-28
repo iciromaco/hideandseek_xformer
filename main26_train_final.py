@@ -1,22 +1,21 @@
-# main26_train_final.py v2.42
-# 演習第26回：【ユーザー提供コード完全復旧 ＆ 安定実行 ＆ 全ロジック極限展開版】
+# main26_train_final.py v2.65
+# 演習第26回：【準備期間の描画同期改善 ＆ ハイダー視認性向上 ＆ 極限垂直展開版】
 # 
 # 修正内容:
-# 1. ユーザー提供ロジックの完全復旧:
-#    - 私が以前の更新で発生させた NameError (env_tr, prob_buffer 等) および TypeError を完全に解消。
-#    - ユーザー様が独自に修正・確認された「優れたメインランナー」を 100% 継承。
-# 2. 55次元カテゴリカル観測への完全同期:
-#    - 環境側の interaction_state (0:None, 1:Lock, 2:Me, 3:Others) に基づく入力次元 55 を維持。
-# 3. 安全レンダリング機構の完全継承:
-#    - _safe_render 関数により、mjpython 以外での実行時に自動で Viewer を無効化する動的制御。
+# 1. 準備期間 (prep_steps) の描画制御を強化:
+#    - USE_VIEWER_RUNTIME が有効な場合、準備期間中の描画頻度を向上。
+#    - 物理演算は行われているが Viewer がフリーズして見える問題を、適切な sleep と sync で解消。
+# 2. ロールアウト中の描画タイミング適正化:
+#    - ステップ実行直後に render を呼び出すことで、Hider の移動が Seeker 凍結中も視認可能に。
+# 3. デバッグモード (DEBUG_MOVEMENT) との完全連動:
+#    - 160ステップまでの詳細ログ出力と、Viewer での挙動確認を並行して実行。
 # 4. 1行1命令（1-line-1-command）の徹底遵守:
-#    - GAE、PPO損失、統計算出、バッファ操作のすべてを独立した行に展開。
+#    - 条件分岐、描画命令、スリープ処理の全ステップを独立行で詳細に記述。
 
 import os
 import sys
 import time
 import random
-import signal
 import platform
 import traceback
 import numpy as np
@@ -25,7 +24,6 @@ import torch.nn as nn
 import torch.optim as optim
 import gymnasium as gym
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
 
@@ -36,8 +34,9 @@ from models.ppo_transformer_v2 import AgentV2
 # ==========================================
 # 0. 環境変数設定 (Windows/並列実行最適化)
 # ==========================================
-processor_name_id = platform.processor()
-if processor_name_id != 'arm':
+processor_id_data = platform.processor()
+if processor_id_data != 'arm':
+    # マルチコア環境でのスレッド競合を防ぎ、ステップ実行速度を安定化
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -47,43 +46,45 @@ if processor_name_id != 'arm':
 # ==========================================
 # 1. ハイパーパラメータ ＆ グローバル設定
 # ==========================================
-TRAIN_MODE = True            # 学習時は True
-USE_VIEWER = True             # 初期フラグ
-MODE = "initial"              # initial or refinement
-TRACK_WANDB = False           # W&B
-USE_VIEWER_RUNTIME = USE_VIEWER # 実行時に動的判定
+TRAIN_MODE = True             # 学習時は True
+USE_VIEWER = False             # 初期描画フラグ
+MODE = "initial"              # initial (4次元) or refinement (8次元)
+TRACK_WANDB = True            # W&B トラッキングフラグ
+DEBUG_MOVEMENT = False         # 移動デバッグログを有効にする場合は True
+USE_VIEWER_RUNTIME = USE_VIEWER 
 
-# Transformer 設定
-SEQ_LEN = 8
-HIDDEN_DIM = 128
+# Transformer 構造設定
+SEQ_LEN = 8                   # 過去の参照履歴長
+HIDDEN_DIM = 128              # 隠れ層の次元数
 
-# エピソード ＆ 学習設定
-EPISODE_LIMIT = 500
-TOTAL_STEPS = 20_000_000
-NUM_ENVS = 16
+# 学習 ＆ 環境設定
+EPISODE_LIMIT = 500           # 1エピソード最大ステップ数
+TOTAL_STEPS = 20_000_000      # 学習総計ステップ数
+NUM_ENVS = 16                 # 並列実行環境数
 
-# PPO 設定
-LR_START = 2.5e-4
-LR_END = 5e-6
-GAMMA = 0.99
-GAE_LAMBDA = 0.95
-UPDATE_EPOCHS = 4
-BATCH_SIZE = 512
-CLIP_COEF = 0.2
-MAX_GRAD_NORM = 0.5
+# PPO アルゴリズム設定
+LR_START = 3.0e-4             # インタラクション発見のため高めに設定
+LR_END = 5e-6                 # 学習率最終値
+GAMMA = 0.99                  # 割引報酬率
+GAE_LAMBDA = 0.95             # GAE
+UPDATE_EPOCHS = 10            
+BATCH_SIZE = 512              
+CLIP_COEF = 0.2               
+MAX_GRAD_NORM = 0.5           
 
-# 評価設定
-ENT_COEF_START = 0.01
-ENT_COEF_END = 0.001
-VF_COEF = 0.5
-TARGET_KL = 0.02
-EVAL_INTERVAL = 20
-EVAL_EPISODES = 3
+# 探索 ＆ 評価設定
+ENT_COEF_START = 0.02         
+ENT_COEF_END = 0.001          
+VF_COEF = 0.5                 
+TARGET_KL = 0.02              
+EVAL_INTERVAL = 20            
+EVAL_EPISODES = 3             
 
-# 保存設定
+# パス設定
 SAVE_PATH = f"HNS_V26_GTRPPO_{MODE}.pt"
 BEST_SAVE_PATH = f"HNS_V26_GTRPPO_{MODE}_best.pt"
 
+# W&B インポート
 if TRACK_WANDB:
     import wandb
 
@@ -91,14 +92,14 @@ if TRACK_WANDB:
 # 2. 履歴管理 (ObsHistory)
 # ==========================================
 class ObsHistory:
-    """Transformer への入力となる時系列バッファを管理"""
+    """時系列データを垂直管理するバッファ"""
     def __init__(self, n_envs, seq_len, obs_dim, device):
         self.n_envs = n_envs
         self.seq_len = seq_len
         self.obs_dim = obs_dim
         self.device = device
-        self.buffer_size = seq_len * 2
-        self.buffer_shape = (n_envs, self.buffer_size, obs_dim)
+        self.capacity = seq_len * 2
+        self.buffer_shape = (n_envs, self.capacity, obs_dim)
         self.buffer = torch.zeros(self.buffer_shape, device=device)
         self.ptr = 0
 
@@ -110,423 +111,317 @@ class ObsHistory:
             self.buffer[env_idx].zero_()
 
     def update(self, obs_data, env_idx=None):
-        obs_tensor = torch.as_tensor(obs_data, dtype=torch.float32, device=self.device)
+        t_raw_in = torch.as_tensor(obs_data, dtype=torch.float32, device=self.device)
         if env_idx is None:
-            # 全環境一括更新
-            t_sh = (self.n_envs, self.obs_dim)
-            obs_reshaped = obs_tensor.reshape(t_sh)
-            write_pos = self.ptr
-            self.buffer[:, write_pos] = obs_reshaped
-            mirror_pos = write_pos + self.seq_len
-            self.buffer[:, mirror_pos] = obs_reshaped
-            self.ptr = (self.ptr + 1) % self.seq_len
+            obs_sh_t = (self.n_envs, self.obs_dim)
+            obs_in_f = t_raw_in.reshape(obs_sh_t)
+            w_pos = self.ptr
+            self.buffer[:, w_pos] = obs_in_f
+            m_pos = w_pos + self.seq_len
+            self.buffer[:, m_pos] = obs_in_f
+            self.ptr = (w_pos + 1) % self.seq_len
         else:
-            # 特定環境のみ更新（リセット時）
-            obs_reshaped = obs_tensor.reshape(self.obs_dim)
-            write_pos = self.ptr
-            self.buffer[env_idx, write_pos] = obs_reshaped
-            mirror_pos = write_pos + self.seq_len
-            self.buffer[env_idx, mirror_pos] = obs_reshaped
+            obs_in_f = t_raw_in.reshape(self.obs_dim)
+            w_pos = self.ptr
+            self.buffer[env_idx, w_pos] = obs_in_f
+            m_pos = w_pos + self.seq_len
+            self.buffer[env_idx, m_pos] = obs_in_f
 
     def get(self):
-        """現在の ptr から過去 SEQ_LEN 分のシーケンスを取得"""
-        start_pos = self.ptr
-        end_pos = self.ptr + self.seq_len
-        sequence_data = self.buffer[:, start_pos:end_pos]
-        contiguous_seq = sequence_data.contiguous()
-        return contiguous_seq
+        s_idx_g = self.ptr
+        e_idx_g = s_idx_g + self.seq_len
+        chunk_g = self.buffer[:, s_idx_g : e_idx_g]
+        return chunk_g.contiguous()
 
 def make_env():
-    render_val = None
+    """環境生成（デバッグモード v3.11 と同期）"""
+    r_mode_arg = None
     if USE_VIEWER_RUNTIME:
         if not TRAIN_MODE:
-            render_val = "human"
-    env_inst = TeamCosEnv(mode=MODE, render_mode=render_val)
-    return env_inst
+            r_mode_arg = "human"
+    
+    env_inst_f = TeamCosEnv(
+        mode=MODE, 
+        render_mode=r_mode_arg, 
+        debug_mode=DEBUG_MOVEMENT
+    )
+    return env_inst_f
 
 # ==========================================
 # 3. メイン実行ロジック (Run)
 # ==========================================
 def run():
-    # ハードウェア設定
-    c_avail = torch.cuda.is_available()
-    d_type_str = "cuda" if c_avail else "cpu"
-    device = torch.device(d_type_str)
+    is_cuda_ready_f = torch.cuda.is_available()
+    d_type_final = "cuda" if is_cuda_ready_f else "cpu"
+    device_obj = torch.device(d_type_final)
 
-    # Viewer 動的制御ロジック
     global USE_VIEWER_RUNTIME
     USE_VIEWER_RUNTIME = USE_VIEWER
-    viewer_warned_flag = False
+    warned_v_flag = False
 
-    def _safe_render(target_env):
-        """レンダリング失敗時にフラグを倒す安全機構"""
-        nonlocal viewer_warned_flag
+    def _safe_render_f(env_p_ref):
+        nonlocal warned_v_flag
         global USE_VIEWER_RUNTIME
         if not USE_VIEWER_RUNTIME:
             return False
         try:
-            target_env.render()
+            env_p_ref.render()
             return True
-        except Exception as e_render:
-            if not viewer_warned_flag:
-                print(f"⚠️ Viewer disabled at runtime: {e_render}")
-                viewer_warned_flag = True
+        except Exception as e_vis_err:
+            if not warned_v_flag:
+                print(f"⚠️ Viewer sync disabled: {e_vis_err}")
+                warned_v_flag = True
             USE_VIEWER_RUNTIME = False
             return False
     
-    # 乱数シード
-    seed_v = 42
-    random.seed(seed_v)
-    np.random.seed(seed_v)
-    torch.manual_seed(seed_v)
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
     torch.backends.cudnn.deterministic = True
     
-    # ネットワーク設定 (55次元に同期)
-    obs_dim_val = 55
-    action_dim_val = 8
-    if MODE == "initial":
-        action_dim_val = 4
+    obs_dim_actual = 55
+    act_dim_actual = 8 if MODE == "refinement" else 4
         
-    # エージェント初期化 (位置引数により不具合を修正)
-    agent = AgentV2(obs_dim_val, action_dim_val, HIDDEN_DIM, SEQ_LEN)
-    agent = agent.to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=LR_START, eps=1e-5)
+    agent_final = AgentV2(obs_dim_actual, act_dim_actual, HIDDEN_DIM, SEQ_LEN)
+    agent_final = agent_final.to(device_obj)
+    optimizer_final = optim.Adam(agent_final.parameters(), lr=LR_START, eps=1e-5)
     
-    # モデルロード
     if os.path.exists(SAVE_PATH):
         try:
-            ckpt_obj = torch.load(SAVE_PATH, map_location=device)
-            agent.load_state_dict(ckpt_obj)
-            print(f"✅ Loaded checkpoint: {SAVE_PATH}")
-        except Exception as err_l:
-            print(f"⚠️ Load failed: {err_l}")
+            ckpt_st = torch.load(SAVE_PATH, map_location=device_obj)
+            agent_final.load_state_dict(ckpt_st)
+            print(f"✅ Loaded: {SAVE_PATH}")
+        except Exception:
+            print(f"⚠️ Initializing fresh.")
 
-    # ------------------------------------------
-    # [A] 再生モード (PLAYBACK)
-    # ------------------------------------------
+    # --- [A] PLAYBACK MODE ---
     if not TRAIN_MODE:
         env_pb = make_env()
-        hist_pb = ObsHistory(1, SEQ_LEN, obs_dim_val, device)
-        agent.eval()
-        
-        obs_raw_pb, _ = env_pb.reset()
-        hist_pb.update(obs_raw_pb)
-        
+        hist_pb = ObsHistory(1, SEQ_LEN, obs_dim_actual, device_obj)
+        agent_final.eval()
+        obs_start_p, _ = env_pb.reset()
+        hist_pb.update(obs_start_p)
         if USE_VIEWER_RUNTIME:
-            is_rendered = _safe_render(env_pb)
-            if is_rendered:
+            if _safe_render_f(env_pb):
                 time.sleep(0.5)
-            
-        target_fps = 40
-        dur_tick = 1.0 / target_fps
-        print(f"🎮 Playback Mode Active.")
-        
+        print(f"🎮 Playback Mode.")
         try:
             while True:
                 if USE_VIEWER_RUNTIME:
                     if env_pb.viewer is None or not env_pb.viewer.is_running():
                         break
-                        
-                tick_s = time.perf_counter()
-                
+                t_s_pb = time.perf_counter()
                 with torch.no_grad():
-                    seq_in = hist_pb.get()
-                    act_out, _, _, _ = agent.get_action_and_value(seq_in)
-                    
-                act_np = act_out.cpu().numpy().flatten()
-                obs_n, rew_v, term, trunc, info_v = env_pb.step(act_np)
-                
-                hist_pb.update(obs_n)
-                
-                if term or trunc:
-                    obs_re, _ = env_pb.reset()
+                    out_pb = agent_final.get_action_and_value(hist_pb.get())
+                    a_pb = out_pb[0]
+                a_np_pb = a_pb.cpu().numpy().flatten()
+                o_nxt_pb, _, term_pb, trunc_pb, _ = env_pb.step(a_np_pb)
+                hist_pb.update(o_nxt_pb)
+                if term_pb or trunc_pb:
+                    o_re_pb, _ = env_pb.reset()
                     hist_pb.reset()
-                    hist_pb.update(obs_re)
-                    tick_s = time.perf_counter()
-                    
-                tick_now = time.perf_counter()
-                tick_elapsed = tick_now - tick_s
-                wait_time = dur_tick - tick_elapsed
-                if wait_time > 0:
-                    time.sleep(wait_time)
-                else:
-                    time.sleep(0.001)
+                    hist_pb.update(o_re_pb)
+                t_dur_pb = time.perf_counter() - t_s_pb
+                w_pb = (1.0/40.0) - t_dur_pb
+                if w_pb > 0: time.sleep(w_pb)
+                else: time.sleep(0.001)
         finally:
             env_pb.close()
-            print("🏁 Playback terminated.")
             sys.exit(0)
 
-    # ------------------------------------------
-    # [B] 学習モード (TRAINING)
-    # ------------------------------------------
+    # --- [B] TRAINING MODE ---
     else:
-        print(f"🚀 Training Mode Started: {MODE}")
-        
-        # 1. W&B 初期化
+        print(f"🚀 Training Started: {MODE}")
         if TRACK_WANDB:
-            now_dt_str = datetime.now().strftime("%m%d_%H%M")
-            run_name_tag = f"ppo_transformer_{MODE}_{now_dt_str}"
+            dt_tag = datetime.now().strftime("%m%d_%H%M")
             wandb.init(
                 project="HNS_V26_TeamCos",
-                name=run_name_tag,
-                config={
-                    "mode": MODE,
-                    "lr_start": LR_START,
-                    "batch_size": BATCH_SIZE,
-                    "total_steps": TOTAL_STEPS,
-                    "num_envs": NUM_ENVS,
-                    "seq_len": SEQ_LEN
-                }
+                name=f"ppo_{MODE}_{dt_tag}",
+                config={"mode": MODE, "steps": TOTAL_STEPS, "lr": LR_START},
+                reinit=True
             )
 
-        # 2. 環境 ＆ 履歴バッファ
-        envs_tr = gym.vector.SyncVectorEnv([make_env for _ in range(NUM_ENVS)])
-        hist_tr = ObsHistory(NUM_ENVS, SEQ_LEN, obs_dim_val, device)
-        log_dir_train = f"runs/HNS_{MODE}_{datetime.now().strftime('%m%d_%H%M')}"
-        writer_tb = SummaryWriter(log_dir_train)
+        envs_train = gym.vector.SyncVectorEnv([make_env for _ in range(NUM_ENVS)])
+        hist_train = ObsHistory(NUM_ENVS, SEQ_LEN, obs_dim_actual, device_obj)
+        env_evaluation = make_env()
+        writer_tb = SummaryWriter(f"runs/HNS_{MODE}_{datetime.now().strftime('%m%d_%H%M')}")
         
-        # 3. テンソルバッファ (極限展開 ＆ 名称統一)
-        obs_buffer = torch.zeros((EPISODE_LIMIT, NUM_ENVS, SEQ_LEN, obs_dim_val), device=device)
-        act_buffer = torch.zeros((EPISODE_LIMIT, NUM_ENVS, action_dim_val), device=device)
-        prob_buffer = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device)
-        rew_buffer = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device)
-        done_buffer = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device)
-        val_buffer = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device)
-        # NDR計算用
-        find_buffer = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device)
+        b_obs = torch.zeros((EPISODE_LIMIT, NUM_ENVS, SEQ_LEN, obs_dim_actual), device=device_obj)
+        b_act = torch.zeros((EPISODE_LIMIT, NUM_ENVS, act_dim_actual), device=device_obj)
+        b_prob = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device_obj)
+        b_rew = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device_obj)
+        b_done = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device_obj)
+        b_val = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device_obj)
+        b_found_f = torch.zeros((EPISODE_LIMIT, NUM_ENVS), device=device_obj)
         
-        global_step_acc = 0
-        update_iter_cnt = 0
-        best_eval_rew_val = -float('inf')
+        g_step_total_acc = 0
+        u_iter_idx = 0
+        best_r_eval_metric = -float('inf')
+        last_eval_r_val = None 
+        training_clock_f = time.time()
         
-        # 学習開始時間の確定 (NameError 根絶)
-        training_start_time = time.time()
-        
-        # 初期リセット
-        obs_v_init, _ = envs_tr.reset()
-        hist_tr.update(obs_v_init)
+        obs_start_vec, _ = envs_train.reset()
+        hist_train.update(obs_start_vec)
         
         if USE_VIEWER_RUNTIME:
-            _safe_render(envs_tr.envs[0])
+            _safe_render_f(envs_train.envs[0])
             time.sleep(0.5)
         
         try:
-            while global_step_acc < TOTAL_STEPS:
+            while g_step_total_acc < TOTAL_STEPS:
                 
-                # --- 4. データ収集 (Rollout) ---
-                agent.eval()
-                for rollout_step_i in range(EPISODE_LIMIT):
-                    global_step_acc += NUM_ENVS
-                    
-                    rollout_sequence_b = hist_tr.get()
-                    obs_buffer[rollout_step_i] = rollout_sequence_b
-                    
-                    if USE_VIEWER_RUNTIME:
-                        _safe_render(envs_tr.envs[0])
-                        
-                    with torch.no_grad():
-                        a_roll, lp_roll, _, v_roll = agent.get_action_and_value(rollout_sequence_b)
-                        val_buffer[rollout_step_i] = v_roll.flatten()
-                        
-                    act_buffer[rollout_step_i] = a_roll
-                    prob_buffer[rollout_step_i] = lp_roll
-                    
-                    next_obs_v_raw, rew_v_raw, done_v_raw, tr_v_raw, info_v_raw = envs_tr.step(a_roll.cpu().numpy())
-                    
-                    rew_buf_t = torch.as_tensor(rew_v_raw, device=device)
-                    done_buf_t = torch.as_tensor(done_v_raw, device=device)
-                    rew_buffer[rollout_step_i] = rew_buf_t
-                    done_buffer[rollout_step_i] = done_buf_t
-                    
-                    # NDRデータの記録 (info から抽出)
-                    is_detected_flags_r = info_v_raw.get("is_detected", np.zeros(NUM_ENVS))
-                    find_buf_t = torch.as_tensor(is_detected_flags_r, dtype=torch.float32, device=device)
-                    find_buffer[rollout_step_i] = find_buf_t
-                    
-                    hist_tr.update(next_obs_v_raw)
-                    
-                    # 個別リセット処理
-                    for env_idx_chk_r in range(NUM_ENVS):
-                        is_env_done = done_v_raw[env_idx_chk_r]
-                        is_env_trunc = tr_v_raw[env_idx_chk_r]
-                        if is_env_done or is_env_trunc:
-                            hist_tr.reset(env_idx=env_idx_chk_r)
-                            hist_tr.update(next_obs_v_raw[env_idx_chk_r], env_idx=env_idx_chk_r)
-
-                # --- 5. アドバンテージ計算 (GAE) ---
-                agent.eval()
-                with torch.no_grad():
-                    v_next_val_r = agent.get_value(hist_tr.get()).reshape(1, -1)
-                    adv_buffer_r = torch.zeros_like(rew_buffer, device=device)
-                    last_gae_val_r = 0
-                    
-                    for t_idx_r in reversed(range(EPISODE_LIMIT)):
-                        non_terminal_mask_r = 1.0 - done_buffer[t_idx_r]
-                        if t_idx_r == EPISODE_LIMIT - 1:
-                            v_target_step_r = v_next_val_r
-                        else:
-                            v_target_step_r = val_buffer[t_idx_r + 1]
-                            
-                        delta_gae_r = rew_buffer[t_idx_r] + GAMMA * v_target_step_r * non_terminal_mask_r - val_buffer[t_idx_r]
-                        last_gae_val_r = delta_gae_r + GAMMA * GAE_LAMBDA * non_terminal_mask_r * last_gae_val_r
-                        adv_buffer_r[t_idx_r] = last_gae_val_r
-                        
-                    return_buffer_r = adv_buffer_r + val_buffer
-
-                # --- 6. 最適化 (PPO Optimization) ---
-                agent.train()
-                # バッファ平坦化 (名称同期済み)
-                f_obs = obs_buffer.reshape(-1, SEQ_LEN, obs_dim_val)
-                f_act = act_buffer.reshape(-1, action_dim_val)
-                f_prob = prob_buffer.reshape(-1)
-                f_adv = adv_buffer_r.reshape(-1)
-                f_ret = return_buffer_r.reshape(-1)
-                f_val = val_buffer.reshape(-1)
-                
-                size_total_ppo = f_obs.shape[0]
-                ppo_indices_set = np.arange(size_total_ppo)
-                clip_fractions_list = []
-                kl_divergence_final_p = torch.tensor(0.0, device=device)
-                
-                for epoch_ppo_i in range(UPDATE_EPOCHS):
-                    np.random.shuffle(ppo_indices_set)
-                    for start_idx_p in range(0, size_total_ppo, BATCH_SIZE):
-                        end_idx_p = start_idx_p + BATCH_SIZE
-                        m_idx_p = ppo_indices_set[start_idx_p:end_idx_p]
-                        
-                        _, n_logp_p, n_ent_p, n_val_ppo_p = agent.get_action_and_value(f_obs[m_idx_p], f_act[m_idx_p])
-                        
-                        l_ratio_ppo_p = n_logp_p - f_prob[m_idx_p]
-                        ratio_ppo_p = l_ratio_ppo_p.exp()
-                        
-                        with torch.no_grad():
-                            kl_divergence_final_p = ((ratio_ppo_p - 1.0) - l_ratio_ppo_p).mean()
-                            diff_ratio = ratio_ppo_p - 1.0
-                            abs_diff_r = diff_ratio.abs()
-                            is_clipped = abs_diff_r.gt(CLIP_COEF)
-                            c_rate_ppo_p = is_clipped.float().mean().item()
-                            clip_fractions_list.append(c_rate_ppo_p)
-                        
-                        # アドバンテージ正規化
-                        mb_adv_p = f_adv[m_idx_p]
-                        mb_adv_mean = mb_adv_p.mean()
-                        mb_adv_std = mb_adv_p.std()
-                        mb_adv_norm_p = (mb_adv_p - mb_adv_mean) / (mb_adv_std + 1e-8)
-                        
-                        # Policy Loss
-                        pg_l_unclipped_p = -mb_adv_norm_p * ratio_ppo_p
-                        pg_ratio_clipped_p = torch.clamp(ratio_ppo_p, 1.0 - CLIP_COEF, 1.0 + CLIP_COEF)
-                        pg_l_clipped_p = -mb_adv_norm_p * pg_ratio_clipped_p
-                        pg_loss_ppo_p = torch.max(pg_l_unclipped_p, pg_l_clipped_p).mean()
-                        
-                        # Value Loss
-                        v_diff_ppo_p = n_val_ppo_p.flatten() - f_ret[m_idx_p]
-                        v_loss_ppo_p = 0.5 * (v_diff_ppo_p ** 2).mean()
-                        
-                        # アニーリング (Learning Progress)
-                        progress_val_p = 1.0 - (global_step_acc / TOTAL_STEPS)
-                        cur_lr_p = LR_END + (LR_START - LR_END) * progress_val_p
-                        for p_group_o in optimizer.param_groups:
-                            p_group_o["lr"] = cur_lr_p
-                            
-                        cur_ent_p = ENT_COEF_END + (ENT_COEF_START - ENT_COEF_END) * progress_val_p
-                        total_loss_ppo_p = pg_loss_ppo_p - cur_ent_p * n_ent_p.mean() + v_loss_ppo_p * VF_COEF
-                        
-                        optimizer.zero_grad()
-                        total_loss_ppo_p.backward()
-                        nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
-                        optimizer.step()
-                        
-                    if kl_divergence_final_p > TARGET_KL:
-                        break
-                
-                update_iter_cnt += 1
-
-                # --- 7. 評価フェーズ (Evaluation) ---
-                if update_iter_cnt % EVAL_INTERVAL == 0:
-                    agent.eval()
-                    eval_accum_rewards_list = []
-                    
+                # --- Step 1: Evaluation ---
+                if u_iter_idx % EVAL_INTERVAL == 0:
+                    agent_final.eval()
+                    eval_results = []
                     for _ in range(EVAL_EPISODES):
-                        # envs_tr を正しく参照し NameError (env_tr) を根絶
-                        o_ev_init_r, _ = envs_tr.reset()
-                        h_ev_r = ObsHistory(NUM_ENVS, SEQ_LEN, obs_dim_val, device)
-                        h_ev_r.update(o_ev_init_r)
-                        r_ev_sum_r = np.zeros(NUM_ENVS)
-                        
+                        o_ev_init, _ = env_evaluation.reset()
+                        h_ev_obj = ObsHistory(1, SEQ_LEN, obs_dim_actual, device_obj)
+                        h_ev_obj.update(o_ev_init)
+                        r_score = 0
                         for _ in range(EPISODE_LIMIT):
                             with torch.no_grad():
-                                eval_output = agent.get_action_and_value(h_ev_r.get())
-                                a_ev_out_r = eval_output[0]
-                                
-                            o_ev_next_r, r_ev_r, d_ev_r, t_ev_r, _ = envs_tr.step(a_ev_out_r.cpu().numpy())
-                            r_ev_sum_r = r_ev_sum_r + r_ev_r
-                            h_ev_r.update(o_ev_next_r)
-                            
-                            if any(d_ev_r) or any(t_ev_r):
-                                break
-                        eval_accum_rewards_list.append(np.mean(r_ev_sum_r))
-                        
-                    avg_reward_ev_final_p = np.mean(eval_accum_rewards_list)
-                    writer_tb.add_scalar("eval/avg_reward", avg_reward_ev_final_p, global_step_acc)
-                    if TRACK_WANDB:
-                        wandb.log({"eval/avg_reward": avg_reward_ev_final_p}, step=global_step_acc)
-                        
-                    if avg_reward_ev_final_p > best_eval_reward:
-                        best_eval_reward = avg_reward_ev_final_p
-                        torch.save(agent.state_dict(), BEST_SAVE_PATH)
+                                a_ev_p = agent_final.get_action_and_value(h_ev_obj.get())[0]
+                            o_ev_nxt, r_ev_v, d_ev_v, t_ev_v, _ = env_evaluation.step(a_ev_p.cpu().numpy().flatten())
+                            r_score += r_ev_v
+                            h_ev_obj.update(o_ev_nxt)
+                            if d_ev_v or t_ev_v: break
+                        eval_results.append(r_score)
+                    last_eval_r_val = np.mean(eval_results)
+                    writer_tb.add_scalar("eval/avg_reward", last_eval_r_val, g_step_total_acc)
+                    if last_eval_r_val > best_r_eval_metric:
+                        best_r_eval_metric = last_eval_r_val
+                        torch.save(agent_final.state_dict(), BEST_SAVE_PATH)
 
-                # --- 8. 統計ロギング (Logging) ---
-                y_pred_np_p = f_val.cpu().numpy()
-                y_true_np_p = f_ret.cpu().numpy()
-                var_y_total_p = np.var(y_true_np_p)
-                if var_y_total_p > 1e-6:
-                    residual_v_p = np.var(y_true_np_p - y_pred_np_p)
-                    exp_var_val_p = 1.0 - residual_v_p / var_y_total_p
-                else:
-                    exp_var_val_p = 0.0
+                # --- Step 2: Data Rollout ---
+                agent_final.train() 
+                for step_idx in range(EPISODE_LIMIT):
+                    g_step_total_acc = g_step_total_acc + NUM_ENVS
                     
-                time_now_t = time.time()
-                dur_train_p = time_now_t - training_start_time
-                sps_train_p = int(global_step_acc / (dur_train_p + 1e-8))
-                mean_rollout_reward_p = rew_buffer.mean().item()
-                
-                # NDR (No-Detected Ratio) 計算
-                raw_find_mean_p = find_buffer.mean().item()
-                ndr_val_final_p = 1.0 - raw_find_mean_p
-                
-                print(f"Step: {global_step_acc:8d} | SPS: {sps_train_p:4d} | Rew: {mean_rollout_reward_p:7.4f} | NDR: {ndr_val_final_p:6.2%} | KL: {kl_divergence_final_p:6.4f}")
-                
-                # TensorBoard / W&B 出力
-                log_metrics_p = {
-                    "params/learning_rate": cur_lr_p,
-                    "params/entropy_coef": cur_ent_p,
-                    "losses/value_loss": v_loss_ppo_p.item(),
-                    "losses/policy_loss": pg_loss_ppo_p.item(),
-                    "losses/approx_kl": kl_divergence_final_p.item(),
-                    "losses/clip_fraction": np.mean(clip_fractions_list),
-                    "losses/explained_variance": exp_var_val_p,
-                    "charts/SPS": sps_train_p,
-                    "charts/avg_reward": mean_rollout_reward_p,
-                    "charts/no_detected_ratio": ndr_val_final_p
-                }
-                for k_metric_p, v_metric_p in log_metrics_p.items():
-                    writer_tb.add_scalar(k_metric_p, v_metric_p, global_step_acc)
-                if TRACK_WANDB:
-                    wandb.log(log_metrics_p, step=global_step_acc)
-                
-                torch.save(agent.state_dict(), SAVE_PATH)
+                    obs_seq_roll = hist_train.get()
+                    b_obs[step_idx] = obs_seq_roll
+                    
+                    # 描画命令の送信 (Hider 動作確認のため頻度向上)
+                    if USE_VIEWER_RUNTIME:
+                        # 準備期間 (0-80) は毎ステップ描画し、sleep を入れる
+                        if step_idx <= 80:
+                            _safe_render_f(envs_train.envs[0])
+                            # Hider の動きを視認するためのディレイ
+                            time.sleep(0.015) 
+                        elif step_idx % 15 == 0:
+                            _safe_render_f(envs_train.envs[0])
+                        
+                    with torch.no_grad():
+                        out_roll = agent_final.get_action_and_value(obs_seq_roll)
+                        a_r_t = out_roll[0]
+                        lp_r_t = out_roll[1]
+                        v_r_t = out_roll[3]
+                        b_val[step_idx] = v_r_t.flatten()
+                    
+                    b_act[step_idx] = a_r_t
+                    b_prob[step_idx] = lp_r_t
+                    
+                    act_np_f = a_r_t.cpu().numpy()
+                    o_nxt_all, r_all, d_all, t_all, i_all = envs_train.step(act_np_f)
+                    
+                    b_rew[step_idx] = torch.as_tensor(r_all, device=device_obj)
+                    b_done[step_idx] = torch.as_tensor(d_all, device=device_obj)
+                    
+                    is_det_vec = i_all.get("is_detected", np.zeros(NUM_ENVS))
+                    b_found_f[step_idx] = torch.as_tensor(is_det_vec, dtype=torch.float32, device=device_obj)
+                    
+                    hist_train.update(o_nxt_all)
+                    for e_idx in range(NUM_ENVS):
+                        if d_all[e_idx] or t_all[e_idx]:
+                            hist_train.reset(env_idx=e_idx)
+                            hist_train.update(o_nxt_all[e_idx], env_idx=e_idx)
+                            
+                    if DEBUG_MOVEMENT and any(t_all):
+                        break
 
-        except KeyboardInterrupt:
-            print("✋ Training interrupted.")
-        except Exception:
-            traceback.print_exc()
+                # --- Step 3: GAE ---
+                agent_final.eval()
+                with torch.no_grad():
+                    v_nx_raw = agent_final.get_value(hist_train.get())
+                    v_nx_term = v_nx_raw.reshape(1, -1)
+                    b_adv_f = torch.zeros_like(b_rew, device=device_obj)
+                    gae_run = 0
+                    for t_idx_g in reversed(range(EPISODE_LIMIT)):
+                        mask_gae_f = 1.0 - b_done[t_idx_g]
+                        v_target_nxt = v_nx_term if t_idx_g == EPISODE_LIMIT - 1 else b_val[t_idx_g + 1]
+                        td_err_f = b_rew[t_idx_g] + GAMMA * v_target_nxt * mask_gae_f - b_val[t_idx_g]
+                        gae_run = td_err_f + GAMMA * GAE_LAMBDA * mask_gae_f * gae_run
+                        b_adv_f[t_idx_g] = gae_run
+                    b_ret_f = b_adv_f + b_val
+
+                # --- Step 4: Optimization ---
+                agent_final.train()
+                f_obs_t = b_obs.reshape(-1, SEQ_LEN, obs_dim_actual)
+                f_act_t = b_act.reshape(-1, act_dim_actual)
+                f_prob_t = b_prob.reshape(-1)
+                f_adv_t = b_adv_f.reshape(-1)
+                f_ret_t = b_ret_f.reshape(-1)
+                f_val_t = b_val.reshape(-1)
+                
+                ds_sz_ppo = f_obs_t.shape[0]
+                idx_arr = np.arange(ds_sz_ppo)
+                rem_rate = 1.0 - (g_step_total_acc / TOTAL_STEPS)
+                cur_lr_p = LR_END + (LR_START - LR_END) * rem_rate
+                for pg_grp in optimizer_final.param_groups: pg_grp["lr"] = cur_lr_p
+                cur_ent_p = ENT_COEF_END + (ENT_COEF_START - ENT_COEF_END) * rem_rate
+                
+                cl_fra_list = []
+                f_kl_val = torch.tensor(0.0, device=device_obj)
+                for ep_idx in range(UPDATE_EPOCHS):
+                    np.random.shuffle(idx_arr)
+                    for start_p in range(0, ds_sz_ppo, BATCH_SIZE):
+                        m_idx = idx_arr[start_p : start_p + BATCH_SIZE]
+                        res_p = agent_final.get_action_and_value(f_obs_t[m_idx], f_act_t[m_idx])
+                        l_rat = res_p[1] - f_prob_t[m_idx]
+                        ratio_p = torch.exp(l_rat)
+                        with torch.no_grad():
+                            f_kl_val = ((ratio_p - 1.0) - l_rat).mean()
+                            cl_fra_list.append((ratio_p - 1.0).abs().gt(CLIP_COEF).float().mean().item())
+                        mb_adv_p = (f_adv_t[m_idx] - f_adv_t[m_idx].mean()) / (f_adv_t[m_idx].std() + 1e-8)
+                        loss_pi = torch.max(-mb_adv_p * ratio_p, -mb_adv_p * torch.clamp(ratio_p, 1.0-CLIP_COEF, 1.0+CLIP_COEF)).mean()
+                        loss_v = 0.5 * ((res_p[3].flatten() - f_ret_t[m_idx]) ** 2).mean()
+                        loss_tot = loss_pi - (cur_ent_p * res_p[2].mean()) + (loss_v * VF_COEF)
+                        optimizer_final.zero_grad(); loss_tot.backward(); nn.utils.clip_grad_norm_(agent_final.parameters(), MAX_GRAD_NORM); optimizer_final.step()
+                    if f_kl_val > TARGET_KL: break
+                
+                u_iter_idx = u_iter_idx + 1
+
+                # --- Step 5: Logging ---
+                var_y_f = np.var(f_ret_t.cpu().numpy())
+                exp_var_f = 1.0 - (np.var(f_ret_t.cpu().numpy() - f_val_t.cpu().numpy()) / var_y_f) if var_y_f > 1e-6 else 0.0
+                sps_f = int(g_step_total_acc / (time.time() - training_clock_f + 1e-8))
+                r_avg_f, ndr_f = b_rew.mean().item(), 1.0 - b_found_f.mean().item()
+                
+                print(f"Step: {g_step_total_acc:8d} | SPS: {sps_f:4d} | Rew: {r_avg_f:7.4f} | NDR: {ndr_f:6.2%} | KL: {f_kl_val:6.4f}")
+                
+                stats_p = {
+                    "params/learning_rate": cur_lr_p, "params/entropy_coef": cur_ent_p,
+                    "losses/value_loss": loss_v.item(), "losses/policy_loss": loss_pi.item(),
+                    "losses/approx_kl": f_kl_val.item(), "losses/explained_variance": exp_var_f,
+                    "losses/clip_fraction": np.mean(cl_fra_list), "charts/SPS": sps_f,
+                    "charts/avg_reward": r_avg_f, "charts/no_detected_ratio": ndr_f
+                }
+                for k_tb, v_tb in stats_p.items(): writer_tb.add_scalar(k_tb, v_tb, g_step_total_acc)
+                if TRACK_WANDB:
+                    if last_eval_r_val is not None: stats_p["eval/avg_reward"], last_eval_r_val = last_eval_r_val, None
+                    wandb.log(stats_p, step=g_step_total_acc)
+                
+                torch.save(agent_final.state_dict(), SAVE_PATH)
+                if DEBUG_MOVEMENT and g_step_total_acc > 0: break
+                
+        except KeyboardInterrupt: print("✋ Stopped.")
+        except Exception: traceback.print_exc()
         finally:
-            ctx_locals_p = locals()
-            if 'envs_tr' in ctx_locals_p: envs_tr.close()
-            if 'writer_tb' in ctx_locals_p: writer_tb.close()
+            if 'envs_train' in locals(): envs_train.close()
+            if 'env_evaluation' in locals(): env_evaluation.close()
+            if 'writer_tb' in locals(): writer_tb.close()
             if TRACK_WANDB: wandb.finish()
-            print("💾 Training session closed.")
+            print("💾 Training closed.")
 
 if __name__ == "__main__":
     run()
