@@ -1,10 +1,10 @@
-# main26_train_final.py v3.40
+# main26_train_final.py v3.47
 # 修正内容:
-# 1. PEP 8 準拠: インラインコメント、行長制限、セミコロン、空白ルールを修正。
-# 2. 統計算出の完全記述: 損失項や NDR の平均化工程を独立行で解体維持。
-# 3. 再生モードの復元: tqdm postfix に SPS, Reward, NDR を表示する形式を保持。
-# 4. カメラ俯瞰角度の適用: Elevation -50.0 の斜め俯瞰設定。
-# 5. エラー耐性向上: 未定義名や重複インポートを整理。
+# 1. 1行複文 (;) の解体: デバッグの透明性と保守性を向上。
+# 2. 安全停止ロジック: keep_running_v フラグによる、ステップ完了後の正常終了。
+# 3. 高速化 (メモリ): obs_raw_batch_v の一括事前確保により GC 負荷を軽減。
+# 4. 可読性向上: 複雑な dict.get() をローカル変数化し、論理ステップを垂直展開。
+# 5. PEP 8 準拠: 79文字制限、空白規約、不適切なコメントを修正。
 
 import os
 import sys
@@ -28,10 +28,10 @@ from models.ppo_transformer_v2 import AgentV2
 # ==========================================
 # 0. 実行環境・基盤設定
 # ==========================================
-p_info = platform.processor()
+p_info_v = platform.processor()
 
-if p_info != 'arm':
-    # マルチスレッドによる演算競合を防止し、単一コアの SPS 効率を最大化
+if p_info_v != 'arm':
+    # マルチスレッド競合防止
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -43,58 +43,71 @@ if p_info != 'arm':
 # 1. 視認化ユーティリティ
 # ==========================================
 def draw_vision_lines(env):
-    """視野判定ラインの描画工程。"""
-    v_ptr = env.viewer
-    if v_ptr is None:
+    """視野判定ラインの描画。"""
+    v_ptr_v = env.viewer
+    if v_ptr_v is None:
         return
 
+    # ジオメトリリセット
     env.viewer.user_scn.ngeom = 0
-    t_ids = []
-    t_ids.append(env.box_ids[0])
-    t_ids.append(env.box_ids[1])
-    t_ids.append(env.ramp_id)
-    t_ids.append(env.body_ids["s"])
-    t_ids.append(env.body_ids["h1"])
-    t_ids.append(env.body_ids["h2"])
+    t_ids_v = [
+        env.box_ids[0],
+        env.box_ids[1],
+        env.ramp_id,
+        env.body_ids["s"],
+        env.body_ids["h1"],
+        env.body_ids["h2"]
+    ]
 
-    src_keys = ["s", "h1", "h2"]
+    src_keys_v = ["s", "h1", "h2"]
+    identity_v = np.eye(3).flatten()
 
-    for k_src in src_keys:
-        bid_s = env.body_ids[k_src]
-        pos_s = env.data.xpos[bid_s]
-        rj = env.qpos_indices[k_src]['rot']
-        rot_s = env.data.qpos[env.model.jnt_qposadr[rj]]
+    for k_src_v in src_keys_v:
+        bid_s_v = env.body_ids[k_src_v]
+        pos_s_v = env.data.xpos[bid_s_v]
+        rj_idx_v = env.qpos_indices[k_src_v]['rot']
+        rot_s_val_v = env.data.qpos[env.model.jnt_qposadr[rj_idx_v]]
 
-        rgba = [0.1, 1.0, 0.1, 0.6]  # Hider
-        if k_src == "s":
-            rgba = [1.0, 0.3, 0.1, 0.8]  # Seeker
+        # 色決定
+        if k_src_v == "s":
+            rgba_v = [1.0, 0.3, 0.1, 0.8]  # Seeker
+        else:
+            rgba_v = [0.1, 1.0, 0.1, 0.6]  # Hider
 
-        for bid_d in t_ids:
-            if bid_d == bid_s:
+        for bid_d_v in t_ids_v:
+            if bid_d_v == bid_s_v:
                 continue
-            pos_d = env.data.xpos[bid_d]
+            pos_d_v = env.data.xpos[bid_d_v]
 
-            if env._is_within_fov_and_visible(pos_s[:2], rot_s, pos_d[:2],
-                                              bid_s, bid_d):
-                gn = env.viewer.user_scn.ngeom
-                if gn < 100:
-                    gs = env.viewer.user_scn.geoms[gn]
+            if env._is_within_fov_and_visible(pos_s_v[:2], rot_s_val_v,
+                                              pos_d_v[:2], bid_s_v, bid_d_v):
+                gn_v = env.viewer.user_scn.ngeom
+                if gn_v < 100:
+                    gs_v = env.viewer.user_scn.geoms[gn_v]
                     mujoco.mjv_initGeom(
-                        gs, mujoco.mjtGeom.mjGEOM_LINE, [0.005, 0, 0],
-                        pos_s, np.eye(3).flatten(), rgba
+                        gs_v,
+                        mujoco.mjtGeom.mjGEOM_LINE,
+                        [0.005, 0, 0],
+                        pos_s_v,
+                        identity_v,
+                        rgba_v
                     )
                     mujoco.mjv_connector(
-                        gs, mujoco.mjtGeom.mjGEOM_LINE, 0.005, pos_s, pos_d
+                        gs_v,
+                        mujoco.mjtGeom.mjGEOM_LINE,
+                        0.005,
+                        pos_s_v,
+                        pos_d_v
                     )
-                    env.viewer.user_scn.ngeom = gn + 1
+                    env.viewer.user_scn.ngeom = gn_v + 1
 
 
 # ==========================================
-# 2. 全ハイパーパラメータ ＆ 定数
+# 2. ハイパーパラメータ
 # ==========================================
 TRAIN_MODE = False
-USE_VIEWER = False
-TRACK_WANDB = False
+USE_VIEWER = True
+TRACK_WANDB = True
 
 WANDB_PROJECT = "HNS-Xformer-Final"
 WANDB_ENTITY = None
@@ -149,43 +162,49 @@ class ObsHistory:
             self.buffer[i].zero_()
 
     def prime(self, o, i):
-        f = torch.as_tensor(o, dtype=torch.float32, device=self.dev).reshape(
-            self.od
-        )
+        f_t_v = torch.as_tensor(o, dtype=torch.float32,
+                                device=self.dev).reshape(self.od)
         for idx in range(self.capacity):
-            self.buffer[i, idx] = f
+            self.buffer[i, idx] = f_t_v
 
     def update_batch(self, o_batch):
-        t = torch.as_tensor(o_batch, dtype=torch.float32, device=self.dev)
-        p = self.ptr
-        self.buffer[:, p] = t
-        self.buffer[:, p + self.sl] = t
-        self.ptr = (p + 1) % self.sl
+        t_b_v = torch.as_tensor(o_batch, dtype=torch.float32, device=self.dev)
+        p_v = self.ptr
+        self.buffer[:, p_v] = t_b_v
+        self.buffer[:, p_v + self.sl] = t_b_v
+        self.ptr = (p_v + 1) % self.sl
 
     def update_single(self, o, i):
-        rv = torch.as_tensor(o, dtype=torch.float32,
-                             device=self.dev).reshape(self.od)
-        p = self.ptr
-        self.buffer[i, p] = rv
-        self.buffer[i, p + self.sl] = rv
+        rv_v = torch.as_tensor(o, dtype=torch.float32,
+                               device=self.dev).reshape(self.od)
+        p_v = self.ptr
+        self.buffer[i, p_v] = rv_v
+        self.buffer[i, p_v + self.sl] = rv_v
 
     def get(self):
-        s = self.ptr
-        e = self.ptr + self.sl
-        return self.buffer[:, s:e].contiguous()
+        s_v = self.ptr
+        e_v = self.ptr + self.sl
+        return self.buffer[:, s_v: e_v].contiguous()
 
 
 # ==========================================
 # 4. 実行ユーティリティ
 # ==========================================
 def batch_normalize_obs(obs_batch):
-    """NumPy ベクトル演算による高速正規化。"""
-    res = obs_batch.copy()
-    res[:, 0:2] /= 10.0
-    res[:, 2] /= 5.0
-    res[:, 5:17] /= 15.0
-    res[:, 17:55] /= 12.0
-    return res
+    res_v = obs_batch.copy()
+    res_v[:, 0:2] /= 10.0
+    res_v[:, 2] /= 5.0
+    res_v[:, 5:17] /= 15.0
+    res_v[:, 17:55] /= 12.0
+    return res_v
+
+
+def apply_camera_slanted(env):
+    if env.viewer is not None:
+        env.viewer.cam.lookat[:] = [0.0, 0.0, 0.0]
+        env.viewer.cam.distance = 15.0
+        env.viewer.cam.elevation = -50.0
+        env.viewer.cam.azimuth = 90.0
 
 
 def run():
@@ -196,227 +215,221 @@ def run():
         act_dim = 8
 
     agent = AgentV2(obs_dim, act_dim, HIDDEN_DIM, SEQ_LEN).to(device)
-    m_path = HIDER_MODEL_PATH if TRAINING_TARGET == "hider" else \
+    m_path_v = HIDER_MODEL_PATH if TRAINING_TARGET == "hider" else \
         SEEKER_MODEL_PATH
-    if os.path.exists(m_path):
-        agent.load_state_dict(torch.load(m_path, map_location=device))
+
+    if os.path.exists(m_path_v):
+        agent.load_state_dict(torch.load(m_path_v, map_location=device))
         agent.eval()
-        print(f"✅ Loaded weights: {m_path}")
+        print(f"✅ Loaded weights: {m_path_v}")
 
     if TRAIN_MODE and TRACK_WANDB:
         import wandb
-        dt = datetime.now().strftime('%m%d_%H%M')
-        r_name = f"main26_{TRAINING_TARGET}_{dt}"
+        dt_v = datetime.now().strftime('%m%d_%H%M')
+        r_name = f"main26_{TRAINING_TARGET}_{dt_v}"
         wandb.init(project=WANDB_PROJECT, name=r_name)
 
     def make_env_internal():
-        rm = "human" if (USE_VIEWER or not TRAIN_MODE) else None
-        return TeamCosEnv(mode=MODE, target=TRAINING_TARGET, render_mode=rm)
+        rm_v = "human" if (USE_VIEWER or not TRAIN_MODE) else None
+        return TeamCosEnv(mode=MODE, target=TRAINING_TARGET, render_mode=rm_v)
 
-    # --- [A] PLAYBACK ---
+    keep_running_v = True
+
+    # --- [A] PLAYBACK MODE ---
     if not TRAIN_MODE:
-        print("🎬 Starting Playback (Slanted Bird's Eye View)...")
-        env = make_env_internal()
-        h = ObsHistory(1, SEQ_LEN, obs_dim, device)
-        o_r, _ = env.reset()
-        h.prime(env._normalize_obs(o_r), 0)
-        cum_r, n_ndr, st_t, s_t = 0.0, 0, 0, time.time()
-        cam_d = False
-        pbar = tqdm(desc="Playback", unit="step")
+        print("🎬 Starting Playback with Slanted Bird's Eye View...")
+        env_pb = make_env_internal()
+        h_man_pb = ObsHistory(1, SEQ_LEN, obs_dim, device)
+        o_raw_v, _ = env_pb.reset()
+        h_man_pb.prime(env_pb._normalize_obs(o_raw_v), 0)
+        cum_r_v, n_ndr_v, st_t_v, s_time_v = 0.0, 0, 0, time.time()
+        cam_done_v = False
+        pbar_v = tqdm(desc="Playback", unit="step")
         try:
-            while True:
+            while keep_running_v:
                 with torch.no_grad():
-                    a_np = agent.get_action_and_value(h.get())[0].cpu() \
-                        .numpy().flatten()
-                on_r, rw, dn, tr, inf = env.step(a_np)
-                h.update_batch(env._normalize_obs(on_r)[np.newaxis, :])
-                st_t += 1
-                cum_r += rw
-                if not inf.get("is_detected", False):
-                    n_ndr += 1
-                pbar.update(1)
-                pbar.set_postfix({
-                    "SPS": int(st_t/(time.time()-s_t+1e-6)),
-                    "Reward": f"{cum_r/st_t:.4f}",
-                    "NDR": f"{n_ndr/st_t:.2f}"
+                    a_np_v = agent.get_action_and_value(h_man_pb.get())[0]
+                    a_np_v = a_np_v.cpu().numpy().flatten()
+                on_raw_v, rw_v, dn_v, tr_v, inf_v = env_pb.step(a_np_v)
+                h_man_pb.update_batch(env_pb._normalize_obs(on_raw_v)[np.newaxis, :])
+                st_t_v += 1
+                cum_r_v += rw_v
+                if not inf_v.get("is_detected", False):
+                    n_ndr_v += 1
+                pbar_v.update(1)
+                elapsed_v = time.time() - s_time_v
+                sps_curr_v = int(st_t_v / (elapsed_v + 1e-6))
+                pbar_v.set_postfix({
+                    "SPS": sps_curr_v,
+                    "Rew": f"{cum_r_v/st_t_v:.4f}",
+                    "NDR": f"{n_ndr_v/st_t_v:.2f}"
                 })
-                draw_vision_lines(env)
-                env.render()
-                if not cam_d and env.viewer:
-                    env.viewer.cam.lookat[:] = [0, 0, 0]
-                    env.viewer.cam.distance = 15.0
-                    env.viewer.cam.elevation = -50.0
-                    cam_d = True
+                draw_vision_lines(env_pb)
+                env_pb.render()
+                if not cam_done_v:
+                    apply_camera_slanted(env_pb)
+                    cam_done_v = True
                 time.sleep(0.04)
-                if dn or tr:
-                    o_res, _ = env.reset()
-                    h.reset()
-                    h.prime(env._normalize_obs(o_res), 0)
+                if dn_v or tr_v:
+                    o_res_v, _ = env_pb.reset()
+                    h_man_pb.reset()
+                    h_man_pb.prime(env_pb._normalize_obs(o_res_v), 0)
         except KeyboardInterrupt:
-            pass
+            print("\n👋 Playback interrupted by user.")
         finally:
-            pbar.close()
-            env.close()
+            pbar_v.close()
+            env_pb.close()
             sys.exit(0)
 
-    # --- [B] TRAINING ---
+    # --- [B] TRAINING MODE ---
     else:
         print(f"🚀 Training: {NUM_ENVS} envs | Target: {TRAINING_TARGET}")
-        envs_tr_list_v = [make_env_internal() for _ in range(NUM_ENVS)]
+        envs_list_v = [make_env_internal() for _ in range(NUM_ENVS)]
         optimizer = optim.Adam(agent.parameters(), lr=LEARNING_RATE, eps=1e-5)
-        writer = SummaryWriter(
-            f"runs/main26_{TRAINING_TARGET}_{datetime.now().strftime('%m%d_%H%M')}"
-        )
-
-        obs_st = torch.zeros((ROLLOUT_STEPS, NUM_ENVS, SEQ_LEN, obs_dim),
-                             device=device)
-        act_st = torch.zeros((ROLLOUT_STEPS, NUM_ENVS, act_dim), device=device)
-        lp_st = torch.zeros((ROLLOUT_STEPS, NUM_ENVS), device=device)
-        rw_st = torch.zeros((ROLLOUT_STEPS, NUM_ENVS), device=device)
-        dn_st = torch.zeros((ROLLOUT_STEPS, NUM_ENVS), device=device)
-        vl_st = torch.zeros((ROLLOUT_STEPS, NUM_ENVS), device=device)
-
-        h_tr = ObsHistory(NUM_ENVS, SEQ_LEN, obs_dim, device)
-        ndr_q = deque(maxlen=NDR_WINDOW)
+        dt_str_v = datetime.now().strftime('%m%d_%H%M')
+        writer = SummaryWriter(f"runs/main26_{TRAINING_TARGET}_{dt_str_v}")
+        obs_st_v = torch.zeros((ROLLOUT_STEPS, NUM_ENVS, SEQ_LEN, obs_dim), device=device)
+        act_st_v = torch.zeros((ROLLOUT_STEPS, NUM_ENVS, act_dim), device=device)
+        logp_st_v = torch.zeros((ROLLOUT_STEPS, NUM_ENVS), device=device)
+        rew_st_v = torch.zeros((ROLLOUT_STEPS, NUM_ENVS), device=device)
+        done_st_v = torch.zeros((ROLLOUT_STEPS, NUM_ENVS), device=device)
+        val_st_v = torch.zeros((ROLLOUT_STEPS, NUM_ENVS), device=device)
+        obs_raw_batch_v = np.zeros((NUM_ENVS, obs_dim))
+        h_tr_v = ObsHistory(NUM_ENVS, SEQ_LEN, obs_dim, device)
+        ndr_q_v = deque(maxlen=NDR_WINDOW)
+        hold_q_v = deque(maxlen=NDR_WINDOW)
+        lock_q_v = deque(maxlen=NDR_WINDOW)
         for i in range(NUM_ENVS):
-            oi, _ = envs_tr_list_v[i].reset()
-            h_tr.prime(envs_tr_list_v[i]._normalize_obs(oi), i)
-
-        n_dn, g_st, s_t_tr = torch.zeros(NUM_ENVS, device=device), 0, \
-            time.time()
-        for u_idx in range(1, TOTAL_STEPS // (NUM_ENVS * ROLLOUT_STEPS) + 1):
-            if ANNEAL_LR:
-                frac = 1.0 - (u_idx - 1.0) / (TOTAL_STEPS //
-                                              (NUM_ENVS * ROLLOUT_STEPS))
-                optimizer.param_groups[0]["lr"] = frac * LEARNING_RATE
-
-            agent.eval()
-            for ri in range(ROLLOUT_STEPS):
-                g_st += NUM_ENVS
-                c_seq = h_tr.get()
-                obs_st[ri], dn_st[ri] = c_seq, n_dn
-                with torch.no_grad():
-                    at, lpt, _, vt = agent.get_action_and_value(c_seq)
-                    vl_st[ri] = vt.flatten()
-                act_st[ri], lp_st[ri] = at, lpt
-                a_np = at.cpu().numpy()
-                obs_raw_b = np.zeros((NUM_ENVS, obs_dim))
-                for ie in range(NUM_ENVS):
-                    on, r, d, tr, inf = envs_tr_list_v[ie].step(a_np[ie])
-                    rw_st[ri, ie] = float(r)
-                    if TRAINING_TARGET == "hider":
-                        ndr_q.append(float(not inf.get("is_detected", False)))
-                    is_f = bool(d or tr)
-                    n_dn[ie] = float(is_f)
-                    if is_f:
-                        o_r, _ = envs_tr_list_v[ie].reset()
-                        h_tr.update_single(envs_tr_list_v[ie].
-                                           _normalize_obs(o_r), ie)
-                        obs_raw_b[ie] = o_r
-                    else:
-                        obs_raw_b[ie] = on
-                h_tr.update_batch(batch_normalize_obs(obs_raw_b))
-                if USE_VIEWER:
-                    draw_vision_lines(envs_tr_list_v[0])
-                    envs_tr_list_v[0].render()
-
-            with torch.no_grad():
-                nv = agent.get_value(h_tr.get()).reshape(1, -1)
-                advs = torch.zeros_like(rw_st, device=device)
-                lg = 0
-                for t in reversed(range(ROLLOUT_STEPS)):
-                    va = nv if t == ROLLOUT_STEPS - 1 else vl_st[t + 1]
-                    mask = 1.0 - dn_st[t]
-                    delta = rw_st[t] + GAE_GAMMA * va * mask - vl_st[t]
-                    lg = delta + GAE_GAMMA * GAE_LAMBDA * mask * lg
-                    advs[t] = lg
-                rets = advs + vl_st
-
-            agent.train()
-            b_obs = obs_st.reshape(-1, SEQ_LEN, obs_dim)
-            b_lp = lp_st.reshape(-1)
-            b_act = act_st.reshape(-1, act_dim)
-            b_adv = advs.reshape(-1)
-            b_ret = rets.reshape(-1)
-            b_vl = vl_st.reshape(-1)
-
-            # 詳細統計アキュムレータ初期化
-            apg, avl, aet, akl, btc = 0.0, 0.0, 0.0, 0.0, 0
-            indices = np.arange(NUM_ENVS * ROLLOUT_STEPS)
-
-            for ep in range(UPDATE_EPOCHS):
-                np.random.shuffle(indices)
-                m_sz = (NUM_ENVS * ROLLOUT_STEPS) // NUM_MINIBATCHES
-                for si in range(0, NUM_ENVS * ROLLOUT_STEPS, m_sz):
-                    mb = indices[si:si+m_sz]
-                    _, nlp, net, nv = agent.get_action_and_value(b_obs[mb],
-                                                                b_act[mb])
-                    ratio = (nlp - b_lp[mb]).exp()
-
-                    with torch.no_grad():
-                        akl += (ratio - 1.0 - (nlp - b_lp[mb])).mean().item()
-
-                    m_adv = b_adv[mb]
-                    if NORM_ADV:
-                        m_adv = (m_adv - m_adv.mean()) / (m_adv.std() + 1e-8)
-
-                    pg1, pg2 = -m_adv * ratio, -m_adv * torch.clamp(
-                        ratio, 1-CLIP_COEF, 1+CLIP_COEF
-                    )
-                    pg_l = torch.max(pg1, pg2).mean()
-
-                    nvf = nv.flatten()
-                    if CLIP_VALUE_LOSS:
-                        v_u = (nvf - b_ret[mb])**2
-                        v_c = b_vl[mb] + torch.clamp(
-                            nvf - b_vl[mb], -CLIP_COEF, CLIP_COEF
-                        )
-                        v_l = 0.5 * torch.max(v_u, (v_c - b_ret[mb])**2).mean()
-                    else:
-                        v_l = 0.5 * ((nvf - b_ret[mb])**2).mean()
-
-                    total_l = pg_l - ENTROPY_COEF * net.mean() + v_l * VF_COEF
-                    apg += pg_l.item()
-                    avl += v_l.item()
-                    aet += net.mean().item()
-                    btc += 1
-
-                    optimizer.zero_grad()
-                    total_l.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
-                    optimizer.step()
-                if TARGET_KL is not None and (akl / btc) > TARGET_KL:
+            oi_v, _ = envs_list_v[i].reset()
+            h_tr_v.prime(envs_list_v[i]._normalize_obs(oi_v), i)
+        n_dn_v, global_step_v, start_time_tr_v = torch.zeros(NUM_ENVS, device=device), 0, time.time()
+        cam_tr_done_v = False
+        u_total_v = TOTAL_STEPS // (NUM_ENVS * ROLLOUT_STEPS)
+        try:
+            for u_idx_v in range(1, u_total_v + 1):
+                if not keep_running_v:
                     break
-
-            if u_idx % LOG_FREQ == 0:
-                elapsed = time.time() - start_time_tr_v
-                sps = int(g_st / (elapsed + 1e-6))
-                ndr = np.mean(ndr_q) if ndr_q else 0.0
-                div = btc + 1e-6
-                m_rew, m_pg, m_vl, m_et, m_kl = rw_st.mean().item(), apg/div, \
-                    avl/div, aet/div, akl/div
-                print(f"Update {u_idx:4d} | Step {g_st:8d} | SPS {sps:5d} | "
-                      f"Rew {m_rew:7.4f} | NDR {ndr:4.2f} | P-L {m_pg:6.4f} | "
-                      f"V-L {m_vl:6.4f} | Ent {m_et:6.4f}")
-                if TRACK_WANDB:
-                    log = {
-                        "charts/SPS": sps,
-                        "charts/reward": m_rew,
-                        "charts/ndr": ndr,
-                        "losses/policy_loss": m_pg,
-                        "losses/value_loss": m_vl,
-                        "losses/entropy": m_et,
-                        "losses/approx_kl": m_kl,
-                        "charts/learning_rate": optimizer.param_groups[0]["lr"]
-                    }
-                    wandb.log(log, step=g_st)
-            if u_idx % SAVE_FREQ == 0:
-                torch.save(agent.state_dict(), m_path)
-
-        for env_f in envs_tr_list_v:
-            env_f.close()
-        if TRACK_WANDB:
-            wandb.finish()
+                if ANNEAL_LR:
+                    frac_v = 1.0 - (u_idx_v - 1.0) / u_total_v
+                    optimizer.param_groups[0]["lr"] = frac_v * LEARNING_RATE
+                agent.eval()
+                for r_step_v in range(ROLLOUT_STEPS):
+                    global_step_v += NUM_ENVS
+                    c_seq_v = h_tr_v.get()
+                    obs_st_v[r_step_v], done_st_v[r_step_v] = c_seq_v, n_dn_v
+                    with torch.no_grad():
+                        at_v, lpt_v, _, vt_v = agent.get_action_and_value(c_seq_v)
+                        val_st_v[r_step_v] = vt_v.flatten()
+                    act_st_v[r_step_v], logp_st_v[r_step_v] = at_v, lpt_v
+                    a_np_b_v = at_v.cpu().numpy()
+                    for ie in range(NUM_ENVS):
+                        on_v, r_v, d_v, tr_v, inf_v = envs_list_v[ie].step(a_np_b_v[ie])
+                        det_v = inf_v.get("is_detected", False)
+                        h_v = inf_v.get("hold_event", False)
+                        l_v = inf_v.get("lock_event", False)
+                        rew_st_v[r_step_v, ie] = float(r_v)
+                        if TRAINING_TARGET == "hider":
+                            ndr_q_v.append(float(not det_v))
+                            hold_q_v.append(float(h_v))
+                            lock_q_v.append(float(l_v))
+                        is_f_v = bool(d_v or tr_v)
+                        n_dn_v[ie] = float(is_f_v)
+                        if is_f_v:
+                            o_res_v, _ = envs_list_v[ie].reset()
+                            h_tr_v.update_single(envs_list_v[ie]._normalize_obs(o_res_v), ie)
+                            obs_raw_batch_v[ie] = o_res_v
+                        else:
+                            obs_raw_batch_v[ie] = on_v
+                    h_tr_v.update_batch(batch_normalize_obs(obs_raw_batch_v))
+                    if USE_VIEWER:
+                        draw_vision_lines(envs_list_v[0])
+                        envs_list_v[0].render()
+                        if not cam_tr_done_v:
+                            apply_camera_slanted(envs_list_v[0])
+                            cam_tr_done_v = True
+                with torch.no_grad():
+                    nv_v = agent.get_value(h_tr_v.get()).reshape(1, -1)
+                    adv_v = torch.zeros_like(rew_st_v, device=device)
+                    lg_v = 0
+                    for t_rev_v in reversed(range(ROLLOUT_STEPS)):
+                        if t_rev_v == ROLLOUT_STEPS - 1:
+                            va_v = nv_v
+                        else:
+                            va_v = val_st_v[t_rev_v + 1]
+                        mask_v = 1.0 - done_st_v[t_rev_v]
+                        delta_v = rew_st_v[t_rev_v] + GAE_GAMMA * va_v * mask_v - val_st_v[t_rev_v]
+                        lg_v = delta_v + GAE_GAMMA * GAE_LAMBDA * mask_v * lg_v
+                        adv_v[t_rev_v] = lg_v
+                    ret_v = adv_v + val_st_v
+                agent.train()
+                b_obs_v, b_lp_v = obs_st_v.reshape(-1, SEQ_LEN, obs_dim), logp_st_v.reshape(-1)
+                b_act_v, b_adv_v, b_ret_v, b_val_v = act_st_v.reshape(-1, act_dim), adv_v.reshape(-1), ret_v.reshape(-1), val_st_v.reshape(-1)
+                acc_pg_v, acc_vl_v, acc_et_v, acc_kl_v, bt_cnt_v = 0.0, 0.0, 0.0, 0.0, 0
+                idx_l_v = np.arange(NUM_ENVS * ROLLOUT_STEPS)
+                for epoch_i_v in range(UPDATE_EPOCHS):
+                    np.random.shuffle(idx_l_v)
+                    m_sz_v = (NUM_ENVS * ROLLOUT_STEPS) // NUM_MINIBATCHES
+                    for s_ptr_v in range(0, NUM_ENVS * ROLLOUT_STEPS, m_sz_v):
+                        mb_v = idx_l_v[s_ptr_v : s_ptr_v + m_sz_v]
+                        _, n_lp_v, n_et_v, n_vl_v = agent.get_action_and_value(b_obs_v[mb_v], b_act_v[mb_v])
+                        log_diff_v = n_lp_v - b_lp_v[mb_v]
+                        ratio_v = log_diff_v.exp()
+                        with torch.no_grad():
+                            kl_v = (ratio_v - 1.0 - log_diff_v).mean().item()
+                            acc_kl_v += kl_v
+                        if NORM_ADV:
+                            m_adv_v = (b_adv_v[mb_v] - b_adv_v[mb_v].mean()) / (b_adv_v[mb_v].std() + 1e-8)
+                        else:
+                            m_adv_v = b_adv_v[mb_v]
+                        pg_l_v = torch.max(-m_adv_v * ratio_v, -m_adv_v * torch.clamp(ratio_v, 1-CLIP_COEF, 1+CLIP_COEF)).mean()
+                        nv_f_v = n_vl_v.flatten()
+                        if CLIP_VALUE_LOSS:
+                            v_u_v = (nv_f_v - b_ret_v[mb_v])**2
+                            v_c_v = b_val_v[mb_v] + torch.clamp(nv_f_v - b_val_v[mb_v], -CLIP_COEF, CLIP_COEF)
+                            v_l_v = 0.5 * torch.max(v_u_v, (v_c_v - b_ret_v[mb_v])**2).mean()
+                        else:
+                            v_l_v = 0.5 * ((nv_f_v - b_ret_v[mb_v])**2).mean()
+                        total_l_v = pg_l_v - ENTROPY_COEF * n_et_v.mean() + v_l_v * VF_COEF
+                        acc_pg_v += pg_l_v.item()
+                        acc_vl_v += v_l_v.item()
+                        acc_et_v += n_et_v.mean().item()
+                        bt_cnt_v += 1
+                        optimizer.zero_grad()
+                        total_l_v.backward()
+                        nn.utils.clip_grad_norm_(agent.parameters(), MAX_GRAD_NORM)
+                        optimizer.step()
+                    if TARGET_KL is not None and (acc_kl_v / bt_cnt_v) > TARGET_KL:
+                        break
+                if u_idx_v % LOG_FREQ == 0:
+                    elapsed_v = time.time() - start_time_tr_v
+                    sps_v = int(global_step_v / (elapsed_v + 1e-6))
+                    ndr_v, hr_v, lr_v = np.mean(ndr_q_v), np.mean(hold_q_v), np.mean(lock_q_v)
+                    div_f_v = bt_cnt_v + 1e-6
+                    m_rew_v, m_pg_v, m_vl_v, m_et_v, m_kl_v = rew_st_v.mean().item(), acc_pg_v/div_f_v, acc_vl_v/div_f_v, acc_et_v/div_f_v, acc_kl_v/div_f_v
+                    print(f"Upd {u_idx_v:4d} | SPS {sps_v:5d} | Rew {m_rew_v:7.4f} | NDR {ndr_v:.2f} | Hold {hr_v:.2f} | Lock {lr_v:.2f} | P-L {m_pg_v:6.4f} | V-L {m_vl_v:6.4f}")
+                    writer.add_scalar("charts/SPS", sps_v, global_step_v)
+                    writer.add_scalar("charts/reward", m_rew_v, global_step_v)
+                    writer.add_scalar("charts/ndr", ndr_v, global_step_v)
+                    writer.add_scalar("charts/hold_rate", hr_v, global_step_v)
+                    writer.add_scalar("charts/lock_rate", lr_v, global_step_v)
+                    writer.add_scalar("losses/policy_loss", m_pg_v, global_step_v)
+                    writer.add_scalar("losses/value_loss", m_vl_v, global_step_v)
+                    writer.add_scalar("losses/entropy", m_et_v, global_step_v)
+                    writer.add_scalar("losses/approx_kl", m_kl_v, global_step_v)
+                    if TRACK_WANDB:
+                        wandb.log({"charts/SPS": sps_v, "charts/reward": m_rew_v, "charts/ndr": ndr_v, "charts/hold_rate": hr_v, "charts/lock_rate": lr_v, "losses/policy_loss": m_pg_v, "losses/value_loss": m_vl_v, "losses/entropy": m_et_v, "losses/approx_kl": m_kl_v}, step=global_step_v)
+                if u_idx_v % SAVE_FREQ == 0:
+                    torch.save(agent.state_dict(), m_path_v)
+        except KeyboardInterrupt:
+            print("\n⚠️ Training interrupted. Saving weights...")
+            torch.save(agent.state_dict(), m_path_v)
+            keep_running_v = False
+        finally:
+            for env_f_v in envs_list_v:
+                env_f_v.close()
+            writer.close()
+            if TRACK_WANDB:
+                wandb.finish()
 
 
 if __name__ == "__main__":

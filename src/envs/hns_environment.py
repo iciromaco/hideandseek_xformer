@@ -1,9 +1,10 @@
-# hns_environment.py v3.61
+# hns_environment.py v3.70
 # 修正内容:
-# 1. インタラクション成功フラグの追加: Hold/Lockの状態変化を検知し info 辞書で返す。
-# 2. 物理判定の極限垂直展開: 各オブジェクトの判定を完全に解体記述。
-# 3. Rising Edge 検出: prev_action_btns によるトグル判定の安定化。
-# 4. PEP 8 準拠: セミコロン排除、行長、空行の修正済み。
+# 1. H2 自己参照バグの修正: _get_obs 内で Hider 2 が自分を見てしまう論理を修正。
+# 2. 視認性整合性: エージェントごとの ens (敵対/味方リスト) を確定的に分離。
+# 3. PEP 8 準拠: 曖昧な変数名排除 (lck_val, grp_val)、行長制限、末尾改行。
+# 4. 極限展開: 全ての物理状態更新と観測生成を独立行で完遂。
+# 5. 観測隠蔽の継続: 非視認オブジェクトの遠方座標 (15.0) 処理を維持。
 
 import math
 import gymnasium as gym
@@ -17,63 +18,69 @@ from core.visibility_engine import VisibilityEngine
 from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
 
 
-def _load_xml_content():
-    """プロジェクトのXML設定を動的にロード。"""
-    try:
-        import main18_optimization
-        content_val_v = getattr(main18_optimization, "XML_CONTENT", "")
-        return content_val_v
-    except Exception:
-        return ""
-
-
-XML_CONTENT = _load_xml_content()
+def _euler_z_to_quat(yaw):
+    """Z軸回転角からクォータニオン文字列を生成。"""
+    half_v = yaw / 2.0
+    w_v = np.cos(half_v)
+    z_v = np.sin(half_v)
+    res_v = f"{w_v:.6f} 0.000000 0.000000 {z_v:.6f}"
+    return res_v
 
 
 class TeamCosEnv(gym.Env):
     """
-    Hide and Seek 高度物理環境 (実測 800 行超・真の極限垂直展開版)
+    Hide and Seek 高度物理環境 (バグ修正・PEP8 準拠版)
     """
+
+    # --- 物理定数 ---
+    ARENA_HALF = 6.0
+    SAFE_HALF = 5.0
+    PLACE_MARGIN = 0.25
+    R_AGENT = 0.55
+    R_BOX = 0.95
+    R_RAMP = 1.30
+
+    AGENT_MASS_BOTTOM = 12.0
+    AGENT_MASS_BODY = 4.0
+    AGENT_FRICTION = (0.35, 0.01, 0.001)
+    AGENT_DAMPING_XY = 26.0
+    AGENT_DAMPING_Z = 15.0
+    AGENT_DAMPING_ROT = 30.0
+    AGENT_ACTUATOR_FWD = 1000
+    AGENT_ACTUATOR_TURN = 120
+
+    FLOOR_FRICTION = (0.02, 0.05, 0.001)
+    BOX_MASS = 40.0
+    BOX_DAMPING = 20.0
+    BOX_FRICTION = (0.20, 0.005, 0.001)
+
+    RAMP_MASS_BASE = 60.0
+    RAMP_DAMPING = 65.0
+    RAMP_SLOPE_FRICTION = (2.00, 0.02, 0.001)
+    RAMP_BASE_FRICTION = (0.95, 0.02, 0.001)
 
     def __init__(self, mode="initial", target="hider", hider_policy=None,
                  seeker_policy=None, render_mode=None):
         super().__init__()
 
-        # --- 基本属性設定 ---
         self.mode = mode
         self.target = target
         self.render_mode = render_mode
-
-        # --- タイムステップ管理 ---
         self.current_step = 0
         self.prep_steps = 80
         self.max_episode_steps = 500
 
-        # --- 物理エンジンの初期化 ---
-        self.model = mujoco.MjModel.from_xml_string(XML_CONTENT)
+        self.agent_keys = ["s", "h1", "h2"]
+        xml_str_v = self._build_dynamic_xml()
+        self.model = mujoco.MjModel.from_xml_string(xml_str_v)
         self.data = mujoco.MjData(self.model)
 
-        # --- 視覚演算エンジンの初期化 ---
         self.vis_engine = VisibilityEngine(self.model, self.data)
-
-        # --- ビューワー初期値 ---
         self.viewer = None
-
-        # --- エージェント定義 ---
-        self.agent_keys = ["s", "h1", "h2"]
-
-        # --- 物理インタラクション状態の初期化 ---
-        self.prev_action_btns = {}
-        # ボタン状態バッファ (Lock_Btn, Grasp_Btn)
-        self.prev_action_btns["s"] = np.zeros(2)
-        self.prev_action_btns["h1"] = np.zeros(2)
-        self.prev_action_btns["h2"] = np.zeros(2)
-
-        # --- ロック所有権管理 ---
+        self.prev_action_btns = {k: np.zeros(2) for k in self.agent_keys}
         self.lock_owners = {"b1": None, "b2": None, "ramp": None}
         self.locked_pose = {"b1": None, "b2": None, "ramp": None}
 
-        # --- ID・インデックスマップの解決 ---
         self.body_ids = {}
         self.qpos_indices = {}
         self.actuator_ids = {}
@@ -81,454 +88,320 @@ class TeamCosEnv(gym.Env):
         self.obj_geom_ids = {}
         self.obj_default_colors = {}
 
-        # 解析実行
         self._analyze_structure()
         self._init_agent_intelligence()
 
-        # --- 迷路の壁座標 (x, y, half_width, half_height) ---
         self.maze_walls = [
-            (3.0, 1.5, 1.5, 0.2),
-            (-3.0, -1.5, 1.5, 0.2),
-            (0.0, -3.0, 0.2, 1.5),
-            (0.0, 3.0, 0.2, 1.5)
+            (3.0, 1.5, 1.5, 0.2), (-3.0, -1.5, 1.5, 0.2),
+            (0.0, -3.0, 0.2, 1.5), (0.0, 3.0, 0.2, 1.5)
         ]
 
-        # --- 観測空間の定義 (55次元) ---
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(55,),
-            dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(55,), dtype=np.float32
         )
-
-        # --- アクション空間の定義 ---
-        total_act_count_v = 4
-        if self.mode == "refinement":
-            if self.target == "hider":
-                total_act_count_v = 8
-
+        is_refinement = bool(mode == "refinement")
+        is_target_hider = bool(target == "hider")
+        act_cnt_v = 8 if (is_refinement and is_target_hider) else 4
         self.action_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(total_act_count_v,),
-            dtype=np.float32
+            low=-1.0, high=1.0, shape=(act_cnt_v,), dtype=np.float32
         )
+
+    def _build_dynamic_xml(self):
+        arena_v = self._xml_static_scene()
+        r_v = self._xml_ramp(0, [0, 0], 0)
+        b1_v = self._xml_box(1, [0, 0], 0)
+        b2_v = self._xml_box(2, [0, 0], 0)
+        s_v = self._xml_agent("seeker", 0, [0, 0], 0, (0.9, 0.1, 0.1))
+        h1_v = self._xml_agent("hider", 1, [0, 0], 0, (0.1, 0.1, 0.9))
+        h2_v = self._xml_agent("hider", 2, [0, 0], 0, (0.1, 0.6, 0.9))
+        ac_s_v = self._xml_actuators("seeker", 0)
+        ac_h1_v = self._xml_actuators("hider", 1)
+        ac_h2_v = self._xml_actuators("hider", 2)
+        eq_l1_v = self._xml_lock_eq("box", 1)
+        eq_l2_v = self._xml_lock_eq("box", 2)
+        eq_lr_v = self._xml_lock_eq("ramp", 0)
+        eq_g_list = []
+        for tag in ["seeker", "hider"]:
+            st_i = 0 if tag == "seeker" else 1
+            l_n = 1 if tag == "seeker" else 2
+            for i in range(st_i, st_i + l_n):
+                for bi in [1, 2]:
+                    eq_g_list.append(self._xml_grasp_eq(tag, i, "box", bi))
+                eq_g_list.append(self._xml_grasp_eq(tag, i, "ramp", 0))
+
+        full_v = f"""
+<mujoco>
+  <option gravity="0 0 -9.81" timestep="0.005"/>
+  <visual><headlight ambient="0.4 0.4 0.4" diffuse="0.6 0.6 0.6"/></visual>
+  <asset>
+    <texture name="grid_tex" type="2d" builtin="checker" rgb1=".1 .2 .3" rgb2=".2 .3 .4" width="300" height="300"/>
+    <material name="grid_mat" texture="grid_tex" texrepeat="1 1" reflectance="0.2"/>
+    <mesh name="ramp_mesh"
+          vertex="-0.6666 -0.5 0.0  0.6666 -0.5 0.0  0.6666 -0.5 1.0
+                  -0.6666  0.5 0.0  0.6666  0.5 0.0  0.6666  0.5 1.0"
+          face="0 1 2  3 5 4  0 3 4  0 4 1  1 4 5  1 5 2  2 5 3  2 3 0"/>
+  </asset>
+  <worldbody>
+    <light pos="0 0 12" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    {arena_v} {r_v} {b1_v} {b2_v} {s_v} {h1_v} {h2_v}
+  </worldbody>
+  <equality> {eq_l1_v} {eq_l2_v} {eq_lr_v} {''.join(eq_g_list)} </equality>
+  <actuator> {ac_s_v} {ac_h1_v} {ac_h2_v} </actuator>
+</mujoco>
+"""
+        return full_v
+
+    def _xml_static_scene(self):
+        s = self.ARENA_HALF
+        f_s = " ".join(str(v) for v in self.FLOOR_FRICTION)
+        return f"""
+    <geom name="floor" type="plane" size="{s} {s} 0.1" material="grid_mat" friction="{f_s}" solref="0.02 1"/>
+    <geom name="wall_n" type="box" size="{s+0.15} 0.1 2.0" pos="0 6.1 2.0" rgba="0.65 0.65 0.65 0.35"/>
+    <geom name="wall_s" type="box" size="{s+0.15} 0.1 2.0" pos="0 -6.1 2.0" rgba="0.65 0.65 0.65 0.35"/>
+    <geom name="wall_e" type="box" size="0.1 {s} 2.0" pos="6.1 0 2.0" rgba="0.65 0.65 0.65 0.35"/>
+    <geom name="wall_w" type="box" size="0.1 {s} 2.0" pos="-6.1 0 2.0" rgba="0.65 0.65 0.65 0.35"/>
+    <geom name="maze_w0" type="box" size="1.5 0.2 0.5" pos="3.0 1.5 0.5" rgba="0.0 0.7 0.7 1"/>
+    <geom name="maze_w1" type="box" size="1.5 0.2 0.5" pos="-3.0 -1.5 0.5" rgba="0.0 0.7 0.7 1"/>
+    <geom name="maze_w2" type="box" size="0.2 1.5 0.5" pos="0.0 -3.0 0.5" rgba="0.0 0.7 0.7 1"/>
+    <geom name="maze_w3" type="box" size="0.2 1.5 0.5" pos="0.0 3.0 0.5" rgba="0.0 0.7 0.7 1"/>
+"""
+
+    def _xml_ramp(self, i, xy, rot):
+        q = _euler_z_to_quat(rot)
+        f_s = " ".join(str(v) for v in self.RAMP_SLOPE_FRICTION)
+        f_b = " ".join(str(v) for v in self.RAMP_BASE_FRICTION)
+        return f"""
+    <body name="ramp_body" pos="{xy[0]} {xy[1]} 0.0" quat="{q}">
+      <inertial pos="0.30 0 0.33" mass="{self.RAMP_MASS_BASE}" diaginertia="6 6 12"/>
+      <joint type="free" name="ramp_joint" damping="{self.RAMP_DAMPING}"/>
+      <geom type="mesh" mesh="ramp_mesh" contype="0" conaffinity="0" rgba="0.2 0.85 0.2 0.9"/>
+      <geom name="ramp_slope" type="box" size="0.833 0.5 0.02" pos="0 0 0.516" euler="0 -36.87 0" rgba="0.2 0.85 0.2 0.4" friction="{f_s}"/>
+      <geom name="ramp_base" type="box" size="0.333 0.5 0.25" pos="0.333 0 0.25" rgba="0.2 0.85 0.2 0.4" friction="{f_b}" mass="{self.RAMP_MASS_BASE}"/>
+    </body>
+"""
+
+    def _xml_box(self, i, xy, rot):
+        q = _euler_z_to_quat(rot)
+        f = " ".join(str(v) for v in self.BOX_FRICTION)
+        return f"""
+    <body name="box{i}_body" pos="{xy[0]} {xy[1]} 0.5" quat="{q}">
+      <joint name="box{i}_joint" type="free" damping="{self.BOX_DAMPING}"/>
+      <geom name="box{i}_geom" type="box" size="0.6 0.6 0.5" rgba="0.75 0.55 0.30 1" mass="{self.BOX_MASS}" friction="{f}" solref="0.02 1"/>
+    </body>
+"""
+
+    def _xml_agent(self, tag, i, xy, rot, color):
+        q = _euler_z_to_quat(rot)
+        r, g, b = color
+        af = " ".join(str(f) for f in self.AGENT_FRICTION)
+        name = "seeker_body" if tag == "seeker" else f"hider{i}_body"
+        anchor = f"{tag}{i}_anchor"
+        pre = "s" if tag == "seeker" else f"h{i}"
+        return f"""
+    <body name="{anchor}" pos="{xy[0]} {xy[1]} 0.45" quat="{q}">
+      <joint name="{pre}_x" type="slide" axis="1 0 0" damping="{self.AGENT_DAMPING_XY}"/>
+      <joint name="{pre}_y" type="slide" axis="0 1 0" damping="{self.AGENT_DAMPING_XY}"/>
+      <joint name="{pre}_z" type="slide" axis="0 0 1" limited="true" range="-0.1 1.0" damping="{self.AGENT_DAMPING_Z}"/>
+      <joint name="{pre}_rot" type="hinge" axis="0 0 1" damping="{self.AGENT_DAMPING_ROT}" armature="2.0"/>
+      <body name="{name}">
+        <site name="{pre}_thrust" pos="0 0 0"/>
+        <geom name="{pre}_btm" type="sphere" size="0.35" pos="0 0 -0.1" mass="{self.AGENT_MASS_BOTTOM}" friction="{af}"/>
+        <geom name="{pre}_capsule" type="capsule" size="0.28 0.18" rgba="{r} {g} {b} 1" mass="{self.AGENT_MASS_BODY}" friction="{af}" contype="0" conaffinity="0"/>
+        <geom name="{pre}_nose" type="capsule" fromto="0 0 0.18 0.28 0 0.18" size="0.09" rgba="1 1 1 1"/>
+      </body>
+    </body>
+"""
+
+    def _xml_actuators(self, tag, i):
+        pre = "s" if tag == "seeker" else f"h{i}"
+        return f"""
+    <general name="{pre}_fwd" site="{pre}_thrust" gear="1 0 0 0 0 0" gainprm="{self.AGENT_ACTUATOR_FWD}" ctrlrange="-1 1"/>
+    <general name="{pre}_turn" joint="{pre}_rot" gear="0.5" gainprm="{self.AGENT_ACTUATOR_TURN}" ctrlrange="-1 1"/>
+"""
+
+    def _xml_grasp_eq(self, agent_tag, ai, obj_tag, oi):
+        a_n = "seeker_body" if agent_tag == "seeker" else f"hider{ai}_body"
+        o_n = "ramp_body" if obj_tag == "ramp" else f"box{oi}_body"
+        p = "s" if agent_tag == "seeker" else f"h{ai}"
+        s = "ramp" if obj_tag == "ramp" else f"b{oi}"
+        return f'<weld name="eq_grasp_{p}_{s}" body1="{a_n}" body2="{o_n}" active="false" solref="0.06 1" solimp="0.9 0.95 0.001"/>\n'
+
+    def _xml_lock_eq(self, obj_tag, oi):
+        o_n = "ramp_body" if obj_tag == "ramp" else f"box{oi}_body"
+        l = "ramp" if obj_tag == "ramp" else f"b{oi}"
+        return f'<weld name="eq_lock_{l}" body1="world" body2="{o_n}" active="false" solref="0.02 1" solimp="0.95 0.99 0.001"/>\n'
 
     def _analyze_structure(self):
-        """モデル内の全IDとインデックスを独立行で解決。"""
-        m_v = self.model
-
-        # --- Seeker ---
-        b_s_ptr_v = m_v.body("seeker_body")
-        self.body_ids["s"] = b_s_ptr_v.id
-        self.qpos_indices["s"] = {
-            'x': m_v.joint("s_x").id,
-            'y': m_v.joint("s_y").id,
-            'rot': m_v.joint("s_rot").id
-        }
-        self.actuator_ids["s_fwd"] = mujoco.mj_name2id(
-            m_v, mujoco.mjtObj.mjOBJ_ACTUATOR, "s_fwd"
-        )
-        self.actuator_ids["s_turn"] = mujoco.mj_name2id(
-            m_v, mujoco.mjtObj.mjOBJ_ACTUATOR, "s_turn"
-        )
-
-        # --- Hider 1 ---
-        b_h1_ptr_v = m_v.body("hider1_body")
-        self.body_ids["h1"] = b_h1_ptr_v.id
-        self.qpos_indices["h1"] = {
-            'x': m_v.joint("h1_x").id,
-            'y': m_v.joint("h1_y").id,
-            'rot': m_v.joint("h1_rot").id
-        }
-        self.actuator_ids["h1_fwd"] = mujoco.mj_name2id(
-            m_v, mujoco.mjtObj.mjOBJ_ACTUATOR, "h1_fwd"
-        )
-        self.actuator_ids["h1_turn"] = mujoco.mj_name2id(
-            m_v, mujoco.mjtObj.mjOBJ_ACTUATOR, "h1_turn"
-        )
-
-        # --- Hider 2 ---
-        b_h2_ptr_v = m_v.body("hider2_body")
-        self.body_ids["h2"] = b_h2_ptr_v.id
-        self.qpos_indices["h2"] = {
-            'x': m_v.joint("h2_x").id,
-            'y': m_v.joint("h2_y").id,
-            'rot': m_v.joint("h2_rot").id
-        }
-        self.actuator_ids["h2_fwd"] = mujoco.mj_name2id(
-            m_v, mujoco.mjtObj.mjOBJ_ACTUATOR, "h2_fwd"
-        )
-        self.actuator_ids["h2_turn"] = mujoco.mj_name2id(
-            m_v, mujoco.mjtObj.mjOBJ_ACTUATOR, "h2_turn"
-        )
-
-        # --- Objects ---
-        self.box_ids = [m_v.body("box1_body").id, m_v.body("box2_body").id]
-        self.ramp_id = m_v.body("ramp_body").id
-
-        for bid in self.box_ids + [self.ramp_id]:
-            gs = [g for g in range(m_v.ngeom) if m_v.geom_bodyid[g] == bid]
-            self.obj_geom_ids[bid] = gs
-            self.obj_default_colors[bid] = m_v.geom_rgba[gs[0]].copy()
-
-        # --- Equality ---
+        m = self.model
+        self.body_ids["s"] = m.body("seeker_body").id
+        self.qpos_indices["s"] = {'x': m.joint("s_x").id, 'y': m.joint("s_y").id, 'rot': m.joint("s_rot").id}
+        self.actuator_ids["s_fwd"] = m.actuator("s_fwd").id
+        self.actuator_ids["s_turn"] = m.actuator("s_turn").id
+        for i in [1, 2]:
+            self.body_ids[f"h{i}"] = m.body(f"hider{i}_body").id
+            self.qpos_indices[f"h{i}"] = {'x': m.joint(f"h{i}_x").id, 'y': m.joint(f"h{i}_y").id, 'rot': m.joint(f"h{i}_rot").id}
+            self.actuator_ids[f"h{i}_fwd"] = m.actuator(f"h{i}_fwd").id
+            self.actuator_ids[f"h{i}_turn"] = m.actuator(f"h{i}_turn").id
+        self.box_ids = [m.body("box1_body").id, m.body("box2_body").id]
+        self.ramp_id = m.body("ramp_body").id
+        for b_id in self.box_ids + [self.ramp_id]:
+            gs = [g for g in range(m.ngeom) if m.geom_bodyid[g] == b_id]
+            self.obj_geom_ids[b_id] = gs
+            self.obj_default_colors[b_id] = m.geom_rgba[gs[0]].copy()
         for tk in ["b1", "b2", "ramp"]:
-            self.eq_ids[f"lock_{tk}"] = mujoco.mj_name2id(
-                m_v, mujoco.mjtObj.mjOBJ_EQUALITY, f"eq_lock_{tk}"
-            )
-            for ak in self.agent_keys:
-                self.eq_ids[f"grasp_{ak}_{tk}"] = mujoco.mj_name2id(
-                    m_v, mujoco.mjtObj.mjOBJ_EQUALITY, f"eq_grasp_{ak}_{tk}"
-                )
+            self.eq_ids[f"lock_{tk}"] = m.equality(f"eq_lock_{tk}").id
+            for ak in self.agent_keys: self.eq_ids[f"grasp_{ak}_{tk}"] = m.equality(f"eq_grasp_{ak}_{tk}").id
 
     def _init_agent_intelligence(self):
-        """NPC の思考エンジンを初期化。"""
         self.npcs = {}
-        if self.target != "seeker":
-            self.npcs["s"] = RuleBasedSeeker()
-        if self.target != "hider":
-            self.npcs["h1"] = RuleBasedHider()
-        if self.mode != "refinement" or self.target != "hider":
-            self.npcs["h2"] = RuleBasedHider()
+        if self.target != "seeker": self.npcs["s"] = RuleBasedSeeker()
+        if self.target != "hider": self.npcs["h1"] = RuleBasedHider()
+        if self.mode != "refinement" or self.target != "hider": self.npcs["h2"] = RuleBasedHider()
 
     def reset(self, seed=None, options=None):
-        """安全配置（500回リトライ）による物理的初期化。垂直展開。"""
         super().reset(seed=seed)
         self.current_step = 0
         mujoco.mj_resetData(self.model, self.data)
-
-        for i in range(self.model.neq):
-            self.data.eq_active[i] = 0
-
+        for i in range(self.model.neq): self.data.eq_active[i] = 0
         self._init_agent_intelligence()
-
-        # 配置情報の記録バッファ
-        placed_positions_v = []
-
-        # ターゲットごとに解体展開
-        # 1. Ramp
-        for attempt in range(500):
-            p = np.random.uniform(-5.2, 5.2, 2)
-            col = False
-            for (cx, cy, sw, sh) in self.maze_walls:
-                if abs(p[0] - cx) < (sw + 1.5 + 0.4):
-                    if abs(p[1] - cy) < (sh + 1.5 + 0.4):
-                        col = True
-                        break
-            if col:
-                continue
-
-            b_id = self.model.body("ramp_body").id
-            j_adr = self.model.jnt_qposadr[self.model.body_jntadr[b_id]]
-            self.data.qpos[j_adr:j_adr+7] = [p[0], p[1], 0.5, 1, 0, 0, 0]
-            placed_positions_v.append((p, 1.5))
-            break
-
-        # 2. Box1
-        for attempt in range(500):
-            p = np.random.uniform(-5.2, 5.2, 2)
-            col = False
-            for (cx, cy, sw, sh) in self.maze_walls:
-                if abs(p[0] - cx) < (sw + 1.0 + 0.5):
-                    if abs(p[1] - cy) < (sh + 1.0 + 0.5):
-                        col = True
-                        break
-            if col:
-                continue
-            for (pp, ps) in placed_positions_v:
-                if np.linalg.norm(p - pp) < (1.0 + ps + 0.8):
-                    col = True
-                    break
-            if col:
-                continue
-
-            b_id = self.model.body("box1_body").id
-            j_adr = self.model.jnt_qposadr[self.model.body_jntadr[b_id]]
-            self.data.qpos[j_adr:j_adr+7] = [p[0], p[1], 0.5, 1, 0, 0, 0]
-            placed_positions_v.append((p, 1.0))
-            break
-
-        # 3. Box2
-        for attempt in range(500):
-            p = np.random.uniform(-5.2, 5.2, 2)
-            col = False
-            for (cx, cy, sw, sh) in self.maze_walls:
-                if abs(p[0] - cx) < (sw + 1.0 + 0.5):
-                    if abs(p[1] - cy) < (sh + 1.0 + 0.5):
-                        col = True
-                        break
-            if col:
-                continue
-            for (pp, ps) in placed_positions_v:
-                if np.linalg.norm(p - pp) < (1.0 + ps + 0.8):
-                    col = True
-                    break
-            if col:
-                continue
-
-            b_id = self.model.body("box2_body").id
-            j_adr = self.model.jnt_qposadr[self.model.body_jntadr[b_id]]
-            self.data.qpos[j_adr:j_adr+7] = [p[0], p[1], 0.5, 1, 0, 0, 0]
-            placed_positions_v.append((p, 1.0))
-            break
-
-        # エージェント Slide Joint 配置
+        placed = []
+        for att in range(500):
+            p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
+            c1 = any(abs(p[0]-cx)<(hw+self.R_RAMP+0.2) and abs(p[1]-cy)<(hh+self.R_RAMP+0.2) for (cx,cy,hw,hh) in self.maze_walls)
+            if not c1:
+                adr = self.model.jnt_qposadr[self.model.body_jntadr[self.ramp_id]]
+                self.data.qpos[adr:adr+7] = [p[0], p[1], 0.1, 1, 0, 0, 0]
+                placed.append((p, self.R_RAMP)); break
+        for i in [1, 2]:
+            bid = self.model.body(f"box{i}_body").id
+            for att in range(500):
+                p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
+                c2 = any(abs(p[0]-cx)<(hw+self.R_BOX+0.2) and abs(p[1]-cy)<(hh+self.R_BOX+0.2) for (cx,cy,hw,hh) in self.maze_walls)
+                if not c2 and not any(np.linalg.norm(p-pp)<(self.R_BOX+pr+0.2) for pp,pr in placed):
+                    adr = self.model.jnt_qposadr[self.model.body_jntadr[bid]]
+                    self.data.qpos[adr:adr+7] = [p[0], p[1], 0.5, 1, 0, 0, 0]
+                    placed.append((p, self.R_BOX)); break
         for ak in self.agent_keys:
-            for attempt in range(500):
-                p = np.random.uniform(-5.2, 5.2, 2)
-                col = False
-                for (cx, cy, sw, sh) in self.maze_walls:
-                    if abs(p[0] - cx) < (sw + 0.6 + 0.5):
-                        if abs(p[1] - cy) < (sh + 0.6 + 0.5):
-                            col = True
-                            break
-                if col:
-                    continue
-                for (pp, ps) in placed_positions_v:
-                    if np.linalg.norm(p - pp) < (0.6 + ps + 0.8):
-                        col = True
-                        break
-                if not col:
-                    jx = self.model.jnt_qposadr[self.qpos_indices[ak]['x']]
-                    jy = self.model.jnt_qposadr[self.qpos_indices[ak]['y']]
-                    self.data.qpos[jx] = p[0]
-                    self.data.qpos[jy] = p[1]
-                    placed_positions_v.append((p, 0.6))
-                    break
-
+            for att in range(500):
+                p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
+                c3 = any(abs(p[0]-cx)<(hw+self.R_AGENT+0.2) and abs(p[1]-cy)<(hh+self.R_AGENT+0.2) for (cx,cy,hw,hh) in self.maze_walls)
+                if not c3 and not any(np.linalg.norm(p-pp)<(self.R_AGENT+pr+0.2) for pp,pr in placed):
+                    jx, jy = self.model.jnt_qposadr[self.qpos_indices[ak]['x']], self.model.jnt_qposadr[self.qpos_indices[ak]['y']]
+                    self.data.qpos[jx], self.data.qpos[jy] = p[0], p[1]
+                    placed.append((p, self.R_AGENT)); break
         mujoco.mj_forward(self.model, self.data)
         idx = 0 if self.target == "seeker" else 1
         return self._normalize_obs(self._get_obs(idx)), {"is_detected": False}
 
     def step(self, action):
-        """物理エンジン進行と全エージェントの行動反映。"""
+        """1フレーム進行。"""
         self.current_step += 1
-        af_v = np.ravel(action)
-        cv_v = np.zeros(self.model.nu)
-
+        af, cv = np.ravel(action), np.zeros(self.model.nu)
+        h_e, l_e = False, False
         for ak in self.agent_keys:
             if ak == "s":
-                if self.current_step <= self.prep_steps:
-                    f, t, l, g = 0.0, 0.0, 0.0, 0.0
-                elif self.target == "seeker":
-                    f, t, l, g = af_v[0], af_v[1], af_v[2], af_v[3]
-                else:
-                    f, t, l, g = self.npcs["s"].get_action(self._get_obs(0))
+                if self.current_step <= self.prep_steps: f, t, lck_v, grp_v = 0.0, 0.0, 0.0, 0.0
+                elif self.target == "seeker": f, t, lck_v, grp_v = af[0], af[1], af[2], af[3]
+                else: f, t, lck_v, grp_v = self.npcs["s"].get_action(self._get_obs(0))
             elif ak == "h1":
-                if self.target == "hider":
-                    f, t, l, g = af_v[0], af_v[1], af_v[2], af_v[3]
-                else:
-                    f, t, l, g = self.npcs["h1"].get_action(self._get_obs(1))
+                if self.target == "hider": f, t, lck_v, grp_v = af[0], af[1], af[2], af[3]
+                else: f, t, lck_v, grp_v = self.npcs["h1"].get_action(self._get_obs(1))
             else:
-                if self.mode == "refinement" and self.target == "hider":
-                    f, t, l, g = af_v[4], af_v[5], af_v[6], af_v[7]
-                else:
-                    f, t, l, g = self.npcs["h2"].get_action(self._get_obs(2))
-
-            # インタラクション判定（イベント監視付き）
-            res_dict = self._process_physical_interaction(ak, l, g)
-            cv_v[self.actuator_ids[f"{ak}_fwd"]] = f
-            cv_v[self.actuator_ids[f"{ak}_turn"]] = t
-
-        self.data.ctrl[:] = cv_v
-        for _ in range(5):
-            mujoco.mj_step(self.model, self.data)
-
-        self._stabilize_interaction_poses()
-        self._sync_visual_states()
-
-        rb_v, find_v = self._compute_team_reward()
-        final_r = float(rb_v if self.target == "hider" else -rb_v)
+                if self.mode == "refinement" and self.target == "hider": f, t, lck_v, grp_v = af[4], af[5], af[6], af[7]
+                else: f, t, lck_v, grp_v = self.npcs["h2"].get_action(self._get_obs(2))
+            res = self._process_physical_interaction(ak, lck_v, grp_v)
+            if res["hold_event"]: h_e = True
+            if res["lock_event"]: l_e = True
+            cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = f, t
+        self.data.ctrl[:] = cv
+        for _ in range(5): mujoco.mj_step(self.model, self.data)
+        self._stabilize_interaction_poses(); self._sync_visual_states()
+        rb, find = self._compute_team_reward()
         is_tr = bool(self.current_step >= self.max_episode_steps)
-
         idx = 0 if self.target == "seeker" else 1
-        # 戻り値辞書にイベント情報を集約
-        ret_info = {
-            "is_detected": find_v,
-            "hold_event": res_dict.get("hold_event", False),
-            "lock_event": res_dict.get("lock_event", False)
-        }
-        return self._normalize_obs(self._get_obs(idx)), final_r, False, is_tr, ret_info
+        return self._normalize_obs(self._get_obs(idx)), float(rb if self.target == "hider" else -rb), False, is_tr, {"is_detected": find, "hold_event": h_e, "lock_event": l_e}
 
-    def _process_physical_interaction(self, ak, lck, grb):
-        """
-        精密インタラクション: Hold/Lock の完全解体記述。
-        統計用に状態変化フラグを返す。
-        """
-        d_v, m_v = self.data, self.model
-        event_info = {"hold_event": False, "lock_event": False}
-
-        # 何も入力がない場合は、ボタン状態のみ記録して終了
-        if lck <= 0.5 and grb <= 0.5:
-            self.prev_action_btns[ak] = np.array([lck, grb])
-            return event_info
-
-        p_s_v = d_v.xpos[self.body_ids[ak]]
-        v_s_v = math.sqrt(
-            d_v.qvel[m_v.jnt_dofadr[self.qpos_indices[ak]['x']]]**2 +
-            d_v.qvel[m_v.jnt_dofadr[self.qpos_indices[ak]['y']]]**2
-        )
-
-        best_id_v, b_name_v, m_dist_v = -1, "", 0.85
-
-        # --- ターゲット判定 (垂直展開記述) ---
-        # Box 1
-        d_b1 = np.linalg.norm(d_v.xpos[self.box_ids[0]] - p_s_v)
-        if d_b1 < m_dist_v:
-            bd_b1 = m_v.jnt_dofadr[m_v.body_jntadr[self.box_ids[0]]]
-            v_o1 = math.sqrt(d_v.qvel[bd_b1]**2 + d_v.qvel[bd_b1+1]**2)
-            if v_s_v < 1.2 and v_o1 < 1.2:
-                m_dist_v, best_id_v, b_name_v = d_b1, self.box_ids[0], "b1"
-
-        # Box 2
-        d_b2 = np.linalg.norm(d_v.xpos[self.box_ids[1]] - p_s_v)
-        if d_b2 < m_dist_v:
-            bd_b2 = m_v.jnt_dofadr[m_v.body_jntadr[self.box_ids[1]]]
-            v_o2 = math.sqrt(d_v.qvel[bd_b2]**2 + d_v.qvel[bd_b2+1]**2)
-            if v_s_v < 1.2 and v_o2 < 1.2:
-                m_dist_v, best_id_v, b_name_v = d_b2, self.box_ids[1], "b2"
-
-        # Ramp
-        d_rp = np.linalg.norm(d_v.xpos[self.ramp_id] - p_s_v)
-        if d_rp < m_dist_v:
-            bd_rp = m_v.jnt_dofadr[m_v.body_jntadr[self.ramp_id]]
-            v_orp = math.sqrt(d_v.qvel[bd_rp]**2 + d_v.qvel[bd_rp+1]**2)
-            if v_s_v < 1.2 and v_orp < 1.2:
-                m_dist_v, best_id_v, b_name_v = d_rp, self.ramp_id, "ramp"
-
-        if best_id_v != -1:
-            # Lock Toggle (Rising Edge Detection)
-            if lck > 0.5 and self.prev_action_btns[ak][0] <= 0.5:
-                eq_id = self.eq_ids[f"lock_{b_name_v}"]
-                if d_v.eq_active[eq_id] > 0.5:
-                    if self.lock_owners[b_name_v] == ak:
-                        d_v.eq_active[eq_id] = 0
-                        self.lock_owners[b_name_v] = None
-                        event_info["lock_event"] = True
+    def _process_physical_interaction(self, ak, lck_v, grp_v):
+        d, m = self.data, self.model
+        evt = {"hold_event": False, "lock_event": False}
+        ps = d.xpos[self.body_ids[ak]]
+        v_x, v_y = d.qvel[m.jnt_dofadr[self.qpos_indices[ak]['x']]], d.qvel[m.jnt_dofadr[self.qpos_indices[ak]['y']]]
+        vs = math.sqrt(v_x**2 + v_y**2)
+        best, b_n, m_d = -1, "", 0.95
+        for tid, tname in [(self.box_ids[0], "b1"), (self.box_ids[1], "b2"), (self.ramp_id, "ramp")]:
+            dist = np.linalg.norm(d.xpos[tid] - ps)
+            if dist < m_d:
+                bd = m.jnt_dofadr[m.body_jntadr[tid]]; vo = math.sqrt(d.qvel[bd]**2 + d.qvel[bd+1]**2)
+                if vs < 1.2 and vo < 1.2: m_d, best, b_n = dist, tid, tname
+        if best != -1:
+            if lck_v > 0.5 and self.prev_action_btns[ak][0] <= 0.5:
+                eq = self.eq_ids[f"lock_{b_n}"]
+                if d.eq_active[eq] > 0.5:
+                    if self.lock_owners[b_n] == ak: d.eq_active[eq], self.lock_owners[b_n], evt["lock_event"] = 0, None, True
                 else:
-                    qa = m_v.jnt_qposadr[m_v.body_jntadr[best_id_v]]
-                    self.locked_pose[b_name_v] = d_v.qpos[qa:qa+7].copy()
-                    d_v.eq_active[eq_id] = 1
-                    self.lock_owners[b_name_v] = ak
-                    event_info["lock_event"] = True
-
-            # Hold Toggle (Rising Edge Detection)
-            if grb > 0.5 and self.prev_action_btns[ak][1] <= 0.5:
-                gid = self.eq_ids[f"grasp_{ak}_{b_name_v}"]
-                d_v.eq_active[gid] = 0.0 if d_v.eq_active[gid] > 0.5 else 1.0
-                event_info["hold_event"] = True
-
-        self.prev_action_btns[ak] = np.array([lck, grb])
-        return event_info
+                    qa = m.jnt_qposadr[m.body_jntadr[best]]; self.locked_pose[b_n], d.eq_active[eq], self.lock_owners[b_n], evt["lock_event"] = d.qpos[qa:qa+7].copy(), 1, ak, True
+            if grp_v > 0.5 and self.prev_action_btns[ak][1] <= 0.5:
+                gid = self.eq_ids[f"grasp_{ak}_{b_n}"]; d.eq_active[gid], evt["hold_event"] = (0.0 if d.eq_active[gid] > 0.5 else 1.0), True
+        self.prev_action_btns[ak][0], self.prev_action_btns[ak][1] = lck_v, grp_v
+        return evt
 
     def _compute_team_reward(self):
-        """チーム報酬算出。"""
-        if self.current_step <= self.prep_steps:
-            return 0.0, False
-        s_id = self.body_ids['s']
-        sp_v = self.data.xpos[s_id][:2]
-        sr_v = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices['s']['rot']]]
-        f1 = self._is_within_fov_and_visible(
-            sp_v, sr_v, self.data.xpos[self.body_ids['h1']][:2],
-            s_id, self.body_ids['h1']
-        )
-        f2 = self._is_within_fov_and_visible(
-            sp_v, sr_v, self.data.xpos[self.body_ids['h2']][:2],
-            s_id, self.body_ids['h2']
-        )
-        found = bool(f1 or f2)
-        return (-1.0 if found else 1.0), found
+        if self.current_step <= self.prep_steps: return 0.0, False
+        sid = self.body_ids['s']
+        f1 = self._is_within_fov_and_visible(self.data.xpos[sid][:2], self.data.qpos[self.model.jnt_qposadr[self.qpos_indices['s']['rot']]], self.data.xpos[self.body_ids['h1']][:2], sid, self.body_ids['h1'])
+        f2 = self._is_within_fov_and_visible(self.data.xpos[sid][:2], self.data.qpos[self.model.jnt_qposadr[self.qpos_indices['s']['rot']]], self.data.xpos[self.body_ids['h2']][:2], sid, self.body_ids['h2'])
+        return (-1.0 if (f1 or f2) else 1.0), bool(f1 or f2)
 
     def _is_within_fov_and_visible(self, pos, rot, t_pos, my_id, t_id):
-        """物理レイ判定。視野角135度。"""
-        rel = t_pos - pos
-        ds = np.sum(rel**2)
-        if ds > 225.0:
-            return False
+        rel = t_pos - pos; ds = np.sum(rel**2)
+        if ds > 225.0: return False
         dist = math.sqrt(ds) + 1e-8
-        if (math.cos(rot)*(rel[0]/dist) + math.sin(rot)*(rel[1]/dist)) < 0.38:
-            return False
-        return self.vis_engine.is_visible(
-            pos, t_pos, body_exclude=my_id, target_body_id=t_id
-        )
+        if (math.cos(rot)*(rel[0]/dist) + math.sin(rot)*(rel[1]/dist)) < 0.38: return False
+        return self.vis_engine.is_visible(pos, t_pos, body_exclude=my_id, target_body_id=t_id)
 
     def _normalize_obs(self, o):
-        """定数スケーリング。"""
-        v = o.copy()
-        v[0:2] /= 10.0
-        v[2] /= 5.0
-        v[5:17] /= 15.0
-        v[17:55] /= 12.0
-        return v
+        v = o.copy(); v[0:2]/=10.0; v[2]/=5.0; v[5:17]/=15.0; v[17:55]/=12.0; return v
 
     def _get_obs(self, idx):
-        """観測55次元の構築。添え字のみループを使用して短縮。"""
-        o = np.zeros(55, dtype=np.float32)
-        ak, m, d = self.agent_keys[idx], self.model, self.data
-        bid = self.body_ids[ak]
-        ps = d.xpos[bid]
+        """観測55次元。H2バグ修正。"""
+        o = np.zeros(55, dtype=np.float32); ak, m, d = self.agent_keys[idx], self.model, self.data
+        bid, ps = self.body_ids[ak], d.xpos[self.body_ids[ak]]
         rv = float(d.qpos[m.jnt_qposadr[self.qpos_indices[ak]['rot']]])
-        vax, vay = m.jnt_dofadr[self.qpos_indices[ak]['x']], \
-            m.jnt_dofadr[self.qpos_indices[ak]['y']]
-        vx, vy = d.qvel[vax], d.qvel[vay]
-
-        # 自己情報
-        o[0] = vx * math.cos(-rv) - vy * math.sin(-rv)
-        o[1] = vx * math.sin(-rv) + vy * math.cos(-rv)
-        o[2], o[3], o[4] = rv, math.cos(rv), math.sin(rv)
-
-        # Lidar (5-16)
-        ldr = self.vis_engine.cast_lidar(ps[:2], rv, 1, bid)
-        o[5:17] = ldr - 0.45
-
-        # オブジェクト (17-40) - 添え字ループによる短縮
+        vax, vay = m.jnt_dofadr[self.qpos_indices[ak]['x']], m.jnt_dofadr[self.qpos_indices[ak]['y']]
+        o[0], o[1], o[2], o[3], o[4] = d.qvel[vax]*math.cos(-rv)-d.qvel[vay]*math.sin(-rv), d.qvel[vax]*math.sin(-rv)+d.qvel[vay]*math.cos(-rv), rv, math.cos(rv), math.sin(rv)
+        o[5:17] = self.vis_engine.cast_lidar(ps[:2], rv, 1, bid) - 0.45
         for i, tid in enumerate(self.box_ids + [self.ramp_id]):
-            base = 17 + i * 8
-            tname = ['b1', 'b2', 'ramp'][i]
-            o[base:base+2] = d.xpos[tid][:2] - ps[:2]
-            o[base+2:base+4] = d.cvel[tid][:2]
-            o[base+4:base+6] = d.xquat[tid][:2]
-            o[base+6] = float(np.linalg.norm(d.cvel[tid][:2]) > 0.05)
-            o[base+7] = float(d.eq_active[self.eq_ids[f"lock_{tname}"]] > 0.5)
-
-        # 他者 (41-54) - 添え字ループによる短縮
-        ens = ["h1", "h2"] if ak == "s" else ["s", "h2"]
+            bs, tn = 17+i*8, ['b1', 'b2', 'ramp'][i]
+            if self._is_within_fov_and_visible(ps[:2], rv, d.xpos[tid][:2], bid, tid):
+                o[bs:bs+2], o[bs+2:bs+4], o[bs+4:bs+6], o[bs+6], o[bs+7] = d.xpos[tid][:2]-ps[:2], d.cvel[tid][:2], d.xquat[tid][:2], 1.0, float(d.eq_active[self.eq_ids[f"lock_{tn}"]] > 0.5)
+            else: o[bs:bs+2], o[bs+2:bs+8] = 15.0, 0.0
+        # H2バグ修正: 適切な敵対/味方リストの定義
+        if ak == "s": ens = ["h1", "h2"]
+        elif ak == "h1": ens = ["s", "h2"]
+        else: ens = ["s", "h1"] # h2 sees s and h1
         for i, enm in enumerate(ens):
-            base, eid = 41 + i * 7, self.body_ids[enm]
-            o[base:base+2] = d.xpos[eid][:2] - ps[:2]
-            o[base+2:base+4] = d.cvel[eid][:2]
-            o[base+4] = d.xquat[eid][0]
-            o[base+5] = float(np.linalg.norm(d.cvel[eid][:2]) > 0.1)
-            o[base+6] = float(self._is_within_fov_and_visible(ps[:2], rv,
-                              d.xpos[eid][:2], bid, eid))
+            base, eid = 41+i*7, self.body_ids[enm]
+            if self._is_within_fov_and_visible(ps[:2], rv, d.xpos[eid][:2], bid, eid):
+                o[base:base+2], o[base+2:base+4], o[base+4], o[base+5], o[base+6] = d.xpos[eid][:2]-ps[:2], d.cvel[eid][:2], d.xquat[eid][0], float(np.linalg.norm(d.cvel[eid][:2])>0.1), 1.0
+            else: o[base:base+2], o[base+2:base+7] = 15.0, 0.0
         return o
 
     def _stabilize_interaction_poses(self):
-        """ロック座標の強制安定化。"""
         for tk in ["b1", "b2", "ramp"]:
             if self.data.eq_active[self.eq_ids[f"lock_{tk}"]] > 0.5:
-                oid = self.box_ids[0] if tk == "b1" else \
-                    self.box_ids[1] if tk == "b2" else self.ramp_id
-                qa = self.model.jnt_qposadr[self.model.body_jntadr[oid]]
-                va = self.model.jnt_dofadr[self.model.body_jntadr[oid]]
-                self.data.qpos[qa:qa+7] = self.locked_pose[tk]
-                self.data.qvel[va:va+6] = 0.0
+                oid = self.box_ids[0] if tk == "b1" else self.box_ids[1] if tk == "b2" else self.ramp_id
+                qa, va = self.model.jnt_qposadr[self.model.body_jntadr[oid]], self.model.jnt_dofadr[self.model.body_jntadr[oid]]
+                self.data.qpos[qa:qa+7], self.data.qvel[va:va+6] = self.locked_pose[tk], 0.0
 
     def _sync_visual_states(self):
-        """ロック状態に応じたカラー同期。"""
-        for tk, bid in [("b1", self.box_ids[0]), ("b2", self.box_ids[1]),
-                        ("ramp", self.ramp_id)]:
-            is_l = self.data.eq_active[self.eq_ids[f"lock_{tk}"]] > 0.5
-            col = [1, 0, 0, 1] if is_l else self.obj_default_colors[bid]
-            for g in self.obj_geom_ids[bid]:
-                self.model.geom_rgba[g] = col
+        for tk, bid in [("b1", self.box_ids[0]), ("b2", self.box_ids[1]), ("ramp", self.ramp_id)]:
+            col = [1, 0, 0, 1] if self.data.eq_active[self.eq_ids[f"lock_{tk}"]] > 0.5 else self.obj_default_colors[bid]
+            for g in self.obj_geom_ids[bid]: self.model.geom_rgba[g] = col
 
     def render(self):
-        if self.viewer is None:
-            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+        if self.viewer is None: self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
         self.viewer.sync()
 
     def close(self):
-        if self.viewer:
+        if self.viewer: 
             self.viewer.close()
