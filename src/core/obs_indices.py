@@ -1,21 +1,22 @@
+# src/core/obs_indices.py
 """
-core obs_indices.py
 Observation Vector Index Definitions for Hide and Seek.
-インスタンスを直接エクスポートすることで、obs[SELF.VEL_X] のような
-最短の記述を実現します。
+構成数（エージェント、オブジェクトの数）に応じて観測ベクトルのインデックスを
+動的に事前計算し、obs[idx.B[0].REL_X] のような直感的なアクセスを提供します。
 """
 
-from typing import Final
+from typing import Final, List
+
 
 class SelfSchema:
-    """自己情報用スキーマ (0-4次元)"""
-    def __init__(self):
-        self.SLICE: Final = slice(0, 5)
-        self.VEL_X: Final = 0
-        self.VEL_Y: Final = 1
-        self.ROT: Final = 2
-        self.COS_ROT: Final = 3
-        self.SIN_ROT: Final = 4
+    """自己情報用スキーマ (5次元固定)"""
+    def __init__(self, start: int = 0):
+        self.SLICE: Final = slice(start, start + 5)
+        self.VEL_X: Final = start + 0
+        self.VEL_Y: Final = start + 1
+        self.ROT: Final = start + 2
+        self.COS_ROT: Final = start + 3
+        self.SIN_ROT: Final = start + 4
 
 
 class ObjectSchema:
@@ -33,7 +34,7 @@ class ObjectSchema:
 
 
 class AgentSchema:
-    """敵エージェント用スキーマ (7次元)"""
+    """他エージェント用スキーマ (7次元)"""
     def __init__(self, start: int):
         self.SLICE: Final = slice(start, start + 7)
         self.REL_X: Final = start + 0
@@ -45,13 +46,39 @@ class AgentSchema:
         self.VISIBLE: Final = start + 6
 
 
-# --- インスタンスを直接定義（ここがポイント） ---
-SELF: Final = SelfSchema()
-LIDAR: Final = slice(5, 17)
+class ObsIdx:
+    """
+    構成数に基づいて観測インデックスを動的に生成するマッパー。
+    """
+    def __init__(self, n_boxes: int, n_ramps: int, n_others: int):
+        # 1. 自己情報 (0-4)
+        self.SELF = SelfSchema(0)
+        
+        # 2. LiDAR (5-16)
+        self.LIDAR = slice(5, 17)
+        
+        # 3. オブジェクト (17〜)
+        cursor = 17
+        self.B: List[ObjectSchema] = []
+        for _ in range(n_boxes):
+            self.B.append(ObjectSchema(cursor))
+            cursor += 8
+            
+        self.RAMP: List[ObjectSchema] = []
+        for _ in range(n_ramps):
+            self.RAMP.append(ObjectSchema(cursor))
+            cursor += 8
+            
+        # 4. 他エージェント
+        self.OTHERS: List[AgentSchema] = []
+        for _ in range(n_others):
+            self.OTHERS.append(AgentSchema(cursor))
+            cursor += 7
+            
+        # 最終的な観測次元
+        self.total_dim = cursor
 
-B1: Final = ObjectSchema(17)
-B2: Final = ObjectSchema(25)
-RAMP: Final = ObjectSchema(33)
-
-H1: Final = AgentSchema(41)
-H2: Final = AgentSchema(48)
+# --- 使用例 (環境やエージェントの __init__ 内でインスタンス化) ---
+# idx = ObsIdx(n_boxes=2, n_ramps=1, n_others=2)
+# obs_dim = idx.total_dim
+# print(obs[idx.OTHERS[0].VISIBLE])
