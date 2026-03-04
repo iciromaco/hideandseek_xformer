@@ -1,50 +1,46 @@
 # src/agents/scripted_agents.py
-# scripted_agents.py v5.4 (お見合い回避ロジックの導入)
+# scripted_agents.py v5.42 (双方向スタック対応: 空間のある方へ脱出するロジックの実装)
 
 import numpy as np
 import math
 
 
 class RuleBasedSeeker:
-    """比例制御に加え、お見合いを回避するバイアスを持つ Seeker。"""
+    """前後の空間を比較し、最適な方向へスタック脱出を試みる Seeker。"""
 
     def __init__(self):
         self.reflex_timer = 0
-        self.patrol_step = 0
         self.wander_timer = 0
         self.wander_angle = 0.0
-        self.is_grabbing = False
         self.last_known_rel_pos_x = 0.0
         self.last_known_rel_pos_y = 0.0
         self.memory_timer = 0
-        self.last_l_sum = 0.0
         self.stuck_counter = 0
-        self.current_state = "Idle"
+        self.escape_turn_dir = 1.0
+        self.escape_fwd_dir = -1.0 # 脱出時の前後進方向
 
     def get_action(self, obs, idx):
-        self.patrol_step += 1
-        lidar = obs[idx.LIDAR]
-        front_min = np.min(lidar[0:3])
-
-        r_gap = lidar[1] + lidar[3] + lidar[5]
-        l_gap = lidar[2] + lidar[4] + lidar[6]
-        side_diff = r_gap - l_gap
-
-        # --- 比例制御とデッドロック回避 ---
-        speed_scale = np.clip((front_min - 0.2) / 0.8, 0.0, 1.0)
-        # 正面に障害物がある場合、右方向（または左）への微小バイアスを付与
-        # これにより、完全に左右対称な状況でもお見合いが解消されます
-        omiai_bias = 0.25 * (1.0 - speed_scale) if front_min < 0.6 else 0.0
+        L_SCALE, P_SCALE, R_SCALE = 15.0, 12.0, 5.0
+        lidar_raw = obs[idx.LIDAR] * L_SCALE
+        cur_rot = obs[idx.SELF.ROT] * R_SCALE
         
-        avoid_w = np.clip(1.0 - (front_min / 1.5), 0.0, 1.0)
-        avoid_torque = (side_diff * 5.0) + omiai_bias
-
-        curr_l_sum = np.sum(lidar)
-        if abs(curr_l_sum - self.last_l_sum) < 0.0005:
+        # 前後・左右の状況把握
+        front_min = np.min(lidar_raw[idx.LIDAR_FRONT_IDX])
+        back_min = np.min(lidar_raw[idx.LIDAR_BACK_IDX])
+        l_gap = np.sum(lidar_raw[idx.LIDAR_LEFT_IDX])
+        r_gap = np.sum(lidar_raw[idx.LIDAR_RIGHT_IDX])
+        
+        # スタック検知 (低速状態の継続)
+        norm_speed = np.linalg.norm(obs[idx.SELF.VEL_X:idx.SELF.VEL_Y+1])
+        if 0.001 < norm_speed < 0.015:
             self.stuck_counter += 1
         else:
             self.stuck_counter = 0
-        self.last_l_sum = curr_l_sum
+
+        # 安全確保の減速
+        speed_scale = np.clip((front_min - 0.45) / 0.5, 0.0, 1.0)
+        avoid_torque = (l_gap - r_gap) * 3.5
+        avoid_w = np.clip(1.0 - (front_min / 1.5), 0.0, 1.0)
 
         visible_enemies = [en for en in idx.OTHERS if obs[en.VISIBLE] > 0.5]
         enemy_seen = len(visible_enemies) > 0
@@ -52,138 +48,124 @@ class RuleBasedSeeker:
         fwd, trn, lck, grb = 0.0, 0.0, 0.0, 0.0
 
         if self.reflex_timer > 0:
-            self.current_state = "Reflex"
             self.reflex_timer -= 1
-            fwd, trn = -0.4, 0.8
-        elif front_min < 0.15:
-            self.current_state = "AvoidWall"
-            self.reflex_timer = 10
-        elif self.stuck_counter > 45:
-            self.current_state = "StuckEscape"
-            self.reflex_timer = 20
+            if self.reflex_timer > 8:
+                # フェーズ1: 直線移動 (空間がある方へ)
+                fwd, trn = 0.6 * self.escape_fwd_dir, 0.0
+            else:
+                # フェーズ2: 移動旋回
+                fwd, trn = 0.2 * self.escape_fwd_dir, 0.85 * self.escape_turn_dir
+        elif self.stuck_counter > 40 or front_min < 0.42:
+            # スタック判定時、前後の空間を比較して脱出方向を決める
+            self.reflex_timer = 14
             self.stuck_counter = 0
-        elif enemy_seen:
-            self.current_state = "Chasing"
-            self.memory_timer = 150
-            target_en = visible_enemies[0]
-            tx, ty = obs[target_en.REL_X], obs[target_en.REL_Y]
-            self.last_known_rel_pos_x, self.last_known_rel_pos_y = tx, ty
-            fwd = 0.65 * speed_scale
-            # 回避バイアスを含めて目標角度を計算
-            raw_trn = math.atan2(ty, tx) * 3.5
-            trn = np.clip(raw_trn + avoid_torque * avoid_w, -0.9, 0.9)
-        elif self.memory_timer > 0:
-            self.current_state = "MemorySearch"
-            self.memory_timer -= 1
-            mx, my = self.last_known_rel_pos_x, self.last_known_rel_pos_y
-            fwd = 0.45 * speed_scale
-            raw_trn = math.atan2(my, mx) * 2.8
-            trn = np.clip(raw_trn + avoid_torque * avoid_w, -0.7, 0.7)
+            # 前が詰まっていれば後退(-1)、後ろが詰まっていれば前進(1)
+            self.escape_fwd_dir = -1.0 if front_min < back_min else 1.0
+            self.escape_turn_dir = 1.0 if l_gap >= r_gap else -1.0
         else:
-            self.current_state = "Patrol"
-            self.wander_timer -= 1
-            if self.wander_timer <= 0:
-                self.wander_angle = np.random.uniform(-np.pi, np.pi)
-                self.wander_timer = np.random.randint(100, 250)
-            a_err = (self.wander_angle - obs[idx.SELF.ROT] + np.pi) % (2*np.pi)-np.pi
-            fwd = 0.4 * speed_scale
-            trn = np.clip(a_err * 2.5 + avoid_torque * avoid_w, -0.7, 0.7)
+            if enemy_seen:
+                tx, ty = obs[visible_enemies[0].REL_X] * P_SCALE, obs[visible_enemies[0].REL_Y] * P_SCALE
+                self.last_known_rel_pos_x, self.last_known_rel_pos_y = tx, ty
+                self.memory_timer = 180
+                target_angle = math.atan2(ty, tx)
+                fwd = 0.85 * max(0.1, math.cos(target_angle)) * speed_scale
+            elif self.memory_timer > 0:
+                self.memory_timer -= 1
+                target_angle = math.atan2(self.last_known_rel_pos_y, self.last_known_rel_pos_x)
+                fwd = 0.55 * max(0.1, math.cos(target_angle)) * speed_scale
+            else:
+                self.wander_timer -= 1
+                if avoid_w > 0.5: self.wander_timer = 0
+                if self.wander_timer <= 0:
+                    if l_gap > r_gap:
+                        self.wander_angle = cur_rot + np.random.uniform(0.3, np.pi)
+                    else:
+                        self.wander_angle = cur_rot + np.random.uniform(-np.pi, -0.3)
+                    self.wander_timer = np.random.randint(150, 400)
+                target_angle = (self.wander_angle - cur_rot + np.pi) % (2*np.pi) - np.pi
+                fwd = 0.45 * speed_scale
+
+            trn = np.clip(target_angle * 2.8 + avoid_torque * avoid_w, -0.9, 0.9)
 
         return np.array([fwd, trn, lck, grb])
 
 
 class RuleBasedHider:
-    """お見合いを回避し、比例制御で荷物を運ぶ Hider。"""
+    """後退時のスタックも考慮し、より安全な方向へ逃げる Hider。"""
 
     def __init__(self):
         self.reflex_timer = 0
-        self.is_grabbing = False
-        self.is_locking = False
-        self.grab_time = 0
-        self.patrol_step = 0
         self.wander_timer = 0
         self.wander_angle = 0.0
-        self.last_l_sum = 0.0
         self.stuck_counter = 0
-        self.current_state = "Idle"
+        self.escape_turn_dir = 1.0
+        self.escape_fwd_dir = -1.0
 
     def get_action(self, obs, idx):
-        self.patrol_step += 1
-        lidar = obs[idx.LIDAR]
-        front_min = np.min(lidar[0:3])
+        L_SCALE, P_SCALE, R_SCALE = 15.0, 12.0, 5.0
+        lidar_raw = obs[idx.LIDAR] * L_SCALE
+        cur_rot = obs[idx.SELF.ROT] * R_SCALE
         
-        speed_scale = np.clip((front_min - 0.2) / 0.8, 0.0, 1.0)
-        # 対称性を破るバイアスを付与
-        omiai_bias = 0.22 * (1.0 - speed_scale) if front_min < 0.6 else 0.0
+        front_min = np.min(lidar_raw[idx.LIDAR_FRONT_IDX])
+        back_min = np.min(lidar_raw[idx.LIDAR_BACK_IDX])
         
-        seekers = [en for en in idx.OTHERS if obs[en.VISIBLE] > 0.5]
-        s_vis = len(seekers) > 0
-
-        side_diff = (lidar[1]+lidar[3]+lidar[5]) - (lidar[2]+lidar[4]+lidar[6])
-        avoid_w = np.clip(1.0 - (front_min / 1.5), 0.0, 1.0)
-        avoid_t = (side_diff * 6.0) + omiai_bias
-
-        curr_l_sum = np.sum(lidar)
-        if abs(curr_l_sum - self.last_l_sum) < 0.0005:
+        norm_speed = np.linalg.norm(obs[idx.SELF.VEL_X:idx.SELF.VEL_Y+1])
+        if 0.001 < norm_speed < 0.015:
             self.stuck_counter += 1
         else:
             self.stuck_counter = 0
-        self.last_l_sum = curr_l_sum
 
-        min_d, target_obj = 999.0, None
-        for obj_sc in idx.B + idx.RAMP:
-            if obs[obj_sc.IS_LOCKED] > 0.5:
-                d = math.sqrt(obs[obj_sc.REL_X]**2 + obs[obj_sc.REL_Y]**2)
-                if d < min_d:
-                    min_d, target_obj = d, obj_sc
+        speed_scale = np.clip((front_min - 0.45) / 0.8, 0.15, 1.0)
+        
+        seeker = idx.OTHERS[0]
+        seeker_vis = obs[seeker.VISIBLE] > 0.5
+        
+        l_gap = np.sum(lidar_raw[idx.LIDAR_LEFT_IDX])
+        r_gap = np.sum(lidar_raw[idx.LIDAR_RIGHT_IDX])
+        avoid_torque = (l_gap - r_gap) * 4.5
+        avoid_w = np.clip(1.0 - (front_min / 1.5), 0.0, 1.0)
 
         fwd, trn, lck, grb = 0.0, 0.0, 0.0, 0.0
-        if target_obj and min_d < 1.05 and not self.is_locking:
-            if not self.is_grabbing:
-                if min_d < 0.88:
-                    fwd, grb, self.is_grabbing = 0.0, 1.0, True
-                else:
-                    fwd = 0.15
-            else:
-                self.grab_time += 1
-                if self.grab_time > 70:
-                    lck, grb, self.is_locking, self.is_grabbing = 1, 1, True, False
-                    self.grab_time = 0
 
         if self.reflex_timer > 0:
-            self.current_state = "Reflex"
             self.reflex_timer -= 1
-            fwd, trn = -0.35, 0.75
-        elif front_min < 0.15:
-            self.current_state = "AvoidWall"
-            self.reflex_timer = 10
-        elif self.stuck_counter > 40:
-            self.current_state = "StuckEscape"
-            self.reflex_timer = 18
-            self.stuck_counter = 0
-        elif s_vis:
-            self.current_state = "Escape"
-            tx, ty = obs[seekers[0].REL_X], obs[seekers[0].REL_Y]
-            fwd = 0.55 * speed_scale
-            trn = np.clip(math.atan2(-ty, -tx)*3.5 + avoid_t*avoid_w, -0.85, 0.85)
-        elif target_obj and not self.is_locking:
-            if self.is_grabbing:
-                self.current_state = "Carrying"
-                fwd = 0.2 * speed_scale
-                trn = 0.1 * math.sin(self.patrol_step * 0.15)
+            if self.reflex_timer > 8:
+                fwd, trn = 0.6 * self.escape_fwd_dir, 0.0
             else:
-                self.current_state = "Approach"
-                tx, ty = obs[target_obj.REL_X], obs[target_obj.REL_Y]
-                fwd = 0.4 * speed_scale
-                trn = np.clip(math.atan2(ty, tx)*2.8 + avoid_t*avoid_w, -0.7, 0.7)
+                fwd, trn = 0.2 * self.escape_fwd_dir, 0.85 * self.escape_turn_dir
+        elif self.stuck_counter > 40 or front_min < 0.42:
+            self.reflex_timer = 14
+            self.stuck_counter = 0
+            # 空間状況を見て前後どちらに動くか決定
+            self.escape_fwd_dir = -1.0 if front_min < back_min else 1.0
+            self.escape_turn_dir = 1.0 if l_gap >= r_gap else -1.0
         else:
-            self.current_state = "Patrol"
-            self.wander_timer -= 1
-            if self.wander_timer <= 0:
-                self.wander_angle = np.random.uniform(-np.pi, np.pi)
-                self.wander_timer = np.random.randint(120, 280)
-            a_err = (self.wander_angle - obs[idx.SELF.ROT] + np.pi) % (2*np.pi)-np.pi
-            fwd = 0.4 * speed_scale
-            trn = np.clip(a_err * 2.6 + avoid_t * avoid_w, -0.7, 0.7)
+            if seeker_vis:
+                tx, ty = obs[seeker.REL_X] * P_SCALE, obs[seeker.REL_Y] * P_SCALE
+                angle_to_seeker = math.atan2(ty, tx)
+                # 逃げる目標方位 (側方回避バイアス込み)
+                side_bias = 1.2 if l_gap > r_gap else -1.2
+                target_angle = (angle_to_seeker + np.pi + side_bias + np.pi) % (2*np.pi) - np.pi
+                
+                # 後退逃走中も、もし後ろが詰まったら前進に切り替わるように
+                # 通常時は cos に従うが、あまりに後ろが近い場合は制限
+                fwd_val = math.cos(target_angle)
+                if fwd_val < 0 and back_min < 0.5: # 後退したいが後ろが壁
+                    fwd = 0.0 # その場旋回に切り替え
+                else:
+                    fwd = 0.8 * fwd_val * speed_scale
+            else:
+                self.wander_timer -= 1
+                if avoid_w > 0.5: self.wander_timer = 0
+                if self.wander_timer <= 0:
+                    if l_gap > r_gap:
+                        self.wander_angle = cur_rot + np.random.uniform(0.3, np.pi)
+                    else:
+                        self.wander_angle = cur_rot + np.random.uniform(-np.pi, -0.3)
+                    self.wander_timer = np.random.randint(200, 500)
+                target_angle = (self.wander_angle - cur_rot + np.pi) % (2*np.pi) - np.pi
+                fwd = 0.45 * speed_scale
+
+            trn = np.clip(target_angle * 2.8 + avoid_torque * avoid_w, -0.9, 0.9)
 
         return np.array([fwd, trn, lck, grb])

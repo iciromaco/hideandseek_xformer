@@ -1,8 +1,8 @@
 # src/core/obs_indices.py
 """
 Observation Vector Index Definitions for Hide and Seek.
-構成数（エージェント、オブジェクトの数）に応じて観測ベクトルのインデックスを
-動的に事前計算し、obs[idx.B[0].REL_X] のような直感的なアクセスを提供します。
+LiDARの角度定義 [0, 15(L), -15(R), 30(L), -30(R), 45(L), -45(R), ...] に基づき、
+物理的な意味を持つインデックスリストを定義します。
 """
 
 from typing import Final, List
@@ -49,36 +49,33 @@ class AgentSchema:
 class ObsIdx:
     """
     構成数に基づいて観測インデックスを動的に生成するマッパー。
+    LiDARの方向定義をここに集約し、思い込みによるミスを防止します。
     """
     def __init__(self, n_boxes: int, n_ramps: int, n_others: int):
-        # 1. 自己情報 (0-4)
         self.SELF = SelfSchema(0)
-        
-        # 2. LiDAR (5-16)
         self.LIDAR = slice(5, 17)
-        
-        # 3. オブジェクト (17〜)
+
+        # LiDAR 内部インデックス (VisibilityEngineのanglesに対応)
+        # angles = [0, 15, -15, 30, -30, 45, -45, 90, -90, 135, -135, 180]
+        self.LIDAR_FRONT_IDX: Final = [0, 1, 2]         # 0°, 15°, -15°
+        self.LIDAR_LEFT_IDX: Final = [1, 3, 5, 7, 9]    # 15°, 30°, 45°, 90°, 135°
+        self.LIDAR_RIGHT_IDX: Final = [2, 4, 6, 8, 10]  # -15°, -30°, -45°, -90°, -135°
+        self.LIDAR_BACK_IDX: Final = [11]               # 180°
+
         cursor = 17
         self.B: List[ObjectSchema] = []
         for _ in range(n_boxes):
             self.B.append(ObjectSchema(cursor))
             cursor += 8
-            
+
         self.RAMP: List[ObjectSchema] = []
         for _ in range(n_ramps):
             self.RAMP.append(ObjectSchema(cursor))
             cursor += 8
-            
-        # 4. 他エージェント
+
         self.OTHERS: List[AgentSchema] = []
         for _ in range(n_others):
             self.OTHERS.append(AgentSchema(cursor))
             cursor += 7
-            
-        # 最終的な観測次元
-        self.total_dim = cursor
 
-# --- 使用例 (環境やエージェントの __init__ 内でインスタンス化) ---
-# idx = ObsIdx(n_boxes=2, n_ramps=1, n_others=2)
-# obs_dim = idx.total_dim
-# print(obs[idx.OTHERS[0].VISIBLE])
+        self.total_dim = cursor

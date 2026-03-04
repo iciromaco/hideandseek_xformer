@@ -1,11 +1,13 @@
-# main26_train_final.py v5.5
-# PEP 8 準拠: 79文字制限、1行1文、デバッグログ強化版
+# main27_train_final.py v5.8
+# PEP 8 準拠: チャタリング監視ログの追加とシミュレーションの安定化
 
 import torch
 import math
 import numpy as np
 import time
 import sys
+import os
+import traceback
 from core.obs_indices import ObsIdx
 from envs.hns_environment import TeamCosEnv
 
@@ -14,36 +16,29 @@ TRAIN_MODE = False
 USE_VIEWER = True
 NPC_ONLY_DEBUG = True
 
+# src ディレクトリを検索パスに追加
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
+
 def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker"):
-    """
-    動的インデックスを利用した報酬シェイピング。
-    """
-    # 敵が1人でも見えているか
+    """動的インデックスを利用した報酬シェイピング。"""
     enemy_visible = any(obs[en.VISIBLE] > 0.5 for en in idx.OTHERS)
 
-    # 最も近い敵との距離
     min_enemy_dist = 999.0
     for en in idx.OTHERS:
         d = math.sqrt(obs[en.REL_X]**2 + obs[en.REL_Y]**2)
         if d < min_enemy_dist:
             min_enemy_dist = d
 
-    # 自己速度
-    v_idx_x = idx.SELF.VEL_X
-    v_idx_y = idx.SELF.VEL_Y
-    speed = math.sqrt(obs[v_idx_x]**2 + obs[v_idx_y]**2)
+    speed = math.sqrt(obs[idx.SELF.VEL_X]**2 + obs[idx.SELF.VEL_Y]**2)
 
     bonus = 0.0
     if target_team == "seeker":
         if enemy_visible:
             bonus += 0.05
-        # 接近ボーナス
         bonus += 0.02 / (min_enemy_dist + 0.5)
-        # 停止ペナルティ
-        if speed < 0.05:
-            bonus -= 0.01
+        if speed < 0.01:
+            bonus -= 0.02
 
-    # 行動の激しさに対するコスト
     control_cost = -0.005 * np.sum(np.square(action))
     return base_reward + bonus + control_cost
 
@@ -57,12 +52,17 @@ def run_simulation():
         "n_ramps": 1
     }
 
-    # 環境の初期化
     print("Initializing Environment...")
-    env = TeamCosEnv(mode="refinement", target="seeker", **config)
-    idx = env.idx
+    try:
+        env = TeamCosEnv(mode="refinement", target="seeker", **config)
+        idx = env.idx
+    except Exception:
+        print("\nFailed to initialize environment:")
+        traceback.print_exc()
+        return
 
     print("--- Start Simulation ---")
+    print(f"Physics Step: {env.model.opt.timestep * 5}s")
 
     try:
         for episode in range(100):
@@ -70,76 +70,53 @@ def run_simulation():
             done = False
             ep_reward = 0
             step_count = 0
-            viewer_dead_count = 0
 
-            # 初期状態を表示
+            target_npc = None
+            if NPC_ONLY_DEBUG:
+                from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
+                target_npc = RuleBasedSeeker() if env.target == "seeker" else RuleBasedHider()
+
             if USE_VIEWER:
                 env.render()
 
-            print(f"Episode {episode} started.", end=" ", flush=True)
-
             while not done:
-                # Viewerが手動で閉じられたかチェック
                 if USE_VIEWER and env.viewer:
                     if not env.viewer.is_running():
-                        viewer_dead_count += 1
-                        if viewer_dead_count >= 10:
-                            print("\nViewer window closed by user.")
-                            return
-                    else:
-                        viewer_dead_count = 0
+                        return
 
-                # 行動決定
                 if TRAIN_MODE:
-                    # 強化学習推論（未実装時はランダム）
                     action = env.action_space.sample()
-                elif NPC_ONLY_DEBUG:
-                    # 全員をスクリプトNPCとして動作させる
-                    from agents.scripted_agents import (RuleBasedSeeker,
-                                                       RuleBasedHider)
-                    # ターゲットチーム用のNPCロジックを生成
-                    if env.target == "seeker":
-                        debug_npc = RuleBasedSeeker()
-                    else:
-                        debug_npc = RuleBasedHider()
-                    
-                    # 観測データからアクションを計算
-                    action = debug_npc.get_action(obs, idx)
+                elif NPC_ONLY_DEBUG and target_npc is not None:
+                    action = target_npc.get_action(obs, idx)
                 else:
-                    # 静止状態
                     action = np.zeros(env.action_space.shape)
 
-                # 環境ステップ実行
                 next_obs, base_r, term, trun, info = env.step(action)
-                
-                # カスタム報酬の計算
-                reward = compute_custom_reward(obs, action, base_r,
-                                               idx, env.target)
+                reward = compute_custom_reward(obs, action, base_r, idx, env.target)
 
-                # レンダリングと待機
                 if USE_VIEWER:
                     env.render()
-                    time.sleep(0.02)
+                    time.sleep(0.025)
 
                 obs = next_obs
                 ep_reward += reward
                 step_count += 1
                 done = bool(term or trun)
 
-                # 進捗ログ（50ステップごと）
-                if step_count % 50 == 0:
-                    print(".", end="", flush=True)
+                if step_count % 100 == 0:
+                    # アクション（特にステアリング T）の絶対値を出力してチャタリングを確認
+                    print(f"Ep {episode} - Step {step_count} | Steer Command: {action[1]:.2f}")
 
-            print(f" Finished. Steps={step_count}, Reward={ep_reward:.2f}")
+            print(f"Ep {episode} Finished. Steps={step_count}, Reward={ep_reward:.2f}")
 
     except KeyboardInterrupt:
-        print("\nSimulation interrupted by user (Ctrl+C).")
-    except Exception as e:
-        print(f"\nCritical Error during simulation: {e}")
-        import traceback
+        print("\nInterrupted.")
+    except Exception:
+        print("\nUnexpected error:")
         traceback.print_exc()
+        if USE_VIEWER:
+            time.sleep(5)
     finally:
-        print("Closing environment...")
         env.close()
         sys.exit(0)
 
