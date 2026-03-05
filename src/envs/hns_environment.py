@@ -83,8 +83,12 @@ class TeamCosEnv(gym.Env):
     R_RAMP = 1.30
 
     AGENT_DAMPING_XY = 30.0
+    AGENT_DAMPING_Z = 16.0
     AGENT_DAMPING_ROT = 25.0
-    AGENT_ACTUATOR_FWD = 1000
+    AGENT_ACTUATOR_FWD = 700
+    AGENT_Z_MIN = 0.35
+    AGENT_Z_MAX = 1.20
+    AGENT_MAX_VZ = 2.2
     RAMP_JOINT_DAMPING = 90.0
     BOX_JOINT_DAMPING = 28.0
     RAMP_MASS = 60.0
@@ -248,10 +252,11 @@ class TeamCosEnv(gym.Env):
     <body name="{pre}_anchor" pos="{xy[0]} {xy[1]} 0.5" quat="{q}">
       <joint name="{pre}_x" type="slide" axis="1 0 0" damping="{self.AGENT_DAMPING_XY}"/>
       <joint name="{pre}_y" type="slide" axis="0 1 0" damping="{self.AGENT_DAMPING_XY}"/>
+    <joint name="{pre}_z" type="slide" axis="0 0 1" damping="{self.AGENT_DAMPING_Z}" limited="true" range="{self.AGENT_Z_MIN} {self.AGENT_Z_MAX}"/>
       <joint name="{pre}_rot" type="hinge" axis="0 0 1" damping="{self.AGENT_DAMPING_ROT}"/>
       <body name="{pre}_body">
         <site name="{pre}_thrust" pos="0 0 0"/>
-        <geom name="{pre}_btm" type="sphere" size="0.4" pos="0 0 -0.1" mass="12" friction="0.1 0.1 0.1"/>
+        <geom name="{pre}_btm" type="sphere" size="0.4" pos="0 0 -0.1" mass="12" friction="1.2 0.12 0.003"/>
         <geom name="{pre}_capsule" type="capsule" size="0.3 0.3" rgba="{r} {g} {b} 1" mass="4" contype="0" conaffinity="0"/>
         <geom name="{pre}_nose" type="capsule" fromto="0 0 0.3 0.3 0 0.3" size="0.09" rgba="1 1 1 1" contype="0" conaffinity="0"/>
       </body>
@@ -269,6 +274,7 @@ class TeamCosEnv(gym.Env):
             self.qpos_indices[ak] = {
                 'x': m.joint(f"{ak}_x").id,
                 'y': m.joint(f"{ak}_y").id,
+                'z': m.joint(f"{ak}_z").id,
                 'rot': m.joint(f"{ak}_rot").id,
             }
             self.actuator_ids[f"{ak}_fwd"] = m.actuator(f"{ak}_fwd").id
@@ -380,6 +386,28 @@ class TeamCosEnv(gym.Env):
             elif 0.2 < lx <= 0.95:
                 gain = max(gain, 0.6)
         return gain
+
+    def _stabilize_agent_vertical_motion(self):
+        for ak in self.agent_keys:
+            jz = self.qpos_indices[ak]['z']
+            qz_adr = self.model.jnt_qposadr[jz]
+            vz_adr = self.model.jnt_dofadr[jz]
+            z = float(self.data.qpos[qz_adr])
+            vz = float(self.data.qvel[vz_adr])
+
+            if z > self.AGENT_Z_MAX:
+                self.data.qpos[qz_adr] = self.AGENT_Z_MAX
+                if vz > 0.0:
+                    self.data.qvel[vz_adr] = 0.0
+            elif z < self.AGENT_Z_MIN:
+                self.data.qpos[qz_adr] = self.AGENT_Z_MIN
+                if vz < 0.0:
+                    self.data.qvel[vz_adr] = 0.0
+            else:
+                if vz > self.AGENT_MAX_VZ:
+                    self.data.qvel[vz_adr] = self.AGENT_MAX_VZ
+                elif vz < -self.AGENT_MAX_VZ:
+                    self.data.qvel[vz_adr] = -self.AGENT_MAX_VZ
 
     def _interaction_blocked_by_static_walls(self, p1, p2):
         return bool(_blocked_by_static_walls_numba(
@@ -584,8 +612,14 @@ class TeamCosEnv(gym.Env):
             for _ in range(500):
                 p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2); rot = np.random.uniform(-np.pi, np.pi)
                 if not any(np.linalg.norm(p-pp) < (self.R_AGENT+pr+0.3) for pp, pr in placed):
-                    jx, jy, jr = self.qpos_indices[ak]['x'], self.qpos_indices[ak]['y'], self.qpos_indices[ak]['rot']
-                    self.data.qpos[self.model.jnt_qposadr[jx]], self.data.qpos[self.model.jnt_qposadr[jy]], self.data.qpos[self.model.jnt_qposadr[jr]] = p[0], p[1], rot
+                    jx = self.qpos_indices[ak]['x']
+                    jy = self.qpos_indices[ak]['y']
+                    jz = self.qpos_indices[ak]['z']
+                    jr = self.qpos_indices[ak]['rot']
+                    self.data.qpos[self.model.jnt_qposadr[jx]] = p[0]
+                    self.data.qpos[self.model.jnt_qposadr[jy]] = p[1]
+                    self.data.qpos[self.model.jnt_qposadr[jz]] = 0.5
+                    self.data.qpos[self.model.jnt_qposadr[jr]] = rot
                     placed.append((p, self.R_AGENT)); break
         mujoco.mj_forward(self.model, self.data)
         self._cache_planar_object_pose()
@@ -653,6 +687,7 @@ class TeamCosEnv(gym.Env):
         for _ in range(5):
             mujoco.mj_step(self.model, self.data)
             self._apply_object_constraints()
+            self._stabilize_agent_vertical_motion()
         mujoco.mj_forward(self.model, self.data)
 
         box_speeds = [self._body_speed_xy(bid) for bid in self.box_ids]
