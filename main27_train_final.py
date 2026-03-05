@@ -40,25 +40,29 @@ LOCAL_OVERRIDES = {
 
 # ここを "debug" / "train" で切り替えると主要設定を一括変更できます。
 # 優先順位: LOCAL_OVERRIDES > 環境変数 > RUN_PROFILE > デフォルト
-RUN_PROFILE = "train"
+RUN_PROFILE = "train"  # "debug" / "train"
 
 PROFILE_OVERRIDES = {
     "debug": {
         "TRAIN_MODE": False,
-        "USE_VIEWER": True,
-        "NPC_ONLY_DEBUG": False,
+        # "USE_VIEWER": True,
+        "DEBUG_HIDER_POLICY": "model_if_available",
+        "DEBUG_SEEKER_POLICY": "model_if_available",
+        # "NPC_ONLY_DEBUG": False,
         "PLAY_EPISODES": 100,
-        "AUTO_TUNE_HPARAMS": True,
-        "RAMP_CHECK_VIEWER": False
+        # "AUTO_TUNE_HPARAMS": False,
+        # "RAMP_CHECK_VIEWER": False
     },
     "train": {
         "TRAIN_MODE": True,
         "USE_VIEWER": False,
         "TRAINING_TARGET": "hider",
+        "TRAIN_OTHER_HIDER_POLICY": "model_if_available",
+        "TRAIN_OTHER_SEEKER_POLICY": "rule",
         "NPC_ONLY_DEBUG": False,
-        "PLAY_EPISODES": 1000,
         "AUTO_TUNE_HPARAMS": True,
-        "NUM_ENVS": "10"
+        "NUM_ENVS": "10",
+        "TOTAL_TIMESTEPS":300000,
     },
 }
 
@@ -90,6 +94,14 @@ NPC_ONLY_DEBUG = _cfg("NPC_ONLY_DEBUG", "1", _to_bool)
 SHOW_TURN_LINES = _cfg("SHOW_TURN_LINES", "0", _to_bool)
 USE_CUSTOM_REWARD = _cfg("USE_CUSTOM_REWARD", "1", _to_bool)
 AUTO_TUNE_HPARAMS = _cfg("AUTO_TUNE_HPARAMS", "1", _to_bool)
+DEBUG_HIDER_POLICY = _cfg("DEBUG_HIDER_POLICY", "rule", str)
+DEBUG_SEEKER_POLICY = _cfg("DEBUG_SEEKER_POLICY", "rule", str)
+TRAIN_OTHER_HIDER_POLICY = _cfg("TRAIN_OTHER_HIDER_POLICY", "rule", str)
+TRAIN_OTHER_SEEKER_POLICY = _cfg("TRAIN_OTHER_SEEKER_POLICY", "rule", str)
+
+if not TRAIN_MODE:
+    USE_VIEWER = True
+    AUTO_TUNE_HPARAMS = False
 
 MODE = _cfg("MODE", "refinement", str)
 TRAINING_TARGET = _cfg("TRAINING_TARGET", "seeker", str)
@@ -120,6 +132,7 @@ VF_COEF = _cfg("VF_COEF", "0.5", float)
 ENT_COEF = _cfg("ENT_COEF", "0.001", float)
 MAX_GRAD_NORM = _cfg("MAX_GRAD_NORM", "0.5", float)
 
+# 再生/デバッグ（TRAIN_MODE=False）のエピソード数
 PLAY_EPISODES = _cfg("PLAY_EPISODES", "100", int)
 LOG_INTERVAL = _cfg("LOG_INTERVAL", "10", int)
 SAVE_INTERVAL = _cfg("SAVE_INTERVAL", "50", int)
@@ -218,6 +231,10 @@ def model_path_for_config(target, config):
     return os.path.join("checkpoints", f"HNS_V27_{target}_{sig}.pt")
 
 
+POLICY_RULE = "rule"
+POLICY_MODEL_IF_AVAILABLE = "model_if_available"
+
+
 def _wandb_include_code_file(path, root):
     rel = os.path.relpath(path, root).replace("\\", "/")
     if rel in {"pyproject.toml", "README.md"}:
@@ -230,7 +247,7 @@ def _wandb_include_code_file(path, root):
     return name.startswith("main")
 
 
-def init_wandb_run(hp, model_path):
+def init_wandb_run(hp, model_path, training_target):
     if not TRAIN_MODE or not WANDB_ENABLED:
         return None
     if wandb is None:
@@ -238,7 +255,7 @@ def init_wandb_run(hp, model_path):
         return None
 
     env_sig = env_signature(ENV_CONFIG)
-    run_name = WANDB_RUN_NAME or f"v27_{TRAINING_TARGET}_{env_sig}"
+    run_name = WANDB_RUN_NAME or f"v27_{training_target}_{env_sig}"
     try:
         run = wandb.init(
             project=WANDB_PROJECT,
@@ -246,7 +263,7 @@ def init_wandb_run(hp, model_path):
             name=run_name,
             mode=WANDB_MODE,
             config={
-                "training_target": TRAINING_TARGET,
+                "training_target": training_target,
                 "mode": MODE,
                 "env_signature": env_sig,
                 "num_envs": NUM_ENVS,
@@ -705,6 +722,96 @@ def build_env(mode, target, config, render_mode=None):
     )
 
 
+def _snapshot_state_dict_cpu(agent):
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in agent.state_dict().items()
+    }
+
+
+def _normalize_policy_mode(value):
+    text = str(value).strip().lower()
+    if text in {"model", "model_if_available", "inference"}:
+        return POLICY_MODEL_IF_AVAILABLE
+    return POLICY_RULE
+
+
+def _resolve_runtime_target():
+    if TRAIN_MODE:
+        return TRAINING_TARGET
+    return "hider"
+
+
+def _maybe_load_model_state(target):
+    path = model_path_for_config(target, ENV_CONFIG)
+    if not os.path.exists(path):
+        return None, path
+    try:
+        return torch.load(path, map_location="cpu"), path
+    except Exception as exc:
+        print(f"Model load failed ({target}: {exc})")
+        return None, path
+
+
+def _apply_policy_state(env, vec_envs, agent_keys, state_dict, label):
+    if not agent_keys or state_dict is None:
+        return False
+    if vec_envs is not None:
+        try:
+            results = vec_envs.call(
+                "set_inference_policy_state",
+                list(agent_keys),
+                state_dict,
+                SEQ_LEN,
+                HIDDEN_DIM,
+            )
+            enabled = sum(1 for x in results if bool(x))
+            print(f"{label}: enabled on {enabled}/{len(results)} envs")
+            return enabled > 0
+        except Exception as exc:
+            print(f"{label}: vector sync failed ({exc})")
+            return False
+    if env is not None:
+        ok = bool(env.set_inference_policy_state(list(agent_keys), state_dict, SEQ_LEN, HIDDEN_DIM))
+        if ok:
+            print(f"{label}: enabled")
+        return ok
+    return False
+
+
+def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_state_dict):
+    if ref_env is None:
+        return
+
+    if TRAIN_MODE:
+        hider_mode = _normalize_policy_mode(TRAIN_OTHER_HIDER_POLICY)
+        seeker_mode = _normalize_policy_mode(TRAIN_OTHER_SEEKER_POLICY)
+    else:
+        hider_mode = _normalize_policy_mode(DEBUG_HIDER_POLICY)
+        seeker_mode = _normalize_policy_mode(DEBUG_SEEKER_POLICY)
+
+    hider_keys = [k for k in ref_env.hider_keys if k != ref_env.learnable_agent_key]
+    seeker_keys = [k for k in ref_env.seeker_keys if k != ref_env.learnable_agent_key]
+
+    hider_state = primary_state_dict if runtime_target == "hider" else None
+    seeker_state = primary_state_dict if runtime_target == "seeker" else None
+
+    if hider_mode == POLICY_MODEL_IF_AVAILABLE and hider_state is None:
+        hider_state, hider_path = _maybe_load_model_state("hider")
+        if hider_state is None:
+            print(f"Hider policy: fallback to rule (missing model: {hider_path})")
+
+    if seeker_mode == POLICY_MODEL_IF_AVAILABLE and seeker_state is None:
+        seeker_state, seeker_path = _maybe_load_model_state("seeker")
+        if seeker_state is None:
+            print(f"Seeker policy: fallback to rule (missing model: {seeker_path})")
+
+    if hider_mode == POLICY_MODEL_IF_AVAILABLE:
+        _apply_policy_state(env, vec_envs, hider_keys, hider_state, "Hider inference policy")
+    if seeker_mode == POLICY_MODEL_IF_AVAILABLE:
+        _apply_policy_state(env, vec_envs, seeker_keys, seeker_state, "Seeker inference policy")
+
+
 def run_debug_or_playback(env, agent, device, model_loaded):
     idx = env.idx
     obs_dim = env.observation_space.shape[0]
@@ -806,7 +913,16 @@ def run_debug_or_playback(env, agent, device, model_loaded):
         )
 
 
-def run_train(env, agent, optimizer, model_path, device, hp, wandb_run=None):
+def run_train(
+    env,
+    agent,
+    optimizer,
+    model_path,
+    device,
+    hp,
+    training_target,
+    wandb_run=None,
+):
     def _atomic_save(path):
         tmp_path = f"{path}.tmp"
         torch.save(agent.state_dict(), tmp_path)
@@ -967,7 +1083,7 @@ def run_train(env, agent, optimizer, model_path, device, hp, wandb_run=None):
             ):
                 ramp_eval = evaluate_fixed_ramp_climb(
                     MODE,
-                    TRAINING_TARGET,
+                    training_target,
                     agent,
                     device,
                     episodes=RAMP_CHECK_EPISODES,
@@ -1065,6 +1181,7 @@ def run_train_vector(
     model_path,
     device,
     hp,
+    training_target,
     num_envs,
     wandb_run=None,
 ):
@@ -1255,7 +1372,7 @@ def run_train_vector(
             ):
                 ramp_eval = evaluate_fixed_ramp_climb(
                     MODE,
-                    TRAINING_TARGET,
+                    training_target,
                     agent,
                     device,
                     episodes=RAMP_CHECK_EPISODES,
@@ -1318,6 +1435,7 @@ def run_train_vector(
 
 
 def run():
+    runtime_target = _resolve_runtime_target()
     print("Initializing Environment...")
     print(f"Run profile: {RUN_PROFILE}")
     print(
@@ -1325,6 +1443,11 @@ def run():
         f"TRAIN_MODE={TRAIN_MODE}, "
         f"USE_VIEWER={USE_VIEWER}, "
         f"NPC_ONLY_DEBUG={NPC_ONLY_DEBUG}, "
+        f"RUNTIME_TARGET={runtime_target}, "
+        f"DEBUG_HIDER_POLICY={DEBUG_HIDER_POLICY}, "
+        f"DEBUG_SEEKER_POLICY={DEBUG_SEEKER_POLICY}, "
+        f"TRAIN_OTHER_HIDER_POLICY={TRAIN_OTHER_HIDER_POLICY}, "
+        f"TRAIN_OTHER_SEEKER_POLICY={TRAIN_OTHER_SEEKER_POLICY}, "
         f"NUM_ENVS={NUM_ENVS}, "
         f"RAMP_CHECK_VIEWER={RAMP_CHECK_VIEWER}, "
         f"RAMP_CHECK_FORCE_UPHILL={RAMP_CHECK_FORCE_UPHILL}"
@@ -1332,7 +1455,7 @@ def run():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def make_env(render_mode=None):
-        return build_env(MODE, TRAINING_TARGET, ENV_CONFIG, render_mode)
+        return build_env(MODE, runtime_target, ENV_CONFIG, render_mode)
 
     env = None
     vec_envs = None
@@ -1345,7 +1468,7 @@ def run():
                     partial(
                         build_env,
                         MODE,
-                        TRAINING_TARGET,
+                        runtime_target,
                         env_config_snapshot,
                         None,
                     )
@@ -1371,16 +1494,16 @@ def run():
     print(f"Env signature: {env_signature(ENV_CONFIG)}")
     print(f"obs_dim={obs_dim}, act_dim={act_dim}, seq_len={SEQ_LEN}")
 
-    model_path = model_path_for_config(TRAINING_TARGET, ENV_CONFIG)
-    hp = select_hparams(ENV_CONFIG, TRAINING_TARGET)
+    model_path = model_path_for_config(runtime_target, ENV_CONFIG)
+    hp = select_hparams(ENV_CONFIG, runtime_target)
     print(
-        f"HP[{TRAINING_TARGET}]: T={hp['total_timesteps']} R={hp['rollout_steps']} "
+        f"HP[{runtime_target}]: T={hp['total_timesteps']} R={hp['rollout_steps']} "
         f"MB={hp['minibatch_size']} LR={hp['learning_rate']:.2e} "
         f"ENT={hp['ent_coef']:.2e} CLIP={hp['clip_coef']:.2f} "
         f"EPOCHS={hp['update_epochs']}"
     )
     agent = AgentV2(obs_dim, act_dim, HIDDEN_DIM, SEQ_LEN).to(device)
-    wandb_run = init_wandb_run(hp, model_path)
+    wandb_run = init_wandb_run(hp, model_path, runtime_target) if TRAIN_MODE else None
     model_loaded = False
     if os.path.exists(model_path):
         try:
@@ -1390,11 +1513,20 @@ def run():
         except Exception as exc:
             print(f"Model load skipped ({exc})")
 
+    primary_state_dict = _snapshot_state_dict_cpu(agent) if model_loaded else None
+    configure_team_policy_modes(
+        env,
+        vec_envs,
+        ref_env,
+        runtime_target,
+        primary_state_dict,
+    )
+
     try:
         if RAMP_CHECK_VIEWER:
             run_ramp_check_viewer(
                 MODE,
-                TRAINING_TARGET,
+                runtime_target,
                 agent,
                 device,
                 episodes=RAMP_CHECK_EPISODES,
@@ -1416,11 +1548,21 @@ def run():
                     model_path,
                     device,
                     hp,
+                    runtime_target,
                     NUM_ENVS,
                     wandb_run,
                 )
             else:
-                run_train(env, agent, optimizer, model_path, device, hp, wandb_run)
+                run_train(
+                    env,
+                    agent,
+                    optimizer,
+                    model_path,
+                    device,
+                    hp,
+                    runtime_target,
+                    wandb_run,
+                )
         else:
             run_debug_or_playback(env, agent, device, model_loaded)
     except KeyboardInterrupt:

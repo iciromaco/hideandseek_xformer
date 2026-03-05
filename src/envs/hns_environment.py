@@ -6,12 +6,14 @@ import gymnasium as gym
 import mujoco
 import mujoco.viewer
 import numpy as np
+import torch
 from numba import njit
 from gymnasium import spaces
 
 from core.visibility_engine import VisibilityEngine
 from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
 from core.obs_indices import ObsIdx
+from models.ppo_transformer_v2 import AgentV2
 
 
 def _euler_z_to_quat(yaw):
@@ -140,6 +142,12 @@ class TeamCosEnv(gym.Env):
         self.vis_engine = VisibilityEngine(self.model, self.data)
         self.viewer = None
         self.inference_policies = inference_policies or {}
+        self._inference_models = {}
+        self.shared_team_policy = False
+        self.shared_policy_model = None
+        self.shared_policy_seq_len = 8
+        self.shared_policy_hidden_dim = 128
+        self.shared_team_prefix = "h" if self.learnable_agent_key.startswith("h") else "s"
         
         self.last_debug_ctrl = {k: (0.0, 0.0) for k in self.agent_keys}
         
@@ -167,6 +175,54 @@ class TeamCosEnv(gym.Env):
         # 【修正】アクションスペースを 4 次元に固定。
         # 外部（学習アルゴリズム）からは常に 1 体分の入力を受け取る。
         self.action_space = spaces.Box(-1.0, 1.0, (4,), np.float32)
+
+    def set_shared_team_policy_state(self, state_dict, seq_len=8, hidden_dim=128):
+        if state_dict is None:
+            self.shared_team_policy = False
+            self.shared_policy_model = None
+            return False
+
+        self.shared_team_policy = True
+        self.shared_policy_seq_len = int(seq_len)
+        self.shared_policy_hidden_dim = int(hidden_dim)
+        obs_dim = int(self.observation_space.shape[0])
+        act_dim = int(self.action_space.shape[0])
+        policy_model = AgentV2(obs_dim, act_dim, self.shared_policy_hidden_dim, self.shared_policy_seq_len)
+        policy_model.load_state_dict(state_dict)
+        policy_model.eval()
+        self.shared_policy_model = policy_model
+        return True
+
+    def set_inference_policy_state(self, agent_keys, state_dict, seq_len=8, hidden_dim=128):
+        if state_dict is None:
+            return False
+
+        keys = [k for k in agent_keys if k in self.agent_keys]
+        if not keys:
+            return False
+
+        obs_dim = int(self.observation_space.shape[0])
+        act_dim = int(self.action_space.shape[0])
+        policy_model = AgentV2(obs_dim, act_dim, int(hidden_dim), int(seq_len))
+        policy_model.load_state_dict(state_dict)
+        policy_model.eval()
+
+        def _policy(norm_obs):
+            obs_np = np.asarray(norm_obs, dtype=np.float32).reshape(1, -1)
+            seq_np = np.repeat(obs_np[:, None, :], int(seq_len), axis=1)
+            seq_t = torch.as_tensor(seq_np, dtype=torch.float32)
+            with torch.no_grad():
+                arr = policy_model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+            if arr.size >= 4:
+                return arr[:4]
+            out = np.zeros(4, dtype=np.float32)
+            out[:arr.size] = arr
+            return out
+
+        for ak in keys:
+            self.inference_policies[ak] = _policy
+            self._inference_models[ak] = policy_model
+        return True
 
     def _build_dynamic_xml(self):
         arena = self._xml_static_scene()
@@ -587,6 +643,26 @@ class TeamCosEnv(gym.Env):
                     return float(arr[0]), float(arr[1]), 0.0, 0.0
             except Exception:
                 pass
+
+        if (
+            self.shared_team_policy
+            and self.shared_policy_model is not None
+            and agent_key != self.learnable_agent_key
+            and agent_key.startswith(self.shared_team_prefix)
+        ):
+            try:
+                obs_np = np.asarray(norm_obs, dtype=np.float32).reshape(1, -1)
+                seq_np = np.repeat(obs_np[:, None, :], self.shared_policy_seq_len, axis=1)
+                seq_t = torch.as_tensor(seq_np, dtype=torch.float32)
+                with torch.no_grad():
+                    arr = self.shared_policy_model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+                if arr.size >= 4:
+                    return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
+                if arr.size >= 2:
+                    return float(arr[0]), float(arr[1]), 0.0, 0.0
+            except Exception:
+                pass
+
         arr = np.asarray(self.npcs[agent_key].get_action(norm_obs, self.idx)).reshape(-1)
         if arr.size >= 4:
             return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
