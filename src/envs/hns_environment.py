@@ -1,5 +1,5 @@
 # src/envs/hns_environment.py
-# hns_environment.py v4.54 (ステアリング色の個別化とデバッグ視認性の向上)
+# hns_environment.py v4.58 (学習対象を 1 エージェントに限定するロジックの修正)
 
 import math
 import gymnasium as gym
@@ -21,7 +21,7 @@ def _euler_z_to_quat(yaw):
 
 class TeamCosEnv(gym.Env):
     """
-    Hide and Seek 高度物理環境 (チーム別カラーデバッグ版)
+    Hide and Seek 高度物理環境 (単一エージェント学習最適化版)
     """
     ARENA_HALF = 6.0
     SAFE_HALF = 5.0
@@ -46,7 +46,6 @@ class TeamCosEnv(gym.Env):
         self.vis_engine = VisibilityEngine(self.model, self.data)
         self.viewer = None
         
-        # 最後に適用された制御入力を保持 (デバッグ描画用)
         self.last_debug_ctrl = {k: (0.0, 0.0) for k in self.agent_keys}
         
         self.body_ids, self.qpos_indices, self.actuator_ids = {}, {}, {}
@@ -55,9 +54,12 @@ class TeamCosEnv(gym.Env):
         self._analyze_structure()
         self._init_agent_intelligence()
         
+        # 観測空間
         self.observation_space = spaces.Box(-np.inf, np.inf, (self.idx.total_dim,), np.float32)
-        act_cnt = 8 if (mode == "refinement" and target == "hider") else 4
-        self.action_space = spaces.Box(-1.0, 1.0, (act_cnt,), np.float32)
+        
+        # 【修正】アクションスペースを 4 次元に固定。
+        # 外部（学習アルゴリズム）からは常に 1 体分の入力を受け取る。
+        self.action_space = spaces.Box(-1.0, 1.0, (4,), np.float32)
 
     def _build_dynamic_xml(self):
         arena = self._xml_static_scene()
@@ -178,26 +180,47 @@ class TeamCosEnv(gym.Env):
                     self.data.qpos[self.model.jnt_qposadr[jx]], self.data.qpos[self.model.jnt_qposadr[jy]], self.data.qpos[self.model.jnt_qposadr[jr]] = p[0], p[1], rot
                     placed.append((p, self.R_AGENT)); break
         mujoco.mj_forward(self.model, self.data)
-        idx = 0 if self.target == "seeker" else 1
-        return self._normalize_obs(self._get_obs(idx)), {"is_detected": False}
+        
+        # 学習対象の観測を返す (seeker なら s, hider なら h1)
+        idx_to_obs = 0 if self.target == "seeker" else 1
+        return self._normalize_obs(self._get_obs(idx_to_obs)), {"is_detected": False}
 
     def step(self, action):
         self.current_step += 1
         af, cv = np.ravel(action), np.zeros(self.model.nu)
+        
         for i, ak in enumerate(self.agent_keys):
-            f, t = 0.0, 0.0
-            if (self.target == ak) or (self.target == "hider" and ak.startswith("h")):
-                if ak == "s" and self.current_step <= self.prep_steps: f, t = 0.0, 0.0
-                else: idx_offset = 0 if ak == "s" or ak == "h1" else 4; f, t = af[idx_offset], af[idx_offset+1]
+            # 【核心】学習対象の判定: seeker なら s, hider なら h1 のみ。
+            # h2 は常に NPC (RuleBasedHider) または 推論モデル (将来実装) で制御する。
+            if (self.target == "seeker" and ak == "s") or (self.target == "hider" and ak == "h1"):
+                if ak == "s" and self.current_step <= self.prep_steps:
+                    f, t = 0.0, 0.0
+                else:
+                    # 外部アクション（常に4要素）を適用
+                    f, t = af[0], af[1]
             else:
-                if ak == "s" and self.current_step <= self.prep_steps: f, t = 0.0, 0.0
-                else: norm_obs = self._normalize_obs(self._get_obs(i)); f, t, _, _ = self.npcs[ak].get_action(norm_obs, self.idx)
+                # それ以外（非ターゲットの Seeker や、Hider2）は内部 NPC が制御
+                if ak == "s" and self.current_step <= self.prep_steps:
+                    f, t = 0.0, 0.0
+                else:
+                    norm_obs = self._normalize_obs(self._get_obs(i))
+                    f, t, _, _ = self.npcs[ak].get_action(norm_obs, self.idx)
+            
             cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = f, t
             self.last_debug_ctrl[ak] = (f, t)
+            
         self.data.ctrl[:] = cv
         for _ in range(5): mujoco.mj_step(self.model, self.data)
-        rb, find = self._compute_team_reward(); idx = 0 if self.target == "seeker" else 1
-        return (self._normalize_obs(self._get_obs(idx)), float(rb if self.target == "hider" else -rb), False, self.current_step >= self.max_episode_steps, {"is_detected": find})
+        
+        rb, find = self._compute_team_reward()
+        # 学習対象に合わせて観測を生成
+        idx_to_obs = 0 if self.target == "seeker" else 1
+        
+        return (self._normalize_obs(self._get_obs(idx_to_obs)), 
+                float(rb if self.target == "hider" else -rb), 
+                False, 
+                self.current_step >= self.max_episode_steps, 
+                {"is_detected": find})
 
     def _compute_team_reward(self):
         if self.current_step <= self.prep_steps: return 0.0, False
@@ -252,8 +275,6 @@ class TeamCosEnv(gym.Env):
             self.viewer.user_scn.ngeom = 0
             for ak in self.agent_keys:
                 sid = self.body_ids[ak]; pos = self.data.xpos[sid]; rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]['rot']]]
-                
-                # 1. ステアリングライン (チーム別カラー)
                 t_val = self.last_debug_ctrl[ak][1]
                 if abs(t_val) > 0.005:
                     h = 1.1 if ak == "s" else 1.3
@@ -265,8 +286,6 @@ class TeamCosEnv(gym.Env):
                         mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 8.0 + abs(t_val)*25, p_start, p_end)
                         g.rgba[:] = color
                         self.viewer.user_scn.ngeom += 1
-
-                # 2. 視線ライン
                 targets = [(self.body_ids[k], [1,0,0,1] if ak=='s' else [0,0,1,1]) for k in self.agent_keys if k != ak]
                 for tid, color in targets:
                     if self._is_vis(pos[:2], rot, self.data.xpos[tid][:2], sid, tid):
@@ -275,8 +294,6 @@ class TeamCosEnv(gym.Env):
                             mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 2.0, pos, self.data.xpos[tid])
                             g.rgba[:] = color
                             self.viewer.user_scn.ngeom += 1
-            
-            # 3. 黄色マーカー
             obs_raw = self._get_obs(0); h1_idx = self.idx.OTHERS[0]
             if obs_raw[h1_idx.VISIBLE] > 0.5:
                 lx, ly = obs_raw[h1_idx.REL_X], obs_raw[h1_idx.REL_Y]; sid = self.body_ids["s"]; spos = self.data.xpos[sid][:2]; srot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices["s"]["rot"]]]
@@ -286,5 +303,4 @@ class TeamCosEnv(gym.Env):
         self.viewer.sync()
 
     def close(self):
-        if self.viewer: 
-            self.viewer.close()
+        if self.viewer: self.viewer.close()
