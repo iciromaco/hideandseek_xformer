@@ -70,6 +70,10 @@ def run_simulation():
             done = False
             ep_reward = 0
             step_count = 0
+            lock_events = 0
+            grab_events = 0
+            lock_events_window = 0
+            grab_events_window = 0
 
             target_npc = None
             if NPC_ONLY_DEBUG:
@@ -93,6 +97,10 @@ def run_simulation():
 
                 next_obs, base_r, term, trun, info = env.step(action)
                 reward = compute_custom_reward(obs, action, base_r, idx, env.target)
+                lock_events += int(info.get("lock_event", 0))
+                grab_events += int(info.get("grab_event", 0))
+                lock_events_window += int(info.get("lock_event", 0))
+                grab_events_window += int(info.get("grab_event", 0))
 
                 if USE_VIEWER:
                     env.render()
@@ -105,9 +113,30 @@ def run_simulation():
 
                 if step_count % 100 == 0:
                     # アクション（特にステアリング T）の絶対値を出力してチャタリングを確認
-                    print(f"Ep {episode} - Step {step_count} | Steer Command: {action[1]:.2f}")
+                    print(
+                        "Ep "
+                        f"{episode} - Step {step_count} | "
+                        f"Steer={action[1]:.2f} "
+                        f"LockBtnMax={info.get('dbg_lock_btn_max', 0.0):.2f} "
+                        f"GrabBtnMax={info.get('dbg_grab_btn_max', 0.0):.2f} "
+                        f"LockPressed={int(info.get('dbg_lock_pressed', 0))} "
+                        f"GrabPressed={int(info.get('dbg_grab_pressed', 0))} "
+                        f"LockTarget={int(info.get('dbg_lock_target', 0))} "
+                        f"GrabTarget={int(info.get('dbg_grab_target', 0))} "
+                        f"LockEvt={int(info.get('lock_event', 0))} "
+                        f"GrabEvt={int(info.get('grab_event', 0))} "
+                        f"WinLock={lock_events_window} "
+                        f"WinGrab={grab_events_window} "
+                        f"CumLock={lock_events} "
+                        f"CumGrab={grab_events}"
+                    )
+                    lock_events_window = 0
+                    grab_events_window = 0
 
-            print(f"Ep {episode} Finished. Steps={step_count}, Reward={ep_reward:.2f}")
+            print(
+                f"Ep {episode} Finished. Steps={step_count}, Reward={ep_reward:.2f}, "
+                f"LockEvents={lock_events}, GrabEvents={grab_events}"
+            )
 
     except KeyboardInterrupt:
         print("\nInterrupted.")

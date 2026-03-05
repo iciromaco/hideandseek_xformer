@@ -5,6 +5,49 @@ import numpy as np
 import math
 
 
+def _interaction_buttons(obs, idx, interact_cooldown):
+    """近距離前方オブジェクトに対して lock/grab ボタンを生成する。"""
+    if interact_cooldown > 0:
+        return 0.0, 0.0, interact_cooldown - 1
+
+    p_scale = 12.0
+    best = None
+
+    for obj in list(idx.B) + list(idx.RAMP):
+        rel_x = float(obs[obj.REL_X]) * p_scale
+        rel_y = float(obs[obj.REL_Y]) * p_scale
+        dist = math.hypot(rel_x, rel_y)
+        if dist > 1.95:
+            continue
+        if rel_x <= -0.25:
+            continue
+        if best is None or dist < best[0]:
+            best = (dist, rel_x, obj)
+
+    if best is None:
+        return 0.0, 0.0, 0
+
+    _, rel_x, obj = best
+    is_locked = float(obs[obj.IS_LOCKED]) > 0.5
+    is_moving = float(obs[obj.IS_MOVING]) > 0.5
+    lidar_raw = obs[idx.LIDAR] * 15.0
+    front_min = float(np.min(lidar_raw[idx.LIDAR_FRONT_IDX]))
+
+    if is_locked:
+        if rel_x > 0.05 and front_min < 0.55:
+            return 1.0, 0.0, 14
+        return 0.0, 0.0, 0
+
+    if is_moving:
+        if front_min < 0.50:
+            return 0.0, 1.0, 10
+        return 1.0, 0.0, 14
+
+    if not is_moving:
+        return 0.0, 1.0, 12
+    return 0.0, 0.0, 0
+
+
 class RuleBasedSeeker:
     """目的地への方位偏差を計算し、壁を避けながら追従する Seeker。"""
 
@@ -18,6 +61,7 @@ class RuleBasedSeeker:
         self.stuck_counter = 0
         self.escape_turn_dir = 1.0
         self.escape_fwd_dir = -1.0
+        self.interact_cooldown = 0
 
     def get_action(self, obs, idx):
         L_SCALE, P_SCALE, R_SCALE = 15.0, 12.0, 5.0
@@ -72,6 +116,9 @@ class RuleBasedSeeker:
 
             trn = np.clip(target_angle * 2.8 + avoid_torque * avoid_w, -0.9, 0.9)
 
+        lck, grb, self.interact_cooldown = _interaction_buttons(
+            obs, idx, self.interact_cooldown
+        )
         return np.array([fwd, trn, lck, grb])
 
 
@@ -85,6 +132,7 @@ class RuleBasedHider:
         self.stuck_counter = 0
         self.escape_turn_dir = 1.0
         self.escape_fwd_dir = -1.0
+        self.interact_cooldown = 0
 
     def get_action(self, obs, idx):
         L_SCALE, P_SCALE, R_SCALE = 15.0, 12.0, 5.0
@@ -138,4 +186,7 @@ class RuleBasedHider:
 
             trn = np.clip(target_angle * 2.8 + avoid_torque * avoid_w, -0.9, 0.9)
 
+        lck, grb, self.interact_cooldown = _interaction_buttons(
+            obs, idx, self.interact_cooldown
+        )
         return np.array([fwd, trn, lck, grb])

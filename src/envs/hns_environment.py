@@ -32,9 +32,16 @@ class TeamCosEnv(gym.Env):
     AGENT_DAMPING_XY = 30.0
     AGENT_DAMPING_ROT = 25.0
     AGENT_ACTUATOR_FWD = 1000
+    INTERACT_RANGE = 1.95
+    BTN_ON = 0.1
+    BTN_COOLDOWN = 8
+    GRAB_OFFSET = 1.45
+    GRAB_FOLLOW_GAIN = 8.0
+    GRAB_MAX_SPEED = 2.6
 
     def __init__(self, mode="initial", target="hider", n_seekers=1,
-                 n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None):
+                 n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None,
+                 inference_policies=None):
         super().__init__()
         self.mode, self.target, self.render_mode = mode, target, render_mode
         self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
@@ -45,14 +52,19 @@ class TeamCosEnv(gym.Env):
         self.data = mujoco.MjData(self.model)
         self.vis_engine = VisibilityEngine(self.model, self.data)
         self.viewer = None
+        self.inference_policies = inference_policies or {}
         
         self.last_debug_ctrl = {k: (0.0, 0.0) for k in self.agent_keys}
         
         self.body_ids, self.qpos_indices, self.actuator_ids = {}, {}, {}
+        self.obj_body_map = {}
+        self.obj_geom_ids = {}
+        self.obj_default_rgba = {}
         self.maze_walls = [(3, 1.5, 1.5, 0.2), (-3, -1.5, 1.5, 0.2),
                           (0, -3, 0.2, 1.5), (0, 3, 0.2, 1.5)]
         self._analyze_structure()
         self._init_agent_intelligence()
+        self._init_interaction_state()
         
         # 観測空間
         self.observation_space = spaces.Box(-np.inf, np.inf, (self.idx.total_dim,), np.float32)
@@ -110,7 +122,7 @@ class TeamCosEnv(gym.Env):
         return f"""
     <body name="ramp_body" pos="{xy[0]} {xy[1]} 0" quat="{q}">
       <joint type="free" name="ramp_joint" damping="60.0"/>
-      <geom type="mesh" mesh="ramp_mesh" rgba="0 1 0 1" friction="0.5 0.1 0.1"/>
+            <geom name="ramp_geom" type="mesh" mesh="ramp_mesh" rgba="0 1 0 1" friction="0.5 0.1 0.1"/>
     </body>"""
 
     def _xml_box(self, i, xy, rot):
@@ -155,15 +167,191 @@ class TeamCosEnv(gym.Env):
             self.actuator_ids[f"h{i}_fwd"] = m.actuator(f"h{i}_fwd").id
             self.actuator_ids[f"h{i}_turn"] = m.actuator(f"h{i}_turn").id
         self.ramp_id, self.box_ids = m.body("ramp_body").id, [m.body("box1_body").id, m.body("box2_body").id]
+        self.obj_body_map = {"b1": self.box_ids[0], "b2": self.box_ids[1], "ramp": self.ramp_id}
+        self.obj_geom_ids = {
+            "b1": [m.geom("box1_geom").id],
+            "b2": [m.geom("box2_geom").id],
+            "ramp": [m.geom("ramp_geom").id],
+        }
+        self.obj_default_rgba = {
+            k: m.geom_rgba[v[0]].copy() for k, v in self.obj_geom_ids.items()
+        }
 
     def _init_agent_intelligence(self):
         self.npcs = {"s": RuleBasedSeeker(), "h1": RuleBasedHider(), "h2": RuleBasedHider()}
+
+    def _init_interaction_state(self):
+        self.object_state = {
+            "b1": {"mode": "free", "owner": None, "locked_pose": None},
+            "b2": {"mode": "free", "owner": None, "locked_pose": None},
+            "ramp": {"mode": "free", "owner": None, "locked_pose": None},
+        }
+        self.prev_action_btns = {ak: np.zeros(2, dtype=np.float32) for ak in self.agent_keys}
+        self.btn_cooldown = {ak: 0 for ak in self.agent_keys}
+
+    def _obj_addr(self, obj_key):
+        bid = self.obj_body_map[obj_key]
+        jadr = self.model.body_jntadr[bid]
+        return self.model.jnt_qposadr[jadr], self.model.jnt_dofadr[jadr]
+
+    def _select_target(self, ak, for_grab=False):
+        apos = self.data.xpos[self.body_ids[ak]][:2]
+        rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]['rot']]]
+        fwd = np.array([math.cos(rot), math.sin(rot)], dtype=np.float32)
+        aid = self.body_ids[ak]
+        best_key, best_dist = None, 1e9
+        for tk, bid in self.obj_body_map.items():
+            st = self.object_state[tk]
+            if for_grab and st["mode"] == "locked" and st["owner"] != ak:
+                continue
+            opos = self.data.xpos[bid][:2]
+            rel = opos - apos
+            dist = float(np.linalg.norm(rel))
+            if dist > self.INTERACT_RANGE:
+                continue
+            if for_grab and float(np.dot(fwd, rel)) <= -0.2:
+                continue
+            if not self.vis_engine.is_visible(
+                apos, opos, body_exclude=aid, target_body_id=bid
+            ):
+                continue
+            if dist < best_dist:
+                best_key, best_dist = tk, dist
+        return best_key
+
+    def _current_grabbed_by(self, ak):
+        for tk, st in self.object_state.items():
+            if st["mode"] == "grabbed" and st["owner"] == ak:
+                return tk
+        return None
+
+    def _toggle_lock(self, ak):
+        tk = self._select_target(ak, for_grab=False)
+        if tk is None:
+            return False
+        st = self.object_state[tk]
+        qadr, _ = self._obj_addr(tk)
+        if st["mode"] == "locked" and st["owner"] == ak:
+            st["mode"], st["owner"], st["locked_pose"] = "free", None, None
+            return True
+        if st["mode"] in ("free", "grabbed") and (st["owner"] is None or st["owner"] == ak):
+            st["mode"] = "locked"
+            st["owner"] = ak
+            st["locked_pose"] = self.data.qpos[qadr:qadr+7].copy()
+            return True
+        return False
+
+    def _toggle_grab(self, ak):
+        cur = self._current_grabbed_by(ak)
+        tk = self._select_target(ak, for_grab=True)
+
+        if cur is not None:
+            aid = self.body_ids[ak]
+            cid = self.obj_body_map[cur]
+            apos = self.data.xpos[aid][:2]
+            cpos = self.data.xpos[cid][:2]
+            if not self.vis_engine.is_visible(
+                apos, cpos, body_exclude=aid, target_body_id=cid
+            ):
+                return False
+
+        if cur is not None and (tk is None or tk == cur):
+            self.object_state[cur]["mode"] = "free"
+            self.object_state[cur]["owner"] = None
+            return True
+        if tk is None:
+            return False
+        st = self.object_state[tk]
+        if st["mode"] == "free":
+            if cur is not None and cur != tk:
+                self.object_state[cur]["mode"] = "free"
+                self.object_state[cur]["owner"] = None
+            st["mode"] = "grabbed"
+            st["owner"] = ak
+            return True
+        return False
+
+    def _handle_buttons(self, ak, lock_btn, grab_btn):
+        prev = self.prev_action_btns[ak]
+        lock_edge = lock_btn > self.BTN_ON and prev[0] <= self.BTN_ON
+        grab_edge = grab_btn > self.BTN_ON and prev[1] <= self.BTN_ON
+        self.prev_action_btns[ak][0] = lock_btn
+        self.prev_action_btns[ak][1] = grab_btn
+        if self.btn_cooldown[ak] > 0:
+            return False, False
+        if lock_edge:
+            lock_evt = self._toggle_lock(ak)
+            self.btn_cooldown[ak] = self.BTN_COOLDOWN
+            return lock_evt, False
+        if grab_edge:
+            grab_evt = self._toggle_grab(ak)
+            self.btn_cooldown[ak] = self.BTN_COOLDOWN
+            return False, grab_evt
+        return False, False
+
+    def _apply_object_constraints(self):
+        for ak in self.agent_keys:
+            if self.btn_cooldown[ak] > 0:
+                self.btn_cooldown[ak] -= 1
+        for tk, st in self.object_state.items():
+            qadr, vadr = self._obj_addr(tk)
+            if st["mode"] == "locked" and st["locked_pose"] is not None:
+                self.data.qpos[qadr:qadr+7] = st["locked_pose"]
+                self.data.qvel[vadr:vadr+6] = 0.0
+            elif st["mode"] == "grabbed" and st["owner"] is not None:
+                owner = st["owner"]
+                opos = self.data.xpos[self.body_ids[owner]][:2]
+                rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[owner]['rot']]]
+                target_xy = opos + np.array([math.cos(rot), math.sin(rot)]) * self.GRAB_OFFSET
+                cur_xy = self.data.qpos[qadr:qadr+2].copy()
+                err_xy = target_xy - cur_xy
+                desired_xy = np.clip(
+                    err_xy * self.GRAB_FOLLOW_GAIN,
+                    -self.GRAB_MAX_SPEED,
+                    self.GRAB_MAX_SPEED,
+                )
+                owner_xy = self.data.qvel[
+                    self.model.jnt_dofadr[self.qpos_indices[owner]['x']]:
+                    self.model.jnt_dofadr[self.qpos_indices[owner]['x']] + 2
+                ]
+                self.data.qvel[vadr:vadr+2] = 0.75 * desired_xy + 0.25 * owner_xy
+                self.data.qvel[vadr+2] = 0.0
+                self.data.qvel[vadr+3:vadr+6] *= 0.6
+        for tk, geom_ids in self.obj_geom_ids.items():
+            mode = self.object_state[tk]["mode"]
+            if mode == "locked":
+                rgba = np.array([0.2, 0.2, 0.2, 1.0])
+            elif mode == "grabbed":
+                rgba = np.array([1.0, 0.85, 0.1, 1.0])
+            else:
+                rgba = self.obj_default_rgba[tk]
+            for gid in geom_ids:
+                self.model.geom_rgba[gid] = rgba
+
+    def _policy_action(self, agent_key, norm_obs):
+        """推論モデルがあれば優先。失敗時は RuleBased にフォールバック。"""
+        policy = self.inference_policies.get(agent_key)
+        if policy is not None:
+            try:
+                pred = policy(norm_obs)
+                arr = np.asarray(pred).reshape(-1)
+                if arr.size >= 4:
+                    return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
+                if arr.size >= 2:
+                    return float(arr[0]), float(arr[1]), 0.0, 0.0
+            except Exception:
+                pass
+        arr = np.asarray(self.npcs[agent_key].get_action(norm_obs, self.idx)).reshape(-1)
+        if arr.size >= 4:
+            return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
+        return float(arr[0]), float(arr[1]), 0.0, 0.0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
         mujoco.mj_resetData(self.model, self.data)
         self._init_agent_intelligence()
+        self._init_interaction_state()
         placed = []
         for bid, rad, z in [(self.ramp_id, self.R_RAMP, 0.1)] + [(b, self.R_BOX, 0.5) for b in self.box_ids]:
             for _ in range(500):
@@ -188,29 +376,58 @@ class TeamCosEnv(gym.Env):
     def step(self, action):
         self.current_step += 1
         af, cv = np.ravel(action), np.zeros(self.model.nu)
+        any_lock_event = False
+        any_grab_event = False
+        any_lock_pressed = False
+        any_grab_pressed = False
+        any_lock_target = False
+        any_grab_target = False
+        max_lock_btn = 0.0
+        max_grab_btn = 0.0
         
         for i, ak in enumerate(self.agent_keys):
             # 【核心】学習対象の判定: seeker なら s, hider なら h1 のみ。
             # h2 は常に NPC (RuleBasedHider) または 推論モデル (将来実装) で制御する。
             if (self.target == "seeker" and ak == "s") or (self.target == "hider" and ak == "h1"):
                 if ak == "s" and self.current_step <= self.prep_steps:
-                    f, t = 0.0, 0.0
+                    f, t, lck, grb = 0.0, 0.0, 0.0, 0.0
                 else:
                     # 外部アクション（常に4要素）を適用
-                    f, t = af[0], af[1]
+                    f = af[0] if len(af) > 0 else 0.0
+                    t = af[1] if len(af) > 1 else 0.0
+                    lck = af[2] if len(af) > 2 else 0.0
+                    grb = af[3] if len(af) > 3 else 0.0
             else:
                 # それ以外（非ターゲットの Seeker や、Hider2）は内部 NPC が制御
                 if ak == "s" and self.current_step <= self.prep_steps:
-                    f, t = 0.0, 0.0
+                    f, t, lck, grb = 0.0, 0.0, 0.0, 0.0
                 else:
                     norm_obs = self._normalize_obs(self._get_obs(i))
-                    f, t, _, _ = self.npcs[ak].get_action(norm_obs, self.idx)
+                    f, t, lck, grb = self._policy_action(ak, norm_obs)
+
+            max_lock_btn = max(max_lock_btn, float(lck))
+            max_grab_btn = max(max_grab_btn, float(grb))
+            lock_pressed = bool(lck > self.BTN_ON)
+            grab_pressed = bool(grb > self.BTN_ON)
+            any_lock_pressed = any_lock_pressed or lock_pressed
+            any_grab_pressed = any_grab_pressed or grab_pressed
+            if lock_pressed and self._select_target(ak, for_grab=False) is not None:
+                any_lock_target = True
+            if grab_pressed and self._select_target(ak, for_grab=True) is not None:
+                any_grab_target = True
+
+            lock_evt, grab_evt = self._handle_buttons(ak, lck, grb)
+            any_lock_event = any_lock_event or lock_evt
+            any_grab_event = any_grab_event or grab_evt
             
             cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = f, t
             self.last_debug_ctrl[ak] = (f, t)
             
         self.data.ctrl[:] = cv
-        for _ in range(5): mujoco.mj_step(self.model, self.data)
+        for _ in range(5):
+            mujoco.mj_step(self.model, self.data)
+            self._apply_object_constraints()
+        mujoco.mj_forward(self.model, self.data)
         
         rb, find = self._compute_team_reward()
         # 学習対象に合わせて観測を生成
@@ -220,7 +437,17 @@ class TeamCosEnv(gym.Env):
                 float(rb if self.target == "hider" else -rb), 
                 False, 
                 self.current_step >= self.max_episode_steps, 
-                {"is_detected": find})
+                {
+                    "is_detected": find,
+                    "lock_event": any_lock_event,
+                    "grab_event": any_grab_event,
+                    "dbg_lock_pressed": any_lock_pressed,
+                    "dbg_grab_pressed": any_grab_pressed,
+                    "dbg_lock_target": any_lock_target,
+                    "dbg_grab_target": any_grab_target,
+                    "dbg_lock_btn_max": max_lock_btn,
+                    "dbg_grab_btn_max": max_grab_btn,
+                })
 
     def _compute_team_reward(self):
         if self.current_step <= self.prep_steps: return 0.0, False
@@ -252,12 +479,39 @@ class TeamCosEnv(gym.Env):
         o[si.VEL_X] = d.qvel[vax] * cos_r - d.qvel[vay] * sin_r
         o[si.VEL_Y] = d.qvel[vax] * sin_r + d.qvel[vay] * cos_r
         o[si.ROT] = rv; o[si.COS_ROT], o[si.SIN_ROT] = math.cos(rv), math.sin(rv)
-        o[self.idx.LIDAR] = self.vis_engine.cast_lidar(ps[:2], rv, 1, self.body_ids[ak])
+        ignore_body_id = -1
+        grabbed_key = self._current_grabbed_by(ak)
+        if grabbed_key is not None:
+            ignore_body_id = self.obj_body_map[grabbed_key]
+        lidar_raw = self.vis_engine.cast_lidar(
+            ps[:2], rv, 1, self.body_ids[ak], ignore_body_id
+        )
+        if grabbed_key is not None:
+            carry_rel = self.data.xpos[ignore_body_id][:2] - ps[:2]
+            h_cos = math.cos(rv)
+            h_sin = math.sin(rv)
+            for i in range(lidar_raw.shape[0]):
+                vx = self.vis_engine.base_cos[i] * h_cos - self.vis_engine.base_sin[i] * h_sin
+                vy = self.vis_engine.base_sin[i] * h_cos + self.vis_engine.base_cos[i] * h_sin
+                proj = carry_rel[0] * vx + carry_rel[1] * vy
+                if proj > 0.0:
+                    lidar_raw[i] = max(0.02, float(lidar_raw[i] - proj))
+        o[self.idx.LIDAR] = lidar_raw
         for i, tid in enumerate(self.box_ids):
             b_idx = self.idx.B[i]; d_w = d.xpos[tid][:2] - ps[:2]
-            o[b_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r; o[b_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r; o[b_idx.IS_MOVING] = 1.0
+            o[b_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r
+            o[b_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r
+            b_vadr = m.jnt_dofadr[m.body_jntadr[tid]]
+            b_speed = math.sqrt(d.qvel[b_vadr] ** 2 + d.qvel[b_vadr + 1] ** 2)
+            o[b_idx.IS_MOVING] = 1.0 if b_speed > 0.05 else 0.0
+            o[b_idx.IS_LOCKED] = 1.0 if self.object_state[f"b{i+1}"]["mode"] == "locked" else 0.0
         r_idx = self.idx.RAMP[0]; d_w_r = d.xpos[self.ramp_id][:2] - ps[:2]
-        o[r_idx.REL_X] = d_w_r[0] * cos_r - d_w_r[1] * sin_r; o[r_idx.REL_Y] = d_w_r[0] * sin_r + d_w_r[1] * cos_r; o[r_idx.IS_MOVING] = 1.0
+        o[r_idx.REL_X] = d_w_r[0] * cos_r - d_w_r[1] * sin_r
+        o[r_idx.REL_Y] = d_w_r[0] * sin_r + d_w_r[1] * cos_r
+        r_vadr = m.jnt_dofadr[m.body_jntadr[self.ramp_id]]
+        r_speed = math.sqrt(d.qvel[r_vadr] ** 2 + d.qvel[r_vadr + 1] ** 2)
+        o[r_idx.IS_MOVING] = 1.0 if r_speed > 0.05 else 0.0
+        o[r_idx.IS_LOCKED] = 1.0 if self.object_state["ramp"]["mode"] == "locked" else 0.0
         ens = ["h1", "h2"] if ak == "s" else ["s", "h2"] if ak == "h1" else ["s", "h1"]
         for i, enm in enumerate(ens):
             en_idx = self.idx.OTHERS[i]; eid = self.body_ids[enm]
