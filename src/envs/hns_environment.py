@@ -1,5 +1,5 @@
 # src/envs/hns_environment.py
-# hns_environment.py v4.58 (学習対象を 1 エージェントに限定するロジックの修正)
+# hns_environment.py v4.5９
 
 import math
 import gymnasium as gym
@@ -41,12 +41,30 @@ class TeamCosEnv(gym.Env):
 
     def __init__(self, mode="initial", target="hider", n_seekers=1,
                  n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None,
-                 inference_policies=None):
+                 inference_policies=None, show_turn_lines=True):
         super().__init__()
+        self.n_seekers = int(n_seekers)
+        self.n_hiders = int(n_hiders)
+        self.n_boxes = int(n_boxes)
+        self.n_ramps = int(n_ramps)
+        if self.n_seekers < 1 or self.n_hiders < 1:
+            raise ValueError("n_seekers and n_hiders must be >= 1")
+        if self.n_ramps < 1:
+            raise ValueError("n_ramps must be >= 1")
         self.mode, self.target, self.render_mode = mode, target, render_mode
+        self.show_turn_lines = bool(show_turn_lines)
         self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
-        self.agent_keys = ["s", "h1", "h2"]
-        self.idx = ObsIdx(n_boxes, n_ramps, n_others=2)
+        if self.n_seekers == 1:
+            self.seeker_keys = ["s"]
+        else:
+            self.seeker_keys = [f"s{i}" for i in range(1, self.n_seekers + 1)]
+        self.hider_keys = [f"h{i}" for i in range(1, self.n_hiders + 1)]
+        self.agent_keys = self.seeker_keys + self.hider_keys
+        self.learnable_agent_key = (
+            self.seeker_keys[0] if target == "seeker" else self.hider_keys[0]
+        )
+        self.learnable_agent_index = self.agent_keys.index(self.learnable_agent_key)
+        self.idx = ObsIdx(n_boxes, n_ramps, n_others=len(self.agent_keys) - 1)
 
         self.model = mujoco.MjModel.from_xml_string(self._build_dynamic_xml())
         self.data = mujoco.MjData(self.model)
@@ -75,14 +93,27 @@ class TeamCosEnv(gym.Env):
 
     def _build_dynamic_xml(self):
         arena = self._xml_static_scene()
-        r = self._xml_ramp(0, [0, 0], 0)
-        b1, b2 = self._xml_box(1, [0, 0], 0), self._xml_box(2, [0, 0], 0)
-        s = self._xml_agent("seeker", 0, [0, 0], 0, (0.9, 0.1, 0.1))
-        h1 = self._xml_agent("hider", 1, [0, 0], 0, (0.1, 0.1, 0.9))
-        h2 = self._xml_agent("hider", 2, [0, 0], 0, (0.1, 0.6, 0.9))
-        acts = (self._xml_actuators("seeker", 0) + 
-                self._xml_actuators("hider", 1) + 
-                self._xml_actuators("hider", 2))
+        ramps = "".join(self._xml_ramp(i, [0, 0], 0) for i in range(1, self.n_ramps + 1))
+        boxes = "".join(self._xml_box(i, [0, 0], 0) for i in range(1, self.n_boxes + 1))
+        seekers = "".join(
+            self._xml_agent(
+                ak,
+                [0, 0],
+                0,
+                (1.0, 0.35, 0.35) if ak == self.learnable_agent_key else (0.75, 0.10, 0.10),
+            )
+            for ak in self.seeker_keys
+        )
+        hiders = "".join(
+            self._xml_agent(
+                ak,
+                [0, 0],
+                0,
+                (0.35, 0.7, 1.0) if ak == self.learnable_agent_key else (0.1, 0.2 + 0.4 * (i % 2), 0.9),
+            )
+            for i, ak in enumerate(self.hider_keys)
+        )
+        acts = "".join(self._xml_actuators(ak) for ak in self.agent_keys)
         
         return f"""
 <mujoco>
@@ -97,7 +128,7 @@ class TeamCosEnv(gym.Env):
   <worldbody>
     <light pos="0 0 12" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
     <camera name="overview" pos="0 13 13" euler="2.35 0 -3.14" mode="fixed" />
-    {arena} {r} {b1} {b2} {s} {h1} {h2}
+        {arena} {ramps} {boxes} {seekers} {hiders}
   </worldbody>
   <actuator>{acts}</actuator>
 </mujoco>"""
@@ -120,9 +151,9 @@ class TeamCosEnv(gym.Env):
     def _xml_ramp(self, i, xy, rot):
         q = _euler_z_to_quat(rot)
         return f"""
-    <body name="ramp_body" pos="{xy[0]} {xy[1]} 0" quat="{q}">
-      <joint type="free" name="ramp_joint" damping="60.0"/>
-            <geom name="ramp_geom" type="mesh" mesh="ramp_mesh" rgba="0 1 0 1" friction="0.5 0.1 0.1"/>
+        <body name="ramp{i}_body" pos="{xy[0]} {xy[1]} 0" quat="{q}">
+            <joint type="free" name="ramp{i}_joint" damping="60.0"/>
+                        <geom name="ramp{i}_geom" type="mesh" mesh="ramp_mesh" rgba="0 1 0 1" friction="0.5 0.1 0.1"/>
     </body>"""
 
     def _xml_box(self, i, xy, rot):
@@ -133,15 +164,15 @@ class TeamCosEnv(gym.Env):
       <geom name="box{i}_geom" type="box" size="0.6 0.6 0.5" rgba="0.75 0.55 0.3 1" friction="0.5 0.005 0.001"/>
     </body>"""
 
-    def _xml_agent(self, tag, i, xy, rot, color):
-        q, pre = _euler_z_to_quat(rot), ("s" if tag == "seeker" else f"h{i}")
+    def _xml_agent(self, pre, xy, rot, color):
+        q = _euler_z_to_quat(rot)
         r, g, b = color
         return f"""
-    <body name="{tag}{i}_anchor" pos="{xy[0]} {xy[1]} 0.5" quat="{q}">
+    <body name="{pre}_anchor" pos="{xy[0]} {xy[1]} 0.5" quat="{q}">
       <joint name="{pre}_x" type="slide" axis="1 0 0" damping="{self.AGENT_DAMPING_XY}"/>
       <joint name="{pre}_y" type="slide" axis="0 1 0" damping="{self.AGENT_DAMPING_XY}"/>
       <joint name="{pre}_rot" type="hinge" axis="0 0 1" damping="{self.AGENT_DAMPING_ROT}"/>
-      <body name="{'seeker_body' if tag=='seeker' else f'hider{i}_body'}">
+      <body name="{pre}_body">
         <site name="{pre}_thrust" pos="0 0 0"/>
         <geom name="{pre}_btm" type="sphere" size="0.4" pos="0 0 -0.1" mass="12" friction="0.1 0.1 0.1"/>
         <geom name="{pre}_capsule" type="capsule" size="0.3 0.3" rgba="{r} {g} {b} 1" mass="4" contype="0" conaffinity="0"/>
@@ -149,42 +180,48 @@ class TeamCosEnv(gym.Env):
       </body>
     </body>"""
 
-    def _xml_actuators(self, tag, i):
-        pre = "s" if tag == "seeker" else f"h{i}"
+    def _xml_actuators(self, pre):
         return f"""
     <general name="{pre}_fwd" site="{pre}_thrust" gear="1 0 0 0 0 0" gainprm="{self.AGENT_ACTUATOR_FWD}" ctrlrange="-1 1"/>
     <general name="{pre}_turn" joint="{pre}_rot" gear="0.5" gainprm="120" ctrlrange="-1 1"/>\n"""
 
     def _analyze_structure(self):
         m = self.model
-        self.body_ids["s"] = m.body("seeker_body").id
-        self.qpos_indices["s"] = {'x': m.joint("s_x").id, 'y': m.joint("s_y").id, 'rot': m.joint("s_rot").id}
-        self.actuator_ids["s_fwd"] = m.actuator("s_fwd").id
-        self.actuator_ids["s_turn"] = m.actuator("s_turn").id
-        for i in [1, 2]:
-            self.body_ids[f"h{i}"] = m.body(f"hider{i}_body").id
-            self.qpos_indices[f"h{i}"] = {'x': m.joint(f"h{i}_x").id, 'y': m.joint(f"h{i}_y").id, 'rot': m.joint(f"h{i}_rot").id}
-            self.actuator_ids[f"h{i}_fwd"] = m.actuator(f"h{i}_fwd").id
-            self.actuator_ids[f"h{i}_turn"] = m.actuator(f"h{i}_turn").id
-        self.ramp_id, self.box_ids = m.body("ramp_body").id, [m.body("box1_body").id, m.body("box2_body").id]
-        self.obj_body_map = {"b1": self.box_ids[0], "b2": self.box_ids[1], "ramp": self.ramp_id}
-        self.obj_geom_ids = {
-            "b1": [m.geom("box1_geom").id],
-            "b2": [m.geom("box2_geom").id],
-            "ramp": [m.geom("ramp_geom").id],
-        }
+        for ak in self.agent_keys:
+            self.body_ids[ak] = m.body(f"{ak}_body").id
+            self.qpos_indices[ak] = {
+                'x': m.joint(f"{ak}_x").id,
+                'y': m.joint(f"{ak}_y").id,
+                'rot': m.joint(f"{ak}_rot").id,
+            }
+            self.actuator_ids[f"{ak}_fwd"] = m.actuator(f"{ak}_fwd").id
+            self.actuator_ids[f"{ak}_turn"] = m.actuator(f"{ak}_turn").id
+        self.ramp_ids = [
+            m.body(f"ramp{i}_body").id
+            for i in range(1, self.n_ramps + 1)
+        ]
+        self.ramp_keys = [f"ramp{i}" for i in range(1, self.n_ramps + 1)]
+        self.box_ids = [m.body(f"box{i}_body").id for i in range(1, self.n_boxes + 1)]
+        self.obj_body_map = {f"b{i}": bid for i, bid in enumerate(self.box_ids, start=1)}
+        for i, rid in enumerate(self.ramp_ids, start=1):
+            self.obj_body_map[f"ramp{i}"] = rid
+        self.obj_geom_ids = {f"b{i}": [m.geom(f"box{i}_geom").id] for i in range(1, self.n_boxes + 1)}
+        for i in range(1, self.n_ramps + 1):
+            self.obj_geom_ids[f"ramp{i}"] = [m.geom(f"ramp{i}_geom").id]
         self.obj_default_rgba = {
             k: m.geom_rgba[v[0]].copy() for k, v in self.obj_geom_ids.items()
         }
 
     def _init_agent_intelligence(self):
-        self.npcs = {"s": RuleBasedSeeker(), "h1": RuleBasedHider(), "h2": RuleBasedHider()}
+        self.npcs = {
+            ak: (RuleBasedSeeker() if ak.startswith("s") else RuleBasedHider())
+            for ak in self.agent_keys
+        }
 
     def _init_interaction_state(self):
         self.object_state = {
-            "b1": {"mode": "free", "owner": None, "locked_pose": None},
-            "b2": {"mode": "free", "owner": None, "locked_pose": None},
-            "ramp": {"mode": "free", "owner": None, "locked_pose": None},
+            tk: {"mode": "free", "owner": None, "locked_pose": None}
+            for tk in self.obj_body_map
         }
         self.prev_action_btns = {ak: np.zeros(2, dtype=np.float32) for ak in self.agent_keys}
         self.btn_cooldown = {ak: 0 for ak in self.agent_keys}
@@ -353,7 +390,9 @@ class TeamCosEnv(gym.Env):
         self._init_agent_intelligence()
         self._init_interaction_state()
         placed = []
-        for bid, rad, z in [(self.ramp_id, self.R_RAMP, 0.1)] + [(b, self.R_BOX, 0.5) for b in self.box_ids]:
+        ramp_specs = [(rid, self.R_RAMP, 0.1) for rid in self.ramp_ids]
+        box_specs = [(b, self.R_BOX, 0.5) for b in self.box_ids]
+        for bid, rad, z in ramp_specs + box_specs:
             for _ in range(500):
                 p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
                 if not any(np.linalg.norm(p-pp) < (rad+pr+0.2) for pp, pr in placed):
@@ -369,8 +408,8 @@ class TeamCosEnv(gym.Env):
                     placed.append((p, self.R_AGENT)); break
         mujoco.mj_forward(self.model, self.data)
         
-        # 学習対象の観測を返す (seeker なら s, hider なら h1)
-        idx_to_obs = 0 if self.target == "seeker" else 1
+        # 学習対象の観測を返す
+        idx_to_obs = self.learnable_agent_index
         return self._normalize_obs(self._get_obs(idx_to_obs)), {"is_detected": False}
 
     def step(self, action):
@@ -386,10 +425,9 @@ class TeamCosEnv(gym.Env):
         max_grab_btn = 0.0
         
         for i, ak in enumerate(self.agent_keys):
-            # 【核心】学習対象の判定: seeker なら s, hider なら h1 のみ。
-            # h2 は常に NPC (RuleBasedHider) または 推論モデル (将来実装) で制御する。
-            if (self.target == "seeker" and ak == "s") or (self.target == "hider" and ak == "h1"):
-                if ak == "s" and self.current_step <= self.prep_steps:
+            is_seeker = ak.startswith("s")
+            if ak == self.learnable_agent_key:
+                if is_seeker and self.current_step <= self.prep_steps:
                     f, t, lck, grb = 0.0, 0.0, 0.0, 0.0
                 else:
                     # 外部アクション（常に4要素）を適用
@@ -398,8 +436,8 @@ class TeamCosEnv(gym.Env):
                     lck = af[2] if len(af) > 2 else 0.0
                     grb = af[3] if len(af) > 3 else 0.0
             else:
-                # それ以外（非ターゲットの Seeker や、Hider2）は内部 NPC が制御
-                if ak == "s" and self.current_step <= self.prep_steps:
+                # 非学習エージェントは推論モデル優先、なければRuleBased
+                if is_seeker and self.current_step <= self.prep_steps:
                     f, t, lck, grb = 0.0, 0.0, 0.0, 0.0
                 else:
                     norm_obs = self._normalize_obs(self._get_obs(i))
@@ -431,7 +469,7 @@ class TeamCosEnv(gym.Env):
         
         rb, find = self._compute_team_reward()
         # 学習対象に合わせて観測を生成
-        idx_to_obs = 0 if self.target == "seeker" else 1
+        idx_to_obs = self.learnable_agent_index
         
         return (self._normalize_obs(self._get_obs(idx_to_obs)), 
                 float(rb if self.target == "hider" else -rb), 
@@ -450,12 +488,25 @@ class TeamCosEnv(gym.Env):
                 })
 
     def _compute_team_reward(self):
-        if self.current_step <= self.prep_steps: return 0.0, False
-        sid, h1id, h2id = self.body_ids['s'], self.body_ids['h1'], self.body_ids['h2']
-        sp, sr = self.data.xpos[sid][:2], self.data.qpos[self.model.jnt_qposadr[self.qpos_indices['s']['rot']]]
-        f1 = self._is_vis(sp, sr, self.data.xpos[h1id][:2], sid, h1id)
-        f2 = self._is_vis(sp, sr, self.data.xpos[h2id][:2], sid, h2id)
-        return (-1.0 if (f1 or f2) else 1.0), bool(f1 or f2)
+        if self.current_step <= self.prep_steps:
+            return 0.0, False
+        seen_count = 0
+        for hk in self.hider_keys:
+            hid = self.body_ids[hk]
+            hpos = self.data.xpos[hid][:2]
+            seen = False
+            for sk in self.seeker_keys:
+                sid = self.body_ids[sk]
+                spos = self.data.xpos[sid][:2]
+                srot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[sk]['rot']]]
+                if self._is_vis(spos, srot, hpos, sid, hid):
+                    seen = True
+                    break
+            if seen:
+                seen_count += 1
+        # hiderチーム視点: 各hiderについて「見つかっていなければ+1, 見つかれば-1」
+        team_reward = float(self.n_hiders - 2 * seen_count)
+        return team_reward, bool(seen_count > 0)
 
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
         rel = t_pos - pos; dist = math.sqrt(np.sum(rel**2)) + 1e-8
@@ -505,15 +556,21 @@ class TeamCosEnv(gym.Env):
             b_speed = math.sqrt(d.qvel[b_vadr] ** 2 + d.qvel[b_vadr + 1] ** 2)
             o[b_idx.IS_MOVING] = 1.0 if b_speed > 0.05 else 0.0
             o[b_idx.IS_LOCKED] = 1.0 if self.object_state[f"b{i+1}"]["mode"] == "locked" else 0.0
-        r_idx = self.idx.RAMP[0]; d_w_r = d.xpos[self.ramp_id][:2] - ps[:2]
-        o[r_idx.REL_X] = d_w_r[0] * cos_r - d_w_r[1] * sin_r
-        o[r_idx.REL_Y] = d_w_r[0] * sin_r + d_w_r[1] * cos_r
-        r_vadr = m.jnt_dofadr[m.body_jntadr[self.ramp_id]]
-        r_speed = math.sqrt(d.qvel[r_vadr] ** 2 + d.qvel[r_vadr + 1] ** 2)
-        o[r_idx.IS_MOVING] = 1.0 if r_speed > 0.05 else 0.0
-        o[r_idx.IS_LOCKED] = 1.0 if self.object_state["ramp"]["mode"] == "locked" else 0.0
-        ens = ["h1", "h2"] if ak == "s" else ["s", "h2"] if ak == "h1" else ["s", "h1"]
-        for i, enm in enumerate(ens):
+        for i, rid in enumerate(self.ramp_ids):
+            r_idx = self.idx.RAMP[i]
+            d_w_r = d.xpos[rid][:2] - ps[:2]
+            o[r_idx.REL_X] = d_w_r[0] * cos_r - d_w_r[1] * sin_r
+            o[r_idx.REL_Y] = d_w_r[0] * sin_r + d_w_r[1] * cos_r
+            r_vadr = m.jnt_dofadr[m.body_jntadr[rid]]
+            r_speed = math.sqrt(d.qvel[r_vadr] ** 2 + d.qvel[r_vadr + 1] ** 2)
+            o[r_idx.IS_MOVING] = 1.0 if r_speed > 0.05 else 0.0
+            o[r_idx.IS_LOCKED] = 1.0 if self.object_state[f"ramp{i+1}"]["mode"] == "locked" else 0.0
+        ens = [k for k in self.agent_keys if k != ak]
+        if ak.startswith("s"):
+            ens.sort(key=lambda k: (0 if k.startswith("h") else 1, k))
+        else:
+            ens.sort(key=lambda k: (0 if k.startswith("s") else 1, k))
+        for i, enm in enumerate(ens[:len(self.idx.OTHERS)]):
             en_idx = self.idx.OTHERS[i]; eid = self.body_ids[enm]
             if self._is_vis(ps[:2], rv, d.xpos[eid][:2], self.body_ids[ak], eid):
                 d_w = d.xpos[eid][:2] - ps[:2]; o[en_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r; o[en_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r; o[en_idx.VISIBLE] = 1.0
@@ -530,9 +587,10 @@ class TeamCosEnv(gym.Env):
             for ak in self.agent_keys:
                 sid = self.body_ids[ak]; pos = self.data.xpos[sid]; rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]['rot']]]
                 t_val = self.last_debug_ctrl[ak][1]
-                if abs(t_val) > 0.005:
-                    h = 1.1 if ak == "s" else 1.3
-                    color = [0, 1, 1, 1.0] if ak == "s" else [0, 0.2, 1, 1.0]
+                if self.show_turn_lines and abs(t_val) > 0.005:
+                    is_seeker = ak.startswith("s")
+                    h = 1.1 if is_seeker else 1.3
+                    color = [0, 1, 1, 1.0] if is_seeker else [0, 0.2, 1, 1.0]
                     p_start = pos.copy(); p_start[2] = h; p_end = p_start.copy()
                     p_end[0] += -math.sin(rot) * t_val * 2.0; p_end[1] += math.cos(rot) * t_val * 2.0
                     if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
@@ -540,7 +598,10 @@ class TeamCosEnv(gym.Env):
                         mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 8.0 + abs(t_val)*25, p_start, p_end)
                         g.rgba[:] = color
                         self.viewer.user_scn.ngeom += 1
-                targets = [(self.body_ids[k], [1,0,0,1] if ak=='s' else [0,0,1,1]) for k in self.agent_keys if k != ak]
+                targets = [
+                    (self.body_ids[k], [1, 0, 0, 1] if ak.startswith("s") else [0, 0, 1, 1])
+                    for k in self.agent_keys if k != ak
+                ]
                 for tid, color in targets:
                     if self._is_vis(pos[:2], rot, self.data.xpos[tid][:2], sid, tid):
                         if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
@@ -548,12 +609,6 @@ class TeamCosEnv(gym.Env):
                             mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 2.0, pos, self.data.xpos[tid])
                             g.rgba[:] = color
                             self.viewer.user_scn.ngeom += 1
-            obs_raw = self._get_obs(0); h1_idx = self.idx.OTHERS[0]
-            if obs_raw[h1_idx.VISIBLE] > 0.5:
-                lx, ly = obs_raw[h1_idx.REL_X], obs_raw[h1_idx.REL_Y]; sid = self.body_ids["s"]; spos = self.data.xpos[sid][:2]; srot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices["s"]["rot"]]]
-                wx = spos[0] + lx * math.cos(srot) - ly * math.sin(srot); wy = spos[1] + lx * math.sin(srot) + ly * math.cos(srot)
-                if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
-                    g = self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom]; g.type, g.size[:], g.pos[:], g.rgba[:], g.matid = mujoco.mjtGeom.mjGEOM_SPHERE, [0.2, 0.2, 0.2], [wx, wy, 1.2], [1, 1, 0, 1], -1; self.viewer.user_scn.ngeom += 1
         self.viewer.sync()
 
     def close(self):

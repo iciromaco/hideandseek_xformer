@@ -1,5 +1,5 @@
 # src/agents/scripted_agents.py
-# scripted_agents.py v5.43 (論理の整理とHider追いかけ挙動の根本排除)
+# scripted_agents.py v5.44 
 
 import numpy as np
 import math

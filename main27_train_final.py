@@ -15,6 +15,7 @@ from envs.hns_environment import TeamCosEnv
 TRAIN_MODE = False
 USE_VIEWER = True
 NPC_ONLY_DEBUG = True
+SHOW_TURN_LINES = False
 
 # src ディレクトリを検索パスに追加
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
@@ -46,10 +47,11 @@ def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker"):
 def run_simulation():
     """メインシミュレーションループ。"""
     config = {
-        "n_seekers": 1,
-        "n_hiders": 2,
+        "n_seekers": 2,
+        "n_hiders": 3,
         "n_boxes": 2,
-        "n_ramps": 1
+        "n_ramps": 3,
+        "show_turn_lines": SHOW_TURN_LINES,
     }
 
     print("Initializing Environment...")
