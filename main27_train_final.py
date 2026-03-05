@@ -76,6 +76,8 @@ def run_simulation():
             grab_events = 0
             lock_events_window = 0
             grab_events_window = 0
+            sat_count = 0
+            boosted_count = 0
 
             target_npc = None
             if NPC_ONLY_DEBUG:
@@ -103,6 +105,9 @@ def run_simulation():
                 grab_events += int(info.get("grab_event", 0))
                 lock_events_window += int(info.get("lock_event", 0))
                 grab_events_window += int(info.get("grab_event", 0))
+                boosted_count += int(info.get("dbg_boosted_agents", 0) > 0)
+                if float(np.max(np.abs(action[:2]))) >= 0.9:
+                    sat_count += 1
 
                 if USE_VIEWER:
                     env.render()
@@ -130,14 +135,22 @@ def run_simulation():
                         f"WinLock={lock_events_window} "
                         f"WinGrab={grab_events_window} "
                         f"CumLock={lock_events} "
-                        f"CumGrab={grab_events}"
+                        f"CumGrab={grab_events} "
+                        f"BoxMove={int(info.get('dbg_box_moving_count', 0))} "
+                        f"RampMove={int(info.get('dbg_ramp_moving_count', 0))} "
+                        f"MaxBoxV={float(info.get('dbg_max_box_speed', 0.0)):.2f} "
+                        f"MaxRampV={float(info.get('dbg_max_ramp_speed', 0.0)):.2f} "
+                        f"BlockedRamp={int(info.get('dbg_blocked_ramp_count', 0))} "
+                        f"Boosted={int(info.get('dbg_boosted_agents', 0))}"
                     )
                     lock_events_window = 0
                     grab_events_window = 0
 
             print(
                 f"Ep {episode} Finished. Steps={step_count}, Reward={ep_reward:.2f}, "
-                f"LockEvents={lock_events}, GrabEvents={grab_events}"
+                f"LockEvents={lock_events}, GrabEvents={grab_events}, "
+                f"ActSatRatio={sat_count / max(step_count, 1):.2f}, "
+                f"BoostUseRatio={boosted_count / max(step_count, 1):.2f}"
             )
 
     except KeyboardInterrupt:
