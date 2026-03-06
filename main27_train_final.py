@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from numba import njit
+from numba import njit, prange
 
 try:
     import wandb
@@ -268,23 +268,8 @@ HPARAMS_CONFIG_PATH = CONFIG_PATH
 RW_SEEK_VISIBLE_BONUS = _cfg("RW_SEEK_VISIBLE_BONUS", "0.03", float)
 RW_SEEK_DIST_GAIN = _cfg("RW_SEEK_DIST_GAIN", "0.03", float)
 RW_SEEK_IDLE_PENALTY = _cfg("RW_SEEK_IDLE_PENALTY", "0.01", float)
-
-'''
-RW_HIDE_HIDDEN_BONUS = _cfg("RW_HIDE_HIDDEN_BONUS", "0.06", float)
-RW_HIDE_VISIBLE_PENALTY = _cfg("RW_HIDE_VISIBLE_PENALTY", "0.06", float)
-RW_HIDE_DIST_GAIN = _cfg("RW_HIDE_DIST_GAIN", "0.04", float)
-RW_HIDE_BACKWARD_PENALTY = _cfg("RW_HIDE_BACKWARD_PENALTY", "0.05", float)
-RW_HIDE_IDLE_PENALTY = _cfg("RW_HIDE_IDLE_PENALTY", "0.02", float)
-RW_HIDE_WALL_STICK_PENALTY = _cfg("RW_HIDE_WALL_STICK_PENALTY", "0.03", float)
-'''
 RW_HIDE_WALL_NEAR_THRESHOLD = _cfg("RW_HIDE_WALL_NEAR_THRESHOLD", "0.18", float)
 RW_HIDE_STILL_SPEED_THRESHOLD = _cfg("RW_HIDE_STILL_SPEED_THRESHOLD", "0.05", float)
-'''
-RW_HIDE_VISIBLE_FRONT_PENALTY = _cfg("RW_HIDE_VISIBLE_FRONT_PENALTY", "0.04", float)
-RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("RW_HIDE_VISIBLE_NEAR_PENALTY", "0.015", float)
-RW_HIDE_SEEKER_GAZE_COS_PENALTY = _cfg("RW_HIDE_SEEKER_GAZE_COS_PENALTY", "0.03", float)
-RW_HIDE_SEEKER_GAZE_COS_DIST_PENALTY = _cfg("RW_HIDE_SEEKER_GAZE_COS_DIST_PENALTY", "0.01", float)
-'''
 
 RW_MOVE_SAT_PENALTY = _cfg("RW_MOVE_SAT_PENALTY", "0.02", float)
 RW_TURN_SAT_PENALTY = _cfg("RW_TURN_SAT_PENALTY", "0.01", float)
@@ -295,6 +280,97 @@ RW_HAND_CTRL_COST = _cfg("RW_HAND_CTRL_COST", "0.0005", float)
 RW_MOVE_INCENTIVE = _cfg("RW_MOVE_INCENTIVE", "0.02", float)
 RW_IDLE_PENALTY = _cfg("RW_IDLE_PENALTY", "0.03", float)
 RW_WALL_AVOID_PENALTY = _cfg("RW_WALL_AVOID_PENALTY", "0.05", float)
+
+
+def _index_spec_to_array(index_spec):
+    if isinstance(index_spec, slice):
+        start = 0 if index_spec.start is None else int(index_spec.start)
+        stop = int(index_spec.stop)
+        step = 1 if index_spec.step is None else int(index_spec.step)
+        return np.arange(start, stop, step, dtype=np.int32)
+    return np.asarray(index_spec, dtype=np.int32)
+
+
+def _build_reward_index_cache(idx):
+    return {
+        "self_vel_x": int(idx.SELF.VEL_X),
+        "self_vel_y": int(idx.SELF.VEL_Y),
+        "lidar": _index_spec_to_array(idx.LIDAR),
+        "enemy_visible": np.asarray([int(en.VISIBLE) for en in idx.OTHERS], dtype=np.int32),
+        "enemy_rel_x": np.asarray([int(en.REL_X) for en in idx.OTHERS], dtype=np.int32),
+        "enemy_rel_y": np.asarray([int(en.REL_Y) for en in idx.OTHERS], dtype=np.int32),
+    }
+
+
+def _min_lidar_from_obs(obs, lidar_indices):
+    lidar_min = 1.0
+    for lidar_idx in lidar_indices:
+        value = float(obs[int(lidar_idx)])
+        if value < lidar_min:
+            lidar_min = value
+    return lidar_min
+
+
+@njit(cache=True, parallel=True)
+def _compute_custom_reward_batch_numba(
+    obs_batch,
+    action_batch,
+    base_reward_batch,
+    target_is_hider,
+    self_vel_x_idx,
+    self_vel_y_idx,
+    lidar_indices,
+    enemy_visible_indices,
+    enemy_rel_x_indices,
+    enemy_rel_y_indices,
+    move_ctrl_cost,
+    move_incentive,
+    idle_penalty,
+    wall_avoid_penalty,
+):
+    n_envs = obs_batch.shape[0]
+    rewards = np.empty(n_envs, dtype=np.float32)
+    for i in prange(n_envs):
+        move = float(action_batch[i, 0])
+        turn = float(action_batch[i, 1])
+        vel_x = float(obs_batch[i, self_vel_x_idx])
+        vel_y = float(obs_batch[i, self_vel_y_idx])
+        speed = math.sqrt(vel_x * vel_x + vel_y * vel_y)
+
+        control_cost = -move_ctrl_cost * (move * move + turn * turn)
+        bonus = 0.0
+
+        if target_is_hider:
+            if speed < 0.1:
+                bonus -= idle_penalty
+            elif speed > 0.3:
+                bonus += move_incentive
+
+            lidar_min = 1.0
+            for j in range(lidar_indices.shape[0]):
+                lidar_val = float(obs_batch[i, lidar_indices[j]])
+                if lidar_val < lidar_min:
+                    lidar_min = lidar_val
+            if lidar_min < 0.3:
+                ratio = lidar_min / 0.3
+                if ratio < 0.0:
+                    ratio = 0.0
+                elif ratio > 1.0:
+                    ratio = 1.0
+                bonus -= wall_avoid_penalty * (1.0 - ratio)
+        else:
+            if speed < 0.1:
+                bonus -= idle_penalty
+
+            for j in range(enemy_visible_indices.shape[0]):
+                if obs_batch[i, enemy_visible_indices[j]] > 0.5:
+                    dx = float(obs_batch[i, enemy_rel_x_indices[j]])
+                    dy = float(obs_batch[i, enemy_rel_y_indices[j]])
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    bonus += 0.05 / (dist + 1.0)
+
+        rewards[i] = float(base_reward_batch[i]) + bonus + control_cost
+    return rewards
 
 class ObsHistory:
     def __init__(self, num_envs, seq_len, obs_dim, device):
@@ -424,9 +500,13 @@ def init_wandb_run(hp, model_path, training_target):
         run.log({"run_initialized": 1}, step=0)
         run.define_metric("global_step")
         run.define_metric("train/*", step_metric="global_step")
+        run.define_metric("perf/*", step_metric="global_step")
         run.define_metric("env/*", step_metric="global_step")
         run.define_metric("system/*", step_metric="global_step")
         run.define_metric("eval/*", step_metric="global_step")
+        run.define_metric("perf/reward_compute_ms_per_step", summary="min")
+        run.define_metric("perf/env_step_ms_per_step", summary="mean")
+        run.define_metric("perf/reward_to_env_time_ratio", summary="mean")
         if getattr(run, "url", None):
             print(f"wandb run url: {run.url}")
         return run
@@ -819,99 +899,7 @@ def run_ramp_check_viewer(mode, target, agent, device, episodes=3, max_steps=220
     finally:
         eval_env.close()
 
-'''
-@njit(cache=True)
-def _compute_custom_reward_core(
-    base_reward,
-    target_is_seeker,
-    visible,
-    enemy_visible_count,
-    min_enemy_dist,
-    min_visible_enemy_dist,
-    nearest_enemy_rel_x,
-    nearest_visible_rel_x,
-    speed,
-    lidar_min,
-    move,
-    turn,
-    lock_a,
-    grab_a,
-    gaze_cos_front_max,
-    gaze_cos_front_dist_max,
-    rw_seek_visible_bonus,
-    rw_seek_dist_gain,
-    rw_seek_idle_penalty,
-    rw_hide_hidden_bonus,
-    rw_hide_visible_penalty,
-    rw_hide_dist_gain,
-    rw_hide_backward_penalty,
-    rw_hide_idle_penalty,
-    rw_hide_wall_stick_penalty,
-    rw_hide_wall_near_threshold,
-    rw_hide_still_speed_threshold,
-    rw_hide_visible_front_penalty,
-    rw_hide_visible_near_penalty,
-    rw_hide_seeker_gaze_cos_penalty,
-    rw_hide_seeker_gaze_cos_dist_penalty,
-    rw_turn_sat_penalty,
-    rw_move_sat_penalty,
-    rw_move_ctrl_cost,
-    rw_hand_ctrl_cost,
-):
-    bonus = 0.0
-    if target_is_seeker:
-        if visible:
-            bonus += rw_seek_visible_bonus * enemy_visible_count
-            bonus += rw_seek_dist_gain / (min_visible_enemy_dist + 0.2)
-        if speed < 0.01:
-            bonus -= rw_seek_idle_penalty
-    else:
-        if visible:
-            vis_weight = enemy_visible_count if enemy_visible_count > 0 else 1
-            vis_dist_raw = min_visible_enemy_dist if enemy_visible_count > 0 else min_enemy_dist
-            vis_rel_x = nearest_visible_rel_x if enemy_visible_count > 0 else nearest_enemy_rel_x
-            vis_dist = vis_dist_raw if vis_dist_raw > 1e-6 else 1e-6
-            vis_frontness = vis_rel_x / vis_dist
-            if vis_frontness < 0.0:
-                vis_frontness = 0.0
-            bonus -= rw_hide_visible_penalty * vis_weight
-            bonus -= rw_hide_visible_front_penalty * vis_frontness
-            bonus -= rw_hide_visible_near_penalty / (vis_dist_raw + 0.2)
-            bonus -= rw_hide_seeker_gaze_cos_penalty * (gaze_cos_front_max if gaze_cos_front_max > 0.0 else 0.0)
-            bonus -= rw_hide_seeker_gaze_cos_dist_penalty * (
-                gaze_cos_front_dist_max if gaze_cos_front_dist_max > 0.0 else 0.0
-            )
-        else:
-            bonus += rw_hide_hidden_bonus
-        bonus += rw_hide_dist_gain * (min_enemy_dist if min_enemy_dist < 1.5 else 1.5)
-        back = -move
-        if back < 0.0:
-            back = 0.0
-        bonus -= rw_hide_backward_penalty * back
-        if speed < 0.01:
-            bonus -= rw_hide_idle_penalty
-        if lidar_min < rw_hide_wall_near_threshold and speed < rw_hide_still_speed_threshold:
-            bonus -= rw_hide_wall_stick_penalty
-
-    turn_excess = abs(turn) - 0.9
-    if turn_excess < 0.0:
-        turn_excess = 0.0
-    move_excess = abs(move) - 0.9
-    if move_excess < 0.0:
-        move_excess = 0.0
-    turn_sat_cost = rw_turn_sat_penalty * turn_excess
-    move_sat_cost = rw_move_sat_penalty * move_excess
-
-    control_cost = -(
-        rw_move_ctrl_cost * (move * move + turn * turn)
-        + rw_hand_ctrl_cost * (lock_a * lock_a + grab_a * grab_a)
-        + turn_sat_cost
-        + move_sat_cost
-    )
-    return base_reward + bonus + control_cost
-'''
-
-def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker", info=None):
+def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker", info=None, reward_idx_cache=None):
     """
     版改１：高水準な行動インセンティブのみ
     パラメータ数：13 個 → 3 個に削減
@@ -919,122 +907,46 @@ def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker", i
     bonus = 0.0
     
     # 共通
-    speed = math.sqrt(obs[idx.SELF.VEL_X] ** 2 + obs[idx.SELF.VEL_Y] ** 2)
+    cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
+    speed = math.sqrt(obs[cache["self_vel_x"]] ** 2 + obs[cache["self_vel_y"]] ** 2)
     move = float(action[0])
     turn = float(action[1])
     
     # 制御コスト（全員共通、最小限）
-    control_cost = -0.001 * (move**2 + turn**2)
+    control_cost = -RW_MOVE_CTRL_COST * (move**2 + turn**2)
     
     if target_team == "hider":
         # ① 移動インセンティブ（アイドル防止）
         if speed < 0.1:
-            bonus -= 0.03  # 止まってたらペナルティ
+            bonus -= RW_IDLE_PENALTY
         elif speed > 0.3:
-            bonus += 0.02  # 逃げてたらボーナス
+            bonus += RW_MOVE_INCENTIVE
         
         # ② 壁回避
-        lidar_vals = np.asarray(obs[idx.LIDAR], dtype=np.float32)
-        lidar_min = float(np.min(lidar_vals)) if lidar_vals.size > 0 else 1.0
+        lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
         if lidar_min < 0.3:  # 危険に近い
-            bonus -= 0.05 * (1.0 - np.clip(lidar_min / 0.3, 0, 1))
+            bonus -= RW_WALL_AVOID_PENALTY * (1.0 - np.clip(lidar_min / 0.3, 0, 1))
     
     else:  # seeker
         # ① 移動奨励
         if speed < 0.1:
-            bonus -= 0.03
+            bonus -= RW_IDLE_PENALTY
         
         # ② 敵に接近（見えている場合）
-        visible_enemies = [en for en in idx.OTHERS if obs[en.VISIBLE] > 0.5]
-        if visible_enemies:
-            for en in visible_enemies:
-                dx = float(obs[en.REL_X])
-                dy = float(obs[en.REL_Y])
+        for enemy_idx in range(cache["enemy_visible"].shape[0]):
+            if obs[cache["enemy_visible"][enemy_idx]] > 0.5:
+                dx = float(obs[cache["enemy_rel_x"][enemy_idx]])
+                dy = float(obs[cache["enemy_rel_y"][enemy_idx]])
                 dist = math.sqrt(dx**2 + dy**2)
                 # 距離に反比例の報酬（最大距離でも信号がある）
                 bonus += 0.05 / (dist + 1.0)
     
     return base_reward + bonus + control_cost
 
-'''
-def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker", info=None):
-    enemy_visible_count = 0
-    min_enemy_dist = 999.0
-    min_visible_enemy_dist = 999.0
-    nearest_enemy_rel_x = 0.0
-    nearest_visible_rel_x = 0.0
-    for en in idx.OTHERS:
-        rel_x = float(obs[en.REL_X])
-        rel_y = float(obs[en.REL_Y])
-        d = math.sqrt(rel_x ** 2 + rel_y ** 2)
-        if d < min_enemy_dist:
-            min_enemy_dist = d
-            nearest_enemy_rel_x = rel_x
-        if obs[en.VISIBLE] > 0.5:
-            enemy_visible_count += 1
-            if d < min_visible_enemy_dist:
-                min_visible_enemy_dist = d
-                nearest_visible_rel_x = rel_x
-    speed = math.sqrt(obs[idx.SELF.VEL_X] ** 2 + obs[idx.SELF.VEL_Y] ** 2)
-    lidar_vals = np.asarray(obs[idx.LIDAR], dtype=np.float32)
-    lidar_min = float(np.min(lidar_vals)) if lidar_vals.size > 0 else 1.0
-
-    move = float(action[0])
-    turn = float(action[1])
-    lock_a = float(action[2])
-    grab_a = float(action[3])
-    visible = enemy_visible_count > 0
-    if target_team != "seeker" and isinstance(info, dict):
-        visible = bool(info.get("dbg_learnable_hider_seen", info.get("is_detected", visible)))
-    gaze_cos_front_max = 0.0
-    gaze_cos_front_dist_max = 0.0
-    if isinstance(info, dict):
-        gaze_cos_front_max = float(info.get("dbg_seek_gaze_cos_front_max", 0.0))
-        gaze_cos_front_dist_max = float(info.get("dbg_seek_gaze_cos_front_dist_max", 0.0))
-
-    return _compute_custom_reward_core(
-        float(base_reward),
-        bool(target_team == "seeker"),
-        bool(visible),
-        int(enemy_visible_count),
-        float(min_enemy_dist),
-        float(min_visible_enemy_dist),
-        float(nearest_enemy_rel_x),
-        float(nearest_visible_rel_x),
-        float(speed),
-        float(lidar_min),
-        float(move),
-        float(turn),
-        float(lock_a),
-        float(grab_a),
-        float(gaze_cos_front_max),
-        float(gaze_cos_front_dist_max),
-        float(RW_SEEK_VISIBLE_BONUS),
-        float(RW_SEEK_DIST_GAIN),
-        float(RW_SEEK_IDLE_PENALTY),
-        float(RW_HIDE_HIDDEN_BONUS),
-        float(RW_HIDE_VISIBLE_PENALTY),
-        float(RW_HIDE_DIST_GAIN),
-        float(RW_HIDE_BACKWARD_PENALTY),
-        float(RW_HIDE_IDLE_PENALTY),
-        float(RW_HIDE_WALL_STICK_PENALTY),
-        float(RW_HIDE_WALL_NEAR_THRESHOLD),
-        float(RW_HIDE_STILL_SPEED_THRESHOLD),
-        float(RW_HIDE_VISIBLE_FRONT_PENALTY),
-        float(RW_HIDE_VISIBLE_NEAR_PENALTY),
-        float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
-        float(RW_HIDE_SEEKER_GAZE_COS_DIST_PENALTY),
-        float(RW_TURN_SAT_PENALTY),
-        float(RW_MOVE_SAT_PENALTY),
-        float(RW_MOVE_CTRL_COST),
-        float(RW_HAND_CTRL_COST),
-    )
-'''
-
-def _is_wall_stick_state(obs, idx):
-    speed = math.sqrt(float(obs[idx.SELF.VEL_X]) ** 2 + float(obs[idx.SELF.VEL_Y]) ** 2)
-    lidar_vals = np.asarray(obs[idx.LIDAR], dtype=np.float32)
-    lidar_min = float(np.min(lidar_vals)) if lidar_vals.size > 0 else 1.0
+def _is_wall_stick_state(obs, idx, reward_idx_cache=None):
+    cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
+    speed = math.sqrt(float(obs[cache["self_vel_x"]]) ** 2 + float(obs[cache["self_vel_y"]]) ** 2)
+    lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
     return bool(
         (lidar_min < RW_HIDE_WALL_NEAR_THRESHOLD)
         and (speed < RW_HIDE_STILL_SPEED_THRESHOLD)
@@ -1213,6 +1125,7 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
 
 def run_debug_or_playback(env, agent, device, model_loaded):
     idx = env.idx
+    reward_idx_cache = _build_reward_index_cache(idx)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
     history = ObsHistory(1, SEQ_LEN, obs_dim, device)
@@ -1262,7 +1175,7 @@ def run_debug_or_playback(env, agent, device, model_loaded):
 
             next_obs, base_r, term, trun, info = env.step(action)
             reward = (
-                compute_custom_reward(obs, action, base_r, idx, env.target, info)
+                compute_custom_reward(obs, action, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
                 if USE_CUSTOM_REWARD else base_r
             )
 
@@ -1360,6 +1273,7 @@ def run_train(
         os.replace(tmp_path, path)
 
     idx = env.idx
+    reward_idx_cache = _build_reward_index_cache(idx)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
     history = ObsHistory(1, SEQ_LEN, obs_dim, device)
@@ -1397,6 +1311,8 @@ def run_train(
             wall_stick_seen_steps = 0
             entropy_sum = 0.0
             entropy_count = 0
+            reward_compute_sec_sum = 0.0
+            env_step_sec_sum = 0.0
 
             for t in range(hp["rollout_steps"]):
                 if USE_VIEWER and env.viewer and not env.viewer.is_running():
@@ -1409,11 +1325,15 @@ def run_train(
                     action, logp, _, value = agent.get_action_and_value(seq)
 
                 action_np = action.cpu().numpy().reshape(-1)
+                step_t0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = env.step(action_np)
+                env_step_sec_sum += time.perf_counter() - step_t0
+                reward_t0 = time.perf_counter()
                 reward = (
-                    compute_custom_reward(obs, action_np, base_r, idx, env.target, info)
+                    compute_custom_reward(obs, action_np, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
                     if USE_CUSTOM_REWARD else base_r
                 )
+                reward_compute_sec_sum += time.perf_counter() - reward_t0
 
                 done = bool(term or trun)
                 done_last = float(done)
@@ -1436,7 +1356,7 @@ def run_train(
                 seen_learnable = bool(info.get("dbg_learnable_hider_seen", info.get("is_detected", False)))
                 if seen_learnable:
                     learnable_seen_steps += 1
-                is_wall_stick = _is_wall_stick_state(next_obs, idx)
+                is_wall_stick = _is_wall_stick_state(next_obs, idx, reward_idx_cache=reward_idx_cache)
                 if is_wall_stick:
                     wall_stick_steps += 1
                     if seen_learnable:
@@ -1520,6 +1440,9 @@ def run_train(
             avg_reward = rewards_sum / hp["rollout_steps"]
             avg_blocked_ramp = blocked_ramp_sum / hp["rollout_steps"]
             avg_entropy = entropy_sum / max(entropy_count, 1)
+            reward_compute_ms_per_step = 1000.0 * reward_compute_sec_sum / max(hp["rollout_steps"], 1)
+            env_step_ms_per_step = 1000.0 * env_step_sec_sum / max(hp["rollout_steps"], 1)
+            reward_time_ratio = reward_compute_sec_sum / max(env_step_sec_sum, 1e-9)
             ramp_eval = None
             if (
                 RAMP_CHECK_ENABLED
@@ -1546,6 +1469,9 @@ def run_train(
                     "train/learnable_seen_rate": learnable_seen_rate,
                     "train/wall_stick_ratio": wall_stick_ratio,
                     "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
+                    "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,
+                    "perf/env_step_ms_per_step": env_step_ms_per_step,
+                    "perf/reward_to_env_time_ratio": reward_time_ratio,
                     "env/lock_events": lock_evt_sum,
                     "env/grab_events": grab_evt_sum,
                     "env/max_box_speed": max_box_speed,
@@ -1575,6 +1501,9 @@ def run_train(
                     f"SeenRate={learnable_seen_rate:.2f} "
                     f"WallStick={wall_stick_ratio:.2f} "
                     f"Seen@WallStick={wall_stick_seen_ratio:.2f} "
+                    f"RwMs={reward_compute_ms_per_step:.3f} "
+                    f"EnvMs={env_step_ms_per_step:.3f} "
+                    f"Rw/Env={reward_time_ratio:.2f} "
                     f"AvgR={avg_reward:.3f} Ent={avg_entropy:.4f} "
                     f"LockEvt={lock_evt_sum} GrabEvt={grab_evt_sum} "
                     f"MaxBoxV={max_box_speed:.2f} MaxRampV={max_ramp_speed:.2f} "
@@ -1642,6 +1571,7 @@ def run_train_vector(
         os.replace(tmp_path, path)
 
     idx = ref_env.idx
+    reward_idx_cache = _build_reward_index_cache(idx)
     obs_dim = ref_env.observation_space.shape[0]
     act_dim = ref_env.action_space.shape[0]
     history = ObsHistory(num_envs, SEQ_LEN, obs_dim, device)
@@ -1684,6 +1614,8 @@ def run_train_vector(
             wall_stick_seen_steps = 0
             entropy_sum = 0.0
             entropy_count = 0
+            reward_compute_sec_sum = 0.0
+            env_step_sec_sum = 0.0
 
             done_last = np.zeros(num_envs, dtype=np.float32)
             rewards_sum = 0.0
@@ -1696,27 +1628,32 @@ def run_train_vector(
                     action, logp, _, value = agent.get_action_and_value(seq)
 
                 action_np = action.cpu().numpy()
+                step_t0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = envs.step(action_np)
+                env_step_sec_sum += time.perf_counter() - step_t0
                 done_np = np.logical_or(term, trun).astype(np.float32)
                 done_last = done_np
 
                 reward_np = np.asarray(base_r, dtype=np.float32).copy()
+                reward_t0 = time.perf_counter()
                 if USE_CUSTOM_REWARD:
-                    for i in range(num_envs):
-                        scalar_info = {
-                            "dbg_seek_gaze_cos_front_max": float(_info_at(info, "dbg_seek_gaze_cos_front_max", i, 0.0)),
-                            "dbg_seek_gaze_cos_front_dist_max": float(_info_at(info, "dbg_seek_gaze_cos_front_dist_max", i, 0.0)),
-                            "dbg_learnable_hider_seen": bool(_info_at(info, "dbg_learnable_hider_seen", i, False)),
-                            "is_detected": bool(_info_at(info, "is_detected", i, False)),
-                        }
-                        reward_np[i] = compute_custom_reward(
-                            obs[i],
-                            action_np[i],
-                            reward_np[i],
-                            idx,
-                            ref_env.target,
-                            scalar_info,
-                        )
+                    reward_np = _compute_custom_reward_batch_numba(
+                        np.asarray(obs, dtype=np.float32),
+                        np.asarray(action_np, dtype=np.float32),
+                        np.asarray(reward_np, dtype=np.float32),
+                        bool(ref_env.target == "hider"),
+                        reward_idx_cache["self_vel_x"],
+                        reward_idx_cache["self_vel_y"],
+                        reward_idx_cache["lidar"],
+                        reward_idx_cache["enemy_visible"],
+                        reward_idx_cache["enemy_rel_x"],
+                        reward_idx_cache["enemy_rel_y"],
+                        float(RW_MOVE_CTRL_COST),
+                        float(RW_MOVE_INCENTIVE),
+                        float(RW_IDLE_PENALTY),
+                        float(RW_WALL_AVOID_PENALTY),
+                    )
+                reward_compute_sec_sum += time.perf_counter() - reward_t0
 
                 global_step += num_envs
                 rollout_actions[t] = action
@@ -1744,7 +1681,7 @@ def run_train_vector(
                     seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
                     if seen_learnable:
                         learnable_seen_steps += 1
-                    is_wall_stick = _is_wall_stick_state(next_obs[i], idx)
+                    is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache)
                     if is_wall_stick:
                         wall_stick_steps += 1
                         if seen_learnable:
@@ -1836,6 +1773,9 @@ def run_train_vector(
             avg_reward = rewards_sum / (hp["rollout_steps"] * num_envs)
             avg_blocked_ramp = blocked_ramp_sum / (hp["rollout_steps"] * num_envs)
             avg_entropy = entropy_sum / max(entropy_count, 1)
+            reward_compute_ms_per_step = 1000.0 * reward_compute_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
+            env_step_ms_per_step = 1000.0 * env_step_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
+            reward_time_ratio = reward_compute_sec_sum / max(env_step_sec_sum, 1e-9)
             ramp_eval = None
             if (
                 RAMP_CHECK_ENABLED
@@ -1862,6 +1802,9 @@ def run_train_vector(
                     "train/learnable_seen_rate": learnable_seen_rate,
                     "train/wall_stick_ratio": wall_stick_ratio,
                     "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
+                    "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,
+                    "perf/env_step_ms_per_step": env_step_ms_per_step,
+                    "perf/reward_to_env_time_ratio": reward_time_ratio,
                     "env/lock_events": lock_evt_sum,
                     "env/grab_events": grab_evt_sum,
                     "env/max_box_speed": max_box_speed,
@@ -1891,6 +1834,9 @@ def run_train_vector(
                     f"SeenRate={learnable_seen_rate:.2f} "
                     f"WallStick={wall_stick_ratio:.2f} "
                     f"Seen@WallStick={wall_stick_seen_ratio:.2f} "
+                    f"RwMs={reward_compute_ms_per_step:.3f} "
+                    f"EnvMs={env_step_ms_per_step:.3f} "
+                    f"Rw/Env={reward_time_ratio:.2f} "
                     f"AvgR={avg_reward:.3f} Ent={avg_entropy:.4f} "
                     f"LockEvt={lock_evt_sum} GrabEvt={grab_evt_sum} "
                     f"MaxBoxV={max_box_speed:.2f} MaxRampV={max_ramp_speed:.2f} "

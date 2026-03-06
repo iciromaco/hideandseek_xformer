@@ -986,10 +986,6 @@ class TeamCosEnv(gym.Env):
                 dy = float(hpos[1] - spos[1])
                 dist = math.sqrt(dx * dx + dy * dy)
                 min_seeker_dist = min(min_seeker_dist, dist)
-            
-                if self._is_vis(spos, srot, hpos, sid, hid):
-                    seen = True
-                    break
 
                 #gaze_cos 計算
                 if hk == self.learnable_agent_key:     
@@ -1026,42 +1022,6 @@ class TeamCosEnv(gym.Env):
         team_reward = base + dist_bonus
         
         return team_reward, bool(seen_count > 0), gaze_cos_front_max, gaze_cos_front_dist_max, bool(learnable_hider_seen)
-
-    '''
-    def _compute_team_reward(self):
-        if self.current_step <= self.prep_steps:
-            return 0.0, False, 0.0, 0.0, False
-        seen_count = 0
-        gaze_cos_front_max = 0.0
-        gaze_cos_front_dist_max = 0.0
-        learnable_hider_seen = False
-        for hk in self.hider_keys:
-            hid = self.body_ids[hk]
-            hpos = self.data.xpos[hid][:2]
-            seen = False
-            for sk in self.seeker_keys:
-                sid = self.body_ids[sk]
-                spos = self.data.xpos[sid][:2]
-                srot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[sk]['rot']]]
-                if hk == self.learnable_agent_key:
-                    dx = float(hpos[0] - spos[0])
-                    dy = float(hpos[1] - spos[1])
-                    dist = math.sqrt(dx * dx + dy * dy) + 1e-8
-                    cos_align = (math.cos(srot) * (dx / dist)) + (math.sin(srot) * (dy / dist))
-                    frontness = max(float(cos_align), 0.0)
-                    gaze_cos_front_max = max(gaze_cos_front_max, frontness)
-                    gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, frontness / (dist + 0.2))
-                if self._is_vis(spos, srot, hpos, sid, hid):
-                    seen = True
-                    break
-            if seen:
-                seen_count += 1
-            if hk == self.learnable_agent_key:
-                learnable_hider_seen = bool(seen)
-        # hiderチーム視点: 全員未発見なら +1、1人でも発見されたら -1
-        team_reward = 1.0 if seen_count == 0 else -1.0
-        return team_reward, bool(seen_count > 0), gaze_cos_front_max, gaze_cos_front_dist_max, bool(learnable_hider_seen)
-    '''
 
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
         rel = t_pos - pos; dist = math.sqrt(np.sum(rel**2)) + 1e-8
