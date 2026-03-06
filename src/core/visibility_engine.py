@@ -214,7 +214,7 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
 
         elif mode == 2: # Sphere Tracing
             curr_t = SAFE_MARGIN
-            for step in range(40):
+            for _step in range(40):
                 cx = pos_x + vx * curr_t
                 cy = pos_y + vy * curr_t
                 dist_sdf = _get_sdf_scalar(cx, cy, walls_xpos, walls_size, ag_pos, ag_radii, ag_b_ids, box_pos, box_size, box_quats, box_b_ids, exclude_body_id, -1, ignore_id)

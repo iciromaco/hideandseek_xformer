@@ -4,7 +4,6 @@
 import numpy as np
 import mujoco
 import pickle
-import time
 import os
 import tempfile
 from numba import njit

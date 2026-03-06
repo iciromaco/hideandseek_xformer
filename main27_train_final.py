@@ -3,6 +3,7 @@
 import math
 import argparse
 import os
+import subprocess
 import sys
 import time
 import tomllib
@@ -15,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from numba import njit
 
 try:
     import wandb
@@ -42,6 +44,8 @@ CLI_EXAMPLES = (
     "     uv run mjpython main27_train_final.py\n\n"
     "  2-b) 実行時オプションで debug を選択（TOMLを編集しない）\n"
     "     uv run mjpython main27_train_final.py --profile debug\n\n"
+    "  2-c) 複数プロファイルを連続実行（比較）\n"
+    "     uv run mjpython main27_train_final.py --compare-profiles train_wall_only,train_no_wall_stick,train_base_reward\n\n"
     "  3) ヘルプと実行例を表示\n"
     "     uv run mjpython main27_train_final.py -h\n"
 )
@@ -58,7 +62,43 @@ def _cli_profile_override_from_argv(argv=None):
     return None
 
 
+def _cli_compare_profiles_from_argv(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    raw = None
+    for i, token in enumerate(args):
+        if token.startswith("--compare-profiles="):
+            raw = token.split("=", 1)[1]
+            break
+        if token == "--compare-profiles" and i + 1 < len(args):
+            raw = args[i + 1]
+            break
+    if not raw:
+        return []
+    return [p.strip().lower() for p in str(raw).split(",") if p.strip()]
+
+
 CLI_PROFILE_OVERRIDE = _cli_profile_override_from_argv()
+CLI_COMPARE_PROFILES = _cli_compare_profiles_from_argv()
+
+
+def _get_available_runtime_profiles(path):
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+        runtime_cfg = raw.get("runtime", {}) if isinstance(raw, dict) else {}
+        names = {"train", "debug"}
+        if isinstance(runtime_cfg, dict):
+            for key, value in runtime_cfg.items():
+                if key in {"active_profile", "common"}:
+                    continue
+                if isinstance(value, dict):
+                    names.add(str(key).strip().lower())
+        return sorted(names)
+    except Exception:
+        return ["train", "debug"]
+
+
+AVAILABLE_RUNTIME_PROFILES = _get_available_runtime_profiles(CONFIG_PATH)
 
 
 def _parse_cli_args(argv=None):
@@ -70,8 +110,14 @@ def _parse_cli_args(argv=None):
     parser.add_argument(
         "-p",
         "--profile",
-        choices=["train", "debug"],
         help="実行時だけ runtime profile を上書き（TOMLは変更しない）",
+    )
+    parser.add_argument(
+        "--compare-profiles",
+        help=(
+            "カンマ区切りで複数 profile を順次実行（例: "
+            "train_wall_only,train_no_wall_stick,train_base_reward）"
+        ),
     )
     parser.add_argument(
         "--examples",
@@ -86,9 +132,12 @@ def _parse_cli_args(argv=None):
 
 def _normalize_profile_name(value):
     text = str(value).strip().lower()
-    if text in {"debug", "train"}:
+    if text in AVAILABLE_RUNTIME_PROFILES:
         return text
-    print(f"Invalid runtime.active_profile={value}. Fallback to train.")
+    print(
+        f"Invalid runtime.active_profile={value}. "
+        f"Fallback to train. available={AVAILABLE_RUNTIME_PROFILES}"
+    )
     return "train"
 
 
@@ -112,8 +161,10 @@ def _load_runtime_config(path, profile_override=None):
         merged.update(profile_cfg)
         return merged, profile, profile_origin
     except Exception as exc:
-        print(f"runtime config load failed ({exc})")
-        return {}, "train", "fallback(default)"
+        raise SystemExit(
+            f"runtime config load failed: {path} ({exc}). "
+            "Fix the TOML and retry."
+        ) from exc
 
 
 RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(CONFIG_PATH, CLI_PROFILE_OVERRIDE)
@@ -144,6 +195,7 @@ AUTO_TUNE_HPARAMS = _cfg("AUTO_TUNE_HPARAMS", "1", _to_bool)
 DEBUG_HIDER_POLICY = _cfg("DEBUG_HIDER_POLICY", "rule", str)
 DEBUG_SEEKER_POLICY = _cfg("DEBUG_SEEKER_POLICY", "rule", str)
 DEBUG_DETERMINISTIC_INFERENCE = _cfg("DEBUG_DETERMINISTIC_INFERENCE", "0", _to_bool)
+DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("DEBUG_SYMMETRIC_HIDER_POLICY", "0", _to_bool)
 TRAIN_OTHER_HIDER_POLICY = _cfg("TRAIN_OTHER_HIDER_POLICY", "rule", str)
 TRAIN_OTHER_SEEKER_POLICY = _cfg("TRAIN_OTHER_SEEKER_POLICY", "rule", str)
 
@@ -162,6 +214,7 @@ ENV_CONFIG = {
     "show_turn_lines": SHOW_TURN_LINES,
     "policy_source_log": _cfg("POLICY_SOURCE_LOG", "0", _to_bool),
     "policy_source_log_each_reset": _cfg("POLICY_SOURCE_LOG_EACH_RESET", "0", _to_bool),
+    "debug_log_interval_steps": _cfg("DEBUG_LOG_INTERVAL_STEPS", "200", int),
 }
 
 SEQ_LEN = _cfg("SEQ_LEN", "8", int)
@@ -214,24 +267,34 @@ HPARAMS_CONFIG_PATH = CONFIG_PATH
 # Reward shaping coefficients
 RW_SEEK_VISIBLE_BONUS = _cfg("RW_SEEK_VISIBLE_BONUS", "0.03", float)
 RW_SEEK_DIST_GAIN = _cfg("RW_SEEK_DIST_GAIN", "0.03", float)
-RW_SEEK_FORWARD_GAIN = _cfg("RW_SEEK_FORWARD_GAIN", "0.01", float)
 RW_SEEK_IDLE_PENALTY = _cfg("RW_SEEK_IDLE_PENALTY", "0.01", float)
 
+'''
 RW_HIDE_HIDDEN_BONUS = _cfg("RW_HIDE_HIDDEN_BONUS", "0.06", float)
 RW_HIDE_VISIBLE_PENALTY = _cfg("RW_HIDE_VISIBLE_PENALTY", "0.06", float)
 RW_HIDE_DIST_GAIN = _cfg("RW_HIDE_DIST_GAIN", "0.04", float)
-RW_HIDE_FORWARD_GAIN = _cfg("RW_HIDE_FORWARD_GAIN", "0.02", float)
 RW_HIDE_BACKWARD_PENALTY = _cfg("RW_HIDE_BACKWARD_PENALTY", "0.05", float)
 RW_HIDE_IDLE_PENALTY = _cfg("RW_HIDE_IDLE_PENALTY", "0.02", float)
-RW_HIDE_CAMP_PENALTY = _cfg("RW_HIDE_CAMP_PENALTY", "0.02", float)
 RW_HIDE_WALL_STICK_PENALTY = _cfg("RW_HIDE_WALL_STICK_PENALTY", "0.03", float)
+'''
 RW_HIDE_WALL_NEAR_THRESHOLD = _cfg("RW_HIDE_WALL_NEAR_THRESHOLD", "0.18", float)
 RW_HIDE_STILL_SPEED_THRESHOLD = _cfg("RW_HIDE_STILL_SPEED_THRESHOLD", "0.05", float)
+'''
+RW_HIDE_VISIBLE_FRONT_PENALTY = _cfg("RW_HIDE_VISIBLE_FRONT_PENALTY", "0.04", float)
+RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("RW_HIDE_VISIBLE_NEAR_PENALTY", "0.015", float)
+RW_HIDE_SEEKER_GAZE_COS_PENALTY = _cfg("RW_HIDE_SEEKER_GAZE_COS_PENALTY", "0.03", float)
+RW_HIDE_SEEKER_GAZE_COS_DIST_PENALTY = _cfg("RW_HIDE_SEEKER_GAZE_COS_DIST_PENALTY", "0.01", float)
+'''
 
+RW_MOVE_SAT_PENALTY = _cfg("RW_MOVE_SAT_PENALTY", "0.02", float)
 RW_TURN_SAT_PENALTY = _cfg("RW_TURN_SAT_PENALTY", "0.01", float)
 RW_MOVE_CTRL_COST = _cfg("RW_MOVE_CTRL_COST", "0.001", float)
 RW_HAND_CTRL_COST = _cfg("RW_HAND_CTRL_COST", "0.0005", float)
 
+# ✅ 追加する 3 個のパラメータ
+RW_MOVE_INCENTIVE = _cfg("RW_MOVE_INCENTIVE", "0.02", float)
+RW_IDLE_PENALTY = _cfg("RW_IDLE_PENALTY", "0.03", float)
+RW_WALL_AVOID_PENALTY = _cfg("RW_WALL_AVOID_PENALTY", "0.05", float)
 
 class ObsHistory:
     def __init__(self, num_envs, seq_len, obs_dim, device):
@@ -418,6 +481,8 @@ def select_hparams(config, target):
         _apply_hp_patch(hp, hp_cfg.get("base", {}))
 
     if not AUTO_TUNE_HPARAMS:
+        if "TOTAL_TIMESTEPS" in RUNTIME_OVERRIDES:
+            hp["total_timesteps"] = int(TOTAL_TIMESTEPS)
         return hp
 
     sig = env_signature(config)
@@ -467,6 +532,9 @@ def select_hparams(config, target):
         hp["minibatch_size"] = max(32, min(hp["rollout_steps"], hp["minibatch_size"]))
         while hp["rollout_steps"] % hp["minibatch_size"] != 0 and hp["minibatch_size"] > 32:
             hp["minibatch_size"] //= 2
+
+    if "TOTAL_TIMESTEPS" in RUNTIME_OVERRIDES:
+        hp["total_timesteps"] = int(TOTAL_TIMESTEPS)
 
     return hp
 
@@ -751,60 +819,226 @@ def run_ramp_check_viewer(mode, target, agent, device, episodes=3, max_steps=220
     finally:
         eval_env.close()
 
+'''
+@njit(cache=True)
+def _compute_custom_reward_core(
+    base_reward,
+    target_is_seeker,
+    visible,
+    enemy_visible_count,
+    min_enemy_dist,
+    min_visible_enemy_dist,
+    nearest_enemy_rel_x,
+    nearest_visible_rel_x,
+    speed,
+    lidar_min,
+    move,
+    turn,
+    lock_a,
+    grab_a,
+    gaze_cos_front_max,
+    gaze_cos_front_dist_max,
+    rw_seek_visible_bonus,
+    rw_seek_dist_gain,
+    rw_seek_idle_penalty,
+    rw_hide_hidden_bonus,
+    rw_hide_visible_penalty,
+    rw_hide_dist_gain,
+    rw_hide_backward_penalty,
+    rw_hide_idle_penalty,
+    rw_hide_wall_stick_penalty,
+    rw_hide_wall_near_threshold,
+    rw_hide_still_speed_threshold,
+    rw_hide_visible_front_penalty,
+    rw_hide_visible_near_penalty,
+    rw_hide_seeker_gaze_cos_penalty,
+    rw_hide_seeker_gaze_cos_dist_penalty,
+    rw_turn_sat_penalty,
+    rw_move_sat_penalty,
+    rw_move_ctrl_cost,
+    rw_hand_ctrl_cost,
+):
+    bonus = 0.0
+    if target_is_seeker:
+        if visible:
+            bonus += rw_seek_visible_bonus * enemy_visible_count
+            bonus += rw_seek_dist_gain / (min_visible_enemy_dist + 0.2)
+        if speed < 0.01:
+            bonus -= rw_seek_idle_penalty
+    else:
+        if visible:
+            vis_weight = enemy_visible_count if enemy_visible_count > 0 else 1
+            vis_dist_raw = min_visible_enemy_dist if enemy_visible_count > 0 else min_enemy_dist
+            vis_rel_x = nearest_visible_rel_x if enemy_visible_count > 0 else nearest_enemy_rel_x
+            vis_dist = vis_dist_raw if vis_dist_raw > 1e-6 else 1e-6
+            vis_frontness = vis_rel_x / vis_dist
+            if vis_frontness < 0.0:
+                vis_frontness = 0.0
+            bonus -= rw_hide_visible_penalty * vis_weight
+            bonus -= rw_hide_visible_front_penalty * vis_frontness
+            bonus -= rw_hide_visible_near_penalty / (vis_dist_raw + 0.2)
+            bonus -= rw_hide_seeker_gaze_cos_penalty * (gaze_cos_front_max if gaze_cos_front_max > 0.0 else 0.0)
+            bonus -= rw_hide_seeker_gaze_cos_dist_penalty * (
+                gaze_cos_front_dist_max if gaze_cos_front_dist_max > 0.0 else 0.0
+            )
+        else:
+            bonus += rw_hide_hidden_bonus
+        bonus += rw_hide_dist_gain * (min_enemy_dist if min_enemy_dist < 1.5 else 1.5)
+        back = -move
+        if back < 0.0:
+            back = 0.0
+        bonus -= rw_hide_backward_penalty * back
+        if speed < 0.01:
+            bonus -= rw_hide_idle_penalty
+        if lidar_min < rw_hide_wall_near_threshold and speed < rw_hide_still_speed_threshold:
+            bonus -= rw_hide_wall_stick_penalty
 
-def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker"):
-    action = np.asarray(action, dtype=np.float32)
+    turn_excess = abs(turn) - 0.9
+    if turn_excess < 0.0:
+        turn_excess = 0.0
+    move_excess = abs(move) - 0.9
+    if move_excess < 0.0:
+        move_excess = 0.0
+    turn_sat_cost = rw_turn_sat_penalty * turn_excess
+    move_sat_cost = rw_move_sat_penalty * move_excess
+
+    control_cost = -(
+        rw_move_ctrl_cost * (move * move + turn * turn)
+        + rw_hand_ctrl_cost * (lock_a * lock_a + grab_a * grab_a)
+        + turn_sat_cost
+        + move_sat_cost
+    )
+    return base_reward + bonus + control_cost
+'''
+
+def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker", info=None):
+    """
+    版改１：高水準な行動インセンティブのみ
+    パラメータ数：13 個 → 3 個に削減
+    """
+    bonus = 0.0
+    
+    # 共通
+    speed = math.sqrt(obs[idx.SELF.VEL_X] ** 2 + obs[idx.SELF.VEL_Y] ** 2)
+    move = float(action[0])
+    turn = float(action[1])
+    
+    # 制御コスト（全員共通、最小限）
+    control_cost = -0.001 * (move**2 + turn**2)
+    
+    if target_team == "hider":
+        # ① 移動インセンティブ（アイドル防止）
+        if speed < 0.1:
+            bonus -= 0.03  # 止まってたらペナルティ
+        elif speed > 0.3:
+            bonus += 0.02  # 逃げてたらボーナス
+        
+        # ② 壁回避
+        lidar_vals = np.asarray(obs[idx.LIDAR], dtype=np.float32)
+        lidar_min = float(np.min(lidar_vals)) if lidar_vals.size > 0 else 1.0
+        if lidar_min < 0.3:  # 危険に近い
+            bonus -= 0.05 * (1.0 - np.clip(lidar_min / 0.3, 0, 1))
+    
+    else:  # seeker
+        # ① 移動奨励
+        if speed < 0.1:
+            bonus -= 0.03
+        
+        # ② 敵に接近（見えている場合）
+        visible_enemies = [en for en in idx.OTHERS if obs[en.VISIBLE] > 0.5]
+        if visible_enemies:
+            for en in visible_enemies:
+                dx = float(obs[en.REL_X])
+                dy = float(obs[en.REL_Y])
+                dist = math.sqrt(dx**2 + dy**2)
+                # 距離に反比例の報酬（最大距離でも信号がある）
+                bonus += 0.05 / (dist + 1.0)
+    
+    return base_reward + bonus + control_cost
+
+'''
+def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker", info=None):
     enemy_visible_count = 0
     min_enemy_dist = 999.0
     min_visible_enemy_dist = 999.0
+    nearest_enemy_rel_x = 0.0
+    nearest_visible_rel_x = 0.0
     for en in idx.OTHERS:
-        d = math.sqrt(obs[en.REL_X] ** 2 + obs[en.REL_Y] ** 2)
+        rel_x = float(obs[en.REL_X])
+        rel_y = float(obs[en.REL_Y])
+        d = math.sqrt(rel_x ** 2 + rel_y ** 2)
         if d < min_enemy_dist:
             min_enemy_dist = d
+            nearest_enemy_rel_x = rel_x
         if obs[en.VISIBLE] > 0.5:
             enemy_visible_count += 1
             if d < min_visible_enemy_dist:
                 min_visible_enemy_dist = d
+                nearest_visible_rel_x = rel_x
     speed = math.sqrt(obs[idx.SELF.VEL_X] ** 2 + obs[idx.SELF.VEL_Y] ** 2)
     lidar_vals = np.asarray(obs[idx.LIDAR], dtype=np.float32)
     lidar_min = float(np.min(lidar_vals)) if lidar_vals.size > 0 else 1.0
 
-    move = float(action[0]) if action.shape[0] > 0 else 0.0
-    turn = float(action[1]) if action.shape[0] > 1 else 0.0
-    lock_a = float(action[2]) if action.shape[0] > 2 else 0.0
-    grab_a = float(action[3]) if action.shape[0] > 3 else 0.0
+    move = float(action[0])
+    turn = float(action[1])
+    lock_a = float(action[2])
+    grab_a = float(action[3])
     visible = enemy_visible_count > 0
+    if target_team != "seeker" and isinstance(info, dict):
+        visible = bool(info.get("dbg_learnable_hider_seen", info.get("is_detected", visible)))
+    gaze_cos_front_max = 0.0
+    gaze_cos_front_dist_max = 0.0
+    if isinstance(info, dict):
+        gaze_cos_front_max = float(info.get("dbg_seek_gaze_cos_front_max", 0.0))
+        gaze_cos_front_dist_max = float(info.get("dbg_seek_gaze_cos_front_dist_max", 0.0))
 
-    bonus = 0.0
-    if target_team == "seeker":
-        if visible:
-            bonus += RW_SEEK_VISIBLE_BONUS * enemy_visible_count
-            bonus += RW_SEEK_DIST_GAIN / (min_visible_enemy_dist + 0.2)
-        bonus += RW_SEEK_FORWARD_GAIN * max(move, 0.0)
-        if speed < 0.01:
-            bonus -= RW_SEEK_IDLE_PENALTY
-    else:
-        if visible:
-            bonus -= RW_HIDE_VISIBLE_PENALTY * enemy_visible_count
-        else:
-            bonus += RW_HIDE_HIDDEN_BONUS
-        bonus += RW_HIDE_DIST_GAIN * min(min_enemy_dist, 1.5)
-        bonus += RW_HIDE_FORWARD_GAIN * max(move, 0.0)
-        bonus -= RW_HIDE_BACKWARD_PENALTY * max(-move, 0.0)
-        if speed < 0.01:
-            bonus -= RW_HIDE_IDLE_PENALTY
-        if (not visible) and speed < RW_HIDE_STILL_SPEED_THRESHOLD:
-            bonus -= RW_HIDE_CAMP_PENALTY
-        if lidar_min < RW_HIDE_WALL_NEAR_THRESHOLD and speed < RW_HIDE_STILL_SPEED_THRESHOLD:
-            bonus -= RW_HIDE_WALL_STICK_PENALTY
-
-    turn_sat_cost = RW_TURN_SAT_PENALTY * max(abs(turn) - 0.9, 0.0)
-    control_cost = -(
-        RW_MOVE_CTRL_COST * (move * move + turn * turn)
-        + RW_HAND_CTRL_COST * (lock_a * lock_a + grab_a * grab_a)
-        + turn_sat_cost
+    return _compute_custom_reward_core(
+        float(base_reward),
+        bool(target_team == "seeker"),
+        bool(visible),
+        int(enemy_visible_count),
+        float(min_enemy_dist),
+        float(min_visible_enemy_dist),
+        float(nearest_enemy_rel_x),
+        float(nearest_visible_rel_x),
+        float(speed),
+        float(lidar_min),
+        float(move),
+        float(turn),
+        float(lock_a),
+        float(grab_a),
+        float(gaze_cos_front_max),
+        float(gaze_cos_front_dist_max),
+        float(RW_SEEK_VISIBLE_BONUS),
+        float(RW_SEEK_DIST_GAIN),
+        float(RW_SEEK_IDLE_PENALTY),
+        float(RW_HIDE_HIDDEN_BONUS),
+        float(RW_HIDE_VISIBLE_PENALTY),
+        float(RW_HIDE_DIST_GAIN),
+        float(RW_HIDE_BACKWARD_PENALTY),
+        float(RW_HIDE_IDLE_PENALTY),
+        float(RW_HIDE_WALL_STICK_PENALTY),
+        float(RW_HIDE_WALL_NEAR_THRESHOLD),
+        float(RW_HIDE_STILL_SPEED_THRESHOLD),
+        float(RW_HIDE_VISIBLE_FRONT_PENALTY),
+        float(RW_HIDE_VISIBLE_NEAR_PENALTY),
+        float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
+        float(RW_HIDE_SEEKER_GAZE_COS_DIST_PENALTY),
+        float(RW_TURN_SAT_PENALTY),
+        float(RW_MOVE_SAT_PENALTY),
+        float(RW_MOVE_CTRL_COST),
+        float(RW_HAND_CTRL_COST),
     )
-    return base_reward + bonus + control_cost
+'''
+
+def _is_wall_stick_state(obs, idx):
+    speed = math.sqrt(float(obs[idx.SELF.VEL_X]) ** 2 + float(obs[idx.SELF.VEL_Y]) ** 2)
+    lidar_vals = np.asarray(obs[idx.LIDAR], dtype=np.float32)
+    lidar_min = float(np.min(lidar_vals)) if lidar_vals.size > 0 else 1.0
+    return bool(
+        (lidar_min < RW_HIDE_WALL_NEAR_THRESHOLD)
+        and (speed < RW_HIDE_STILL_SPEED_THRESHOLD)
+    )
 
 
 def build_env(mode, target, config, render_mode=None):
@@ -890,6 +1124,23 @@ def _set_override_learnable_policy(env, vec_envs, enabled):
     return False
 
 
+def _set_model_policy_deterministic(env, vec_envs, enabled):
+    if vec_envs is not None:
+        try:
+            vec_envs.call("set_model_policy_deterministic", bool(enabled))
+            return True
+        except Exception as exc:
+            print(f"set_model_policy_deterministic: vector sync failed ({exc})")
+            return False
+    if env is not None:
+        try:
+            return bool(env.set_model_policy_deterministic(bool(enabled)))
+        except Exception as exc:
+            print(f"set_model_policy_deterministic failed ({exc})")
+            return False
+    return False
+
+
 def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_state_dict):
     if ref_env is None:
         return
@@ -900,6 +1151,9 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
     else:
         hider_mode = _normalize_policy_mode(DEBUG_HIDER_POLICY)
         seeker_mode = _normalize_policy_mode(DEBUG_SEEKER_POLICY)
+
+    model_policy_deterministic = True if TRAIN_MODE else bool(DEBUG_DETERMINISTIC_INFERENCE)
+    det_sync_ok = _set_model_policy_deterministic(env, vec_envs, model_policy_deterministic)
 
     hider_keys = [k for k in ref_env.hider_keys if k != ref_env.learnable_agent_key]
     seeker_keys = [k for k in ref_env.seeker_keys if k != ref_env.learnable_agent_key]
@@ -924,10 +1178,12 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
 
     symmetric_hider_debug = (
         (not TRAIN_MODE)
+        and DEBUG_SYMMETRIC_HIDER_POLICY
         and runtime_target == "hider"
         and hider_mode == POLICY_MODEL_IF_AVAILABLE
         and (hider_state is not None)
     )
+    override_enabled = False
     if symmetric_hider_debug:
         all_hider_keys = list(ref_env.hider_keys)
         ok = _apply_policy_state(
@@ -938,10 +1194,21 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
             "Debug symmetric hider policy",
         )
         _set_override_learnable_policy(env, vec_envs, ok)
+        override_enabled = bool(ok)
         if ok:
             print("Debug mode: all hiders use same model inference path")
     else:
         _set_override_learnable_policy(env, vec_envs, False)
+        override_enabled = False
+
+    print(
+        "Policy wiring: "
+        f"hider_mode={hider_mode}, "
+        f"seeker_mode={seeker_mode}, "
+        f"model_policy_deterministic={model_policy_deterministic}, "
+        f"det_sync_ok={det_sync_ok}, "
+        f"override_learnable_policy={override_enabled}"
+    )
 
 
 def run_debug_or_playback(env, agent, device, model_loaded):
@@ -995,7 +1262,7 @@ def run_debug_or_playback(env, agent, device, model_loaded):
 
             next_obs, base_r, term, trun, info = env.step(action)
             reward = (
-                compute_custom_reward(obs, action, base_r, idx, env.target)
+                compute_custom_reward(obs, action, base_r, idx, env.target, info)
                 if USE_CUSTOM_REWARD else base_r
             )
 
@@ -1059,7 +1326,9 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                     f"MaxBoxV={float(info.get('dbg_max_box_speed', 0.0)):.2f} "
                     f"MaxRampV={float(info.get('dbg_max_ramp_speed', 0.0)):.2f} "
                     f"BlockedRamp={int(info.get('dbg_blocked_ramp_count', 0))} "
-                    f"Boosted={int(info.get('dbg_boosted_agents', 0))}"
+                    f"Boosted={int(info.get('dbg_boosted_agents', 0))} "
+                    f"OverrideLP={int(info.get('dbg_override_learnable_policy', 0))} "
+                    f"ModelDet={int(info.get('dbg_model_policy_deterministic', 1))}"
                 )
                 lock_events_window = 0
                 grab_events_window = 0
@@ -1123,6 +1392,9 @@ def run_train(
             done_last = 0.0
             rewards_sum = 0.0
             hidden_steps = 0
+            learnable_seen_steps = 0
+            wall_stick_steps = 0
+            wall_stick_seen_steps = 0
             entropy_sum = 0.0
             entropy_count = 0
 
@@ -1139,7 +1411,7 @@ def run_train(
                 action_np = action.cpu().numpy().reshape(-1)
                 next_obs, base_r, term, trun, info = env.step(action_np)
                 reward = (
-                    compute_custom_reward(obs, action_np, base_r, idx, env.target)
+                    compute_custom_reward(obs, action_np, base_r, idx, env.target, info)
                     if USE_CUSTOM_REWARD else base_r
                 )
 
@@ -1161,6 +1433,14 @@ def run_train(
                 rewards_sum += float(reward)
                 if not bool(info.get("is_detected", False)):
                     hidden_steps += 1
+                seen_learnable = bool(info.get("dbg_learnable_hider_seen", info.get("is_detected", False)))
+                if seen_learnable:
+                    learnable_seen_steps += 1
+                is_wall_stick = _is_wall_stick_state(next_obs, idx)
+                if is_wall_stick:
+                    wall_stick_steps += 1
+                    if seen_learnable:
+                        wall_stick_seen_steps += 1
 
                 if done:
                     obs, _ = env.reset()
@@ -1234,6 +1514,9 @@ def run_train(
             elapsed = max(time.time() - train_start_time, 1e-6)
             sps = int(global_step / elapsed)
             hide_rate = hidden_steps / max(hp["rollout_steps"], 1)
+            learnable_seen_rate = learnable_seen_steps / max(hp["rollout_steps"], 1)
+            wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"], 1)
+            wall_stick_seen_ratio = wall_stick_seen_steps / max(wall_stick_steps, 1)
             avg_reward = rewards_sum / hp["rollout_steps"]
             avg_blocked_ramp = blocked_ramp_sum / hp["rollout_steps"]
             avg_entropy = entropy_sum / max(entropy_count, 1)
@@ -1260,6 +1543,9 @@ def run_train(
                     "train/hide_rate": hide_rate,
                     "train/avg_reward": avg_reward,
                     "train/entropy": avg_entropy,
+                    "train/learnable_seen_rate": learnable_seen_rate,
+                    "train/wall_stick_ratio": wall_stick_ratio,
+                    "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
                     "env/lock_events": lock_evt_sum,
                     "env/grab_events": grab_evt_sum,
                     "env/max_box_speed": max_box_speed,
@@ -1286,6 +1572,9 @@ def run_train(
                 print(
                     f"Upd {update}/{num_updates} Step={global_step} "
                     f"SPS={sps} HideRate={hide_rate:.2f} "
+                    f"SeenRate={learnable_seen_rate:.2f} "
+                    f"WallStick={wall_stick_ratio:.2f} "
+                    f"Seen@WallStick={wall_stick_seen_ratio:.2f} "
                     f"AvgR={avg_reward:.3f} Ent={avg_entropy:.4f} "
                     f"LockEvt={lock_evt_sum} GrabEvt={grab_evt_sum} "
                     f"MaxBoxV={max_box_speed:.2f} MaxRampV={max_ramp_speed:.2f} "
@@ -1390,6 +1679,9 @@ def run_train_vector(
             max_ramp_speed = 0.0
             blocked_ramp_sum = 0
             hidden_steps = 0
+            learnable_seen_steps = 0
+            wall_stick_steps = 0
+            wall_stick_seen_steps = 0
             entropy_sum = 0.0
             entropy_count = 0
 
@@ -1411,12 +1703,19 @@ def run_train_vector(
                 reward_np = np.asarray(base_r, dtype=np.float32).copy()
                 if USE_CUSTOM_REWARD:
                     for i in range(num_envs):
+                        scalar_info = {
+                            "dbg_seek_gaze_cos_front_max": float(_info_at(info, "dbg_seek_gaze_cos_front_max", i, 0.0)),
+                            "dbg_seek_gaze_cos_front_dist_max": float(_info_at(info, "dbg_seek_gaze_cos_front_dist_max", i, 0.0)),
+                            "dbg_learnable_hider_seen": bool(_info_at(info, "dbg_learnable_hider_seen", i, False)),
+                            "is_detected": bool(_info_at(info, "is_detected", i, False)),
+                        }
                         reward_np[i] = compute_custom_reward(
                             obs[i],
                             action_np[i],
                             reward_np[i],
                             idx,
                             ref_env.target,
+                            scalar_info,
                         )
 
                 global_step += num_envs
@@ -1442,6 +1741,14 @@ def run_train_vector(
                     )
                     if not bool(_info_at(info, "is_detected", i, False)):
                         hidden_steps += 1
+                    seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
+                    if seen_learnable:
+                        learnable_seen_steps += 1
+                    is_wall_stick = _is_wall_stick_state(next_obs[i], idx)
+                    if is_wall_stick:
+                        wall_stick_steps += 1
+                        if seen_learnable:
+                            wall_stick_seen_steps += 1
 
                 rewards_sum += float(np.sum(reward_np))
 
@@ -1523,6 +1830,9 @@ def run_train_vector(
             elapsed = max(time.time() - train_start_time, 1e-6)
             sps = int(global_step / elapsed)
             hide_rate = hidden_steps / max(hp["rollout_steps"] * num_envs, 1)
+            learnable_seen_rate = learnable_seen_steps / max(hp["rollout_steps"] * num_envs, 1)
+            wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"] * num_envs, 1)
+            wall_stick_seen_ratio = wall_stick_seen_steps / max(wall_stick_steps, 1)
             avg_reward = rewards_sum / (hp["rollout_steps"] * num_envs)
             avg_blocked_ramp = blocked_ramp_sum / (hp["rollout_steps"] * num_envs)
             avg_entropy = entropy_sum / max(entropy_count, 1)
@@ -1549,6 +1859,9 @@ def run_train_vector(
                     "train/hide_rate": hide_rate,
                     "train/avg_reward": avg_reward,
                     "train/entropy": avg_entropy,
+                    "train/learnable_seen_rate": learnable_seen_rate,
+                    "train/wall_stick_ratio": wall_stick_ratio,
+                    "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
                     "env/lock_events": lock_evt_sum,
                     "env/grab_events": grab_evt_sum,
                     "env/max_box_speed": max_box_speed,
@@ -1575,6 +1888,9 @@ def run_train_vector(
                 print(
                     f"Upd {update}/{num_updates} Step={global_step} "
                     f"SPS={sps} HideRate={hide_rate:.2f} "
+                    f"SeenRate={learnable_seen_rate:.2f} "
+                    f"WallStick={wall_stick_ratio:.2f} "
+                    f"Seen@WallStick={wall_stick_seen_ratio:.2f} "
                     f"AvgR={avg_reward:.3f} Ent={avg_entropy:.4f} "
                     f"LockEvt={lock_evt_sum} GrabEvt={grab_evt_sum} "
                     f"MaxBoxV={max_box_speed:.2f} MaxRampV={max_ramp_speed:.2f} "
@@ -1610,6 +1926,7 @@ def run():
         f"DEBUG_HIDER_POLICY={DEBUG_HIDER_POLICY}, "
         f"DEBUG_SEEKER_POLICY={DEBUG_SEEKER_POLICY}, "
         f"DEBUG_DETERMINISTIC_INFERENCE={DEBUG_DETERMINISTIC_INFERENCE}, "
+        f"DEBUG_SYMMETRIC_HIDER_POLICY={DEBUG_SYMMETRIC_HIDER_POLICY}, "
         f"USE_CUSTOM_REWARD={USE_CUSTOM_REWARD}, "
         f"HPARAMS_CONFIG_PATH={HPARAMS_CONFIG_PATH}, "
         f"RESUME_TRAINING={RESUME_TRAINING}, "
@@ -1764,5 +2081,30 @@ def run():
             wandb_run.finish()
 
 
+def run_profile_comparison(profiles):
+    names = [str(p).strip().lower() for p in profiles if str(p).strip()]
+    if not names:
+        print("No profiles specified for comparison.")
+        return 2
+    invalid = [p for p in names if p not in AVAILABLE_RUNTIME_PROFILES]
+    if invalid:
+        print(f"Invalid profiles: {invalid}")
+        print(f"Available profiles: {AVAILABLE_RUNTIME_PROFILES}")
+        return 2
+
+    script_path = os.path.abspath(__file__)
+    for i, profile in enumerate(names, start=1):
+        print(f"[Compare {i}/{len(names)}] profile={profile}")
+        cmd = ["uv", "run", "mjpython", script_path, "--profile", profile]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(f"Profile '{profile}' failed with code {result.returncode}")
+            return result.returncode
+    print("Comparison run completed.")
+    return 0
+
+
 if __name__ == "__main__":
+    if CLI_COMPARE_PROFILES:
+        raise SystemExit(run_profile_comparison(CLI_COMPARE_PROFILES))
     run()

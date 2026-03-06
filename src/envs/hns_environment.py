@@ -113,7 +113,8 @@ class TeamCosEnv(gym.Env):
     def __init__(self, mode="initial", target="hider", n_seekers=1,
                  n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None,
                  inference_policies=None, show_turn_lines=True,
-                 policy_source_log=False, policy_source_log_each_reset=False):
+                 policy_source_log=False, policy_source_log_each_reset=False,
+                 debug_log_interval_steps=200):
         super().__init__()
         self.n_seekers = int(n_seekers)
         self.n_hiders = int(n_hiders)
@@ -152,9 +153,12 @@ class TeamCosEnv(gym.Env):
         self.shared_team_prefix = "h" if self.learnable_agent_key.startswith("h") else "s"
         self._policy_histories = {}
         self.override_learnable_policy = False
+        self.model_policy_deterministic = True
         self._policy_source_logged = set()
         self.policy_source_log = bool(policy_source_log)
         self.policy_source_log_each_reset = bool(policy_source_log_each_reset)
+        self.debug_log_interval_steps = max(1, int(debug_log_interval_steps))
+        self._debug_log_last_step = {}
         
         self.last_debug_ctrl = {k: (0.0, 0.0) for k in self.agent_keys}
         
@@ -224,6 +228,10 @@ class TeamCosEnv(gym.Env):
 
     def set_override_learnable_policy(self, enabled):
         self.override_learnable_policy = bool(enabled)
+        return True
+
+    def set_model_policy_deterministic(self, enabled):
+        self.model_policy_deterministic = bool(enabled)
         return True
 
     def _ensure_policy_history(self, agent_key, seq_len):
@@ -357,6 +365,7 @@ class TeamCosEnv(gym.Env):
         <geom name="{pre}_btm" type="sphere" size="0.4" pos="0 0 -0.1" mass="12" friction="1.2 0.12 0.003"/>
         <geom name="{pre}_capsule" type="capsule" size="0.3 0.3" rgba="{r} {g} {b} 1" mass="4" contype="0" conaffinity="0"/>
         <geom name="{pre}_nose" type="capsule" fromto="0 0 0.3 0.3 0 0.3" size="0.09" rgba="1 1 1 1" contype="0" conaffinity="0"/>
+        <geom name="{pre}_tail" type="capsule" fromto="0 0 0 -0.45 0 -0.3" size="0.05" rgba="{r} {g} {b} 1" contype="0" conaffinity="0"/>
       </body>
     </body>"""
 
@@ -681,7 +690,7 @@ class TeamCosEnv(gym.Env):
             seq_np = self._get_policy_history_seq(agent_key, seq_len, norm_obs)
             seq_t = torch.as_tensor(seq_np[None, :, :], dtype=torch.float32)
             with torch.no_grad():
-                if hasattr(model, "get_deterministic_action_and_value"):
+                if self.model_policy_deterministic and hasattr(model, "get_deterministic_action_and_value"):
                     arr = model.get_deterministic_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
                 else:
                     arr = model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
@@ -714,7 +723,7 @@ class TeamCosEnv(gym.Env):
             seq_np = self._get_policy_history_seq(agent_key, self.shared_policy_seq_len, norm_obs)
             seq_t = torch.as_tensor(seq_np[None, :, :], dtype=torch.float32)
             with torch.no_grad():
-                if hasattr(self.shared_policy_model, "get_deterministic_action_and_value"):
+                if self.model_policy_deterministic and hasattr(self.shared_policy_model, "get_deterministic_action_and_value"):
                     arr = self.shared_policy_model.get_deterministic_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
                 else:
                     arr = self.shared_policy_model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
@@ -736,13 +745,44 @@ class TeamCosEnv(gym.Env):
         key = (agent_key, source)
         if key in self._policy_source_logged:
             return
-        print(f"policy_source[{agent_key}] = {source}")
+        self._debug_print_throttled(
+            f"policy_source:{agent_key}:{source}",
+            f"policy_source[{agent_key}] = {source}",
+            force=True,
+        )
         self._policy_source_logged.add(key)
+
+    def _debug_print_throttled(self, key, message, force=False):
+        if force:
+            print(message)
+            self._debug_log_last_step[key] = int(self.current_step)
+            return
+        now = int(self.current_step)
+        last = int(self._debug_log_last_step.get(key, -10**9))
+        if (now - last) < self.debug_log_interval_steps:
+            return
+        print(message)
+        self._debug_log_last_step[key] = now
+
+    def _is_spawn_position_valid(self, pos_xy, radius, placed, margin):
+        px = float(pos_xy[0])
+        py = float(pos_xy[1])
+        lim = float(self.SAFE_HALF - radius - margin)
+        if abs(px) > lim or abs(py) > lim:
+            return False
+        for wx, wy, sx, sy in self.maze_walls:
+            if abs(px - wx) <= (sx + radius + margin) and abs(py - wy) <= (sy + radius + margin):
+                return False
+        for pp, pr in placed:
+            if np.linalg.norm(pos_xy - pp) < (radius + pr + margin):
+                return False
+        return True
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
         self._policy_histories.clear()
+        self._debug_log_last_step.clear()
         if self.policy_source_log_each_reset:
             self._policy_source_logged.clear()
         mujoco.mj_resetData(self.model, self.data)
@@ -754,14 +794,14 @@ class TeamCosEnv(gym.Env):
         for bid, rad, z in ramp_specs + box_specs:
             for _ in range(500):
                 p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
-                if not any(np.linalg.norm(p-pp) < (rad+pr+0.2) for pp, pr in placed):
+                if self._is_spawn_position_valid(p, rad, placed, margin=0.2):
                     adr = self.model.jnt_qposadr[self.model.body_jntadr[bid]]
                     self.data.qpos[adr:adr+7] = [p[0], p[1], z, 1, 0, 0, 0]
                     placed.append((p, rad)); break
         for ak in self.agent_keys:
             for _ in range(500):
                 p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2); rot = np.random.uniform(-np.pi, np.pi)
-                if not any(np.linalg.norm(p-pp) < (self.R_AGENT+pr+0.3) for pp, pr in placed):
+                if self._is_spawn_position_valid(p, self.R_AGENT, placed, margin=0.3):
                     jx = self.qpos_indices[ak]['x']
                     jy = self.qpos_indices[ak]['y']
                     jz = self.qpos_indices[ak]['z']
@@ -872,7 +912,7 @@ class TeamCosEnv(gym.Env):
             )
         )
         
-        rb, find = self._compute_team_reward()
+        rb, find, gaze_cos_front_max, gaze_cos_front_dist_max, learnable_hider_seen = self._compute_team_reward()
 
         for i, ak in enumerate(self.agent_keys):
             if ak == self.learnable_agent_key and not self.override_learnable_policy:
@@ -914,12 +954,87 @@ class TeamCosEnv(gym.Env):
                     "dbg_max_ramp_speed": float(max(ramp_speeds) if ramp_speeds else 0.0),
                     "dbg_blocked_ramp_count": blocked_ramp_count,
                     "dbg_boosted_agents": boosted_agents,
+                    "dbg_override_learnable_policy": bool(self.override_learnable_policy),
+                    "dbg_model_policy_deterministic": bool(self.model_policy_deterministic),
+                    "dbg_seek_gaze_cos_front_max": float(gaze_cos_front_max),
+                    "dbg_seek_gaze_cos_front_dist_max": float(gaze_cos_front_dist_max),
+                    "dbg_learnable_hider_seen": bool(learnable_hider_seen),
                 })
 
     def _compute_team_reward(self):
         if self.current_step <= self.prep_steps:
-            return 0.0, False
+            return 0.0, False, 0.0, 0.0, False
+        
         seen_count = 0
+        min_seeker_dist = 13.0  # ← 追加
+        gaze_cos_front_max = 0.0
+        gaze_cos_front_dist_max = 0.0
+        learnable_hider_seen = False
+
+        for hk in self.hider_keys:
+            hid = self.body_ids[hk]
+            hpos = self.data.xpos[hid][:2]
+            seen = False
+
+            for sk in self.seeker_keys:
+                sid = self.body_ids[sk]
+                spos = self.data.xpos[sid][:2]
+                srot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[sk]['rot']]]
+
+                # ← 距離計算を追加
+                dx = float(hpos[0] - spos[0])
+                dy = float(hpos[1] - spos[1])
+                dist = math.sqrt(dx * dx + dy * dy)
+                min_seeker_dist = min(min_seeker_dist, dist)
+            
+                if self._is_vis(spos, srot, hpos, sid, hid):
+                    seen = True
+                    break
+
+                #gaze_cos 計算
+                if hk == self.learnable_agent_key:     
+                    dist_with_margin = dist + 1e-8
+                    cos_align = (math.cos(srot) * (dx / dist_with_margin)) + (math.sin(srot) * (dy / dist_with_margin))
+                    frontness = max(float(cos_align), 0.0)
+                    gaze_cos_front_max = max(gaze_cos_front_max, frontness)
+                    gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, frontness / (dist + 0.2))
+ 
+                if self._is_vis(spos, srot, hpos, sid, hid):
+                    seen = True
+                    break
+            if seen:
+                seen_count += 1
+
+            if hk == self.learnable_agent_key:
+                learnable_hider_seen = bool(seen)
+
+        # === ここから改善案 1a（報酬計算部分のみ変更）===
+        # 現在（削除）：team_reward = 1.0 if seen_count == 0 else -1.0
+        
+        # 改善案 1a（新規）：
+        if seen_count == 0:
+            base = 1.0
+            # 敵から遠いほど+ボーナス
+            dist_ratio = min(min_seeker_dist / 12.0, 1.0)
+            dist_bonus = 0.2 * dist_ratio
+        else:
+            # k/n が見つかった場合、線形に減少
+            visibility_factor = seen_count / len(self.hider_keys)
+            base = 1.0 - 2.0 * visibility_factor
+            dist_bonus = 0.0
+        
+        team_reward = base + dist_bonus
+        
+        return team_reward, bool(seen_count > 0), gaze_cos_front_max, gaze_cos_front_dist_max, bool(learnable_hider_seen)
+
+    '''
+    def _compute_team_reward(self):
+        if self.current_step <= self.prep_steps:
+            return 0.0, False, 0.0, 0.0, False
+        seen_count = 0
+        gaze_cos_front_max = 0.0
+        gaze_cos_front_dist_max = 0.0
+        learnable_hider_seen = False
         for hk in self.hider_keys:
             hid = self.body_ids[hk]
             hpos = self.data.xpos[hid][:2]
@@ -928,14 +1043,25 @@ class TeamCosEnv(gym.Env):
                 sid = self.body_ids[sk]
                 spos = self.data.xpos[sid][:2]
                 srot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[sk]['rot']]]
+                if hk == self.learnable_agent_key:
+                    dx = float(hpos[0] - spos[0])
+                    dy = float(hpos[1] - spos[1])
+                    dist = math.sqrt(dx * dx + dy * dy) + 1e-8
+                    cos_align = (math.cos(srot) * (dx / dist)) + (math.sin(srot) * (dy / dist))
+                    frontness = max(float(cos_align), 0.0)
+                    gaze_cos_front_max = max(gaze_cos_front_max, frontness)
+                    gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, frontness / (dist + 0.2))
                 if self._is_vis(spos, srot, hpos, sid, hid):
                     seen = True
                     break
             if seen:
                 seen_count += 1
-        # hiderチーム視点: 各hiderについて「見つかっていなければ+1, 見つかれば-1」
-        team_reward = float(self.n_hiders - 2 * seen_count)
-        return team_reward, bool(seen_count > 0)
+            if hk == self.learnable_agent_key:
+                learnable_hider_seen = bool(seen)
+        # hiderチーム視点: 全員未発見なら +1、1人でも発見されたら -1
+        team_reward = 1.0 if seen_count == 0 else -1.0
+        return team_reward, bool(seen_count > 0), gaze_cos_front_max, gaze_cos_front_dist_max, bool(learnable_hider_seen)
+    '''
 
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
         rel = t_pos - pos; dist = math.sqrt(np.sum(rel**2)) + 1e-8
@@ -1042,3 +1168,5 @@ class TeamCosEnv(gym.Env):
 
     def close(self):
         if self.viewer: self.viewer.close()
+
+    

@@ -12,7 +12,10 @@ import torch.nn as nn
 import torch.distributions as distributions
 import numpy as np
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+LAYER_INIT_STD_DEFAULT = np.sqrt(2.0)
+
+
+def layer_init(layer, std=LAYER_INIT_STD_DEFAULT, bias_const=0.0):
     """
     層の重みを直交初期化し、バイアスを定数で初期化する補助関数。
     """
