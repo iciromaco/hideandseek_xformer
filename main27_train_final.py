@@ -1,9 +1,11 @@
 # main27_train_final.py v6.0
 
 import math
+import argparse
 import os
 import sys
 import time
+import tomllib
 import traceback
 from functools import partial
 
@@ -26,45 +28,95 @@ from envs.hns_environment import TeamCosEnv
 from models.ppo_transformer_v2 import AgentV2
 
 
-LOCAL_OVERRIDES = {
-    # ここを編集すれば環境変数なしで設定できます。
-    # 例:
-    #"TRAIN_MODE": True,
-    #"USE_VIEWER": True,
-    #"TRAINING_TARGET": "seeker",
-    #"N_SEEKERS": 1,
-    #"N_HIDERS": 2,
-    #"N_BOXES": 2,
-    #"N_RAMPS": 1,
-}
+CONFIG_PATH = "configs/hparams_main27.toml"
 
-# ここを "debug" / "train" で切り替えると主要設定を一括変更できます。
-# 優先順位: LOCAL_OVERRIDES > 環境変数 > RUN_PROFILE > デフォルト
-RUN_PROFILE = "train"  # "debug" / "train"
+CLI_EXAMPLES = (
+    "実行例:\n"
+    "  1) 学習を実行する（TOMLで train を選択）\n"
+    "     # configs/hparams_main27.toml の runtime.active_profile = \"train\"\n"
+    "     uv run mjpython main27_train_final.py\n\n"
+    "  1-b) 実行時オプションで train を選択（TOMLを編集しない）\n"
+    "     uv run mjpython main27_train_final.py --profile train\n\n"
+    "  2) 学習結果を確認する（デバッグ再生）\n"
+    "     # configs/hparams_main27.toml の runtime.active_profile = \"debug\"\n"
+    "     uv run mjpython main27_train_final.py\n\n"
+    "  2-b) 実行時オプションで debug を選択（TOMLを編集しない）\n"
+    "     uv run mjpython main27_train_final.py --profile debug\n\n"
+    "  3) ヘルプと実行例を表示\n"
+    "     uv run mjpython main27_train_final.py -h\n"
+)
 
-PROFILE_OVERRIDES = {
-    "debug": {
-        "TRAIN_MODE": False,
-        # "USE_VIEWER": True,
-        "DEBUG_HIDER_POLICY": "model_if_available",
-        "DEBUG_SEEKER_POLICY": "model_if_available",
-        # "NPC_ONLY_DEBUG": False,
-        "PLAY_EPISODES": 100,
-        # "AUTO_TUNE_HPARAMS": False,
-        # "RAMP_CHECK_VIEWER": False
-    },
-    "train": {
-        "TRAIN_MODE": True,
-        "USE_VIEWER": False,
-        "TRAINING_TARGET": "hider",
-        "TRAIN_OTHER_HIDER_POLICY": "model_if_available",
-        "TRAIN_OTHER_SEEKER_POLICY": "rule",
-        "NPC_ONLY_DEBUG": False,
-        "AUTO_TUNE_HPARAMS": True,
-        "NUM_ENVS": "10",
-        "TOTAL_TIMESTEPS":300000,
-    },
-}
+
+def _cli_profile_override_from_argv(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    for i, token in enumerate(args):
+        if token.startswith("--profile="):
+            return token.split("=", 1)[1]
+        if token in {"--profile", "-p"}:
+            if i + 1 < len(args):
+                return args[i + 1]
+    return None
+
+
+CLI_PROFILE_OVERRIDE = _cli_profile_override_from_argv()
+
+
+def _parse_cli_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="HideAndSeek Transformer v27 runner",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=CLI_EXAMPLES,
+    )
+    parser.add_argument(
+        "-p",
+        "--profile",
+        choices=["train", "debug"],
+        help="実行時だけ runtime profile を上書き（TOMLは変更しない）",
+    )
+    parser.add_argument(
+        "--examples",
+        action="store_true",
+        help="実行例のみ表示して終了",
+    )
+    args, _ = parser.parse_known_args(argv)
+    if args.examples:
+        print(CLI_EXAMPLES)
+        raise SystemExit(0)
+
+
+def _normalize_profile_name(value):
+    text = str(value).strip().lower()
+    if text in {"debug", "train"}:
+        return text
+    print(f"Invalid runtime.active_profile={value}. Fallback to train.")
+    return "train"
+
+
+def _load_runtime_config(path, profile_override=None):
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+        runtime_cfg = raw.get("runtime", {}) if isinstance(raw, dict) else {}
+        if not isinstance(runtime_cfg, dict):
+            runtime_cfg = {}
+        profile_value = profile_override if profile_override is not None else runtime_cfg.get("active_profile", "train")
+        profile_origin = "cli(--profile)" if profile_override is not None else "toml(runtime.active_profile)"
+        profile = _normalize_profile_name(profile_value)
+        common = runtime_cfg.get("common", {}) if isinstance(runtime_cfg, dict) else {}
+        profile_cfg = runtime_cfg.get(profile, {}) if isinstance(runtime_cfg, dict) else {}
+        if not isinstance(common, dict):
+            common = {}
+        if not isinstance(profile_cfg, dict):
+            profile_cfg = {}
+        merged = dict(common)
+        merged.update(profile_cfg)
+        return merged, profile, profile_origin
+    except Exception as exc:
+        print(f"runtime config load failed ({exc})")
+        return {}, "train", "fallback(default)"
+
+
+RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(CONFIG_PATH, CLI_PROFILE_OVERRIDE)
 
 
 def _to_bool(value):
@@ -74,13 +126,8 @@ def _to_bool(value):
 
 
 def _cfg(name, default, cast=None):
-    profile_map = PROFILE_OVERRIDES.get(RUN_PROFILE, {})
-    if name in LOCAL_OVERRIDES:
-        raw = LOCAL_OVERRIDES[name]
-    elif name in os.environ:
-        raw = os.environ[name]
-    elif name in profile_map:
-        raw = profile_map[name]
+    if name in RUNTIME_OVERRIDES:
+        raw = RUNTIME_OVERRIDES[name]
     else:
         raw = default
     if cast is None:
@@ -96,6 +143,7 @@ USE_CUSTOM_REWARD = _cfg("USE_CUSTOM_REWARD", "1", _to_bool)
 AUTO_TUNE_HPARAMS = _cfg("AUTO_TUNE_HPARAMS", "1", _to_bool)
 DEBUG_HIDER_POLICY = _cfg("DEBUG_HIDER_POLICY", "rule", str)
 DEBUG_SEEKER_POLICY = _cfg("DEBUG_SEEKER_POLICY", "rule", str)
+DEBUG_DETERMINISTIC_INFERENCE = _cfg("DEBUG_DETERMINISTIC_INFERENCE", "0", _to_bool)
 TRAIN_OTHER_HIDER_POLICY = _cfg("TRAIN_OTHER_HIDER_POLICY", "rule", str)
 TRAIN_OTHER_SEEKER_POLICY = _cfg("TRAIN_OTHER_SEEKER_POLICY", "rule", str)
 
@@ -112,6 +160,8 @@ ENV_CONFIG = {
     "n_boxes": _cfg("N_BOXES", "2", int),
     "n_ramps": _cfg("N_RAMPS", "1", int),
     "show_turn_lines": SHOW_TURN_LINES,
+    "policy_source_log": _cfg("POLICY_SOURCE_LOG", "0", _to_bool),
+    "policy_source_log_each_reset": _cfg("POLICY_SOURCE_LOG_EACH_RESET", "0", _to_bool),
 }
 
 SEQ_LEN = _cfg("SEQ_LEN", "8", int)
@@ -155,6 +205,32 @@ WANDB_MODE = _cfg("WANDB_MODE", "online", str)
 WANDB_RUN_NAME = _cfg("WANDB_RUN_NAME", "", str)
 WANDB_LOG_CODE = _cfg("WANDB_LOG_CODE", "1", _to_bool)
 WANDB_CODE_ROOT = _cfg("WANDB_CODE_ROOT", os.path.dirname(__file__), str)
+
+# Checkpoint handling
+RESUME_TRAINING = _cfg("RESUME_TRAINING", "0", _to_bool)
+RESET_MODEL_ON_TRAIN = _cfg("RESET_MODEL_ON_TRAIN", "0", _to_bool)
+HPARAMS_CONFIG_PATH = CONFIG_PATH
+
+# Reward shaping coefficients
+RW_SEEK_VISIBLE_BONUS = _cfg("RW_SEEK_VISIBLE_BONUS", "0.03", float)
+RW_SEEK_DIST_GAIN = _cfg("RW_SEEK_DIST_GAIN", "0.03", float)
+RW_SEEK_FORWARD_GAIN = _cfg("RW_SEEK_FORWARD_GAIN", "0.01", float)
+RW_SEEK_IDLE_PENALTY = _cfg("RW_SEEK_IDLE_PENALTY", "0.01", float)
+
+RW_HIDE_HIDDEN_BONUS = _cfg("RW_HIDE_HIDDEN_BONUS", "0.06", float)
+RW_HIDE_VISIBLE_PENALTY = _cfg("RW_HIDE_VISIBLE_PENALTY", "0.06", float)
+RW_HIDE_DIST_GAIN = _cfg("RW_HIDE_DIST_GAIN", "0.04", float)
+RW_HIDE_FORWARD_GAIN = _cfg("RW_HIDE_FORWARD_GAIN", "0.02", float)
+RW_HIDE_BACKWARD_PENALTY = _cfg("RW_HIDE_BACKWARD_PENALTY", "0.05", float)
+RW_HIDE_IDLE_PENALTY = _cfg("RW_HIDE_IDLE_PENALTY", "0.02", float)
+RW_HIDE_CAMP_PENALTY = _cfg("RW_HIDE_CAMP_PENALTY", "0.02", float)
+RW_HIDE_WALL_STICK_PENALTY = _cfg("RW_HIDE_WALL_STICK_PENALTY", "0.03", float)
+RW_HIDE_WALL_NEAR_THRESHOLD = _cfg("RW_HIDE_WALL_NEAR_THRESHOLD", "0.18", float)
+RW_HIDE_STILL_SPEED_THRESHOLD = _cfg("RW_HIDE_STILL_SPEED_THRESHOLD", "0.05", float)
+
+RW_TURN_SAT_PENALTY = _cfg("RW_TURN_SAT_PENALTY", "0.01", float)
+RW_MOVE_CTRL_COST = _cfg("RW_MOVE_CTRL_COST", "0.001", float)
+RW_HAND_CTRL_COST = _cfg("RW_HAND_CTRL_COST", "0.0005", float)
 
 
 class ObsHistory:
@@ -297,6 +373,30 @@ def init_wandb_run(hp, model_path, training_target):
 
 
 def select_hparams(config, target):
+    def _apply_hp_patch(dst, patch):
+        for key in dst.keys():
+            if key not in patch:
+                continue
+            try:
+                if isinstance(dst[key], int):
+                    dst[key] = int(patch[key])
+                else:
+                    dst[key] = float(patch[key])
+            except Exception:
+                pass
+
+    def _load_hparams_cfg(path):
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "rb") as f:
+                raw = tomllib.load(f)
+            if isinstance(raw, dict):
+                return raw
+        except Exception as exc:
+            print(f"hparams config load failed ({exc})")
+        return {}
+
     hp = {
         "total_timesteps": TOTAL_TIMESTEPS,
         "rollout_steps": ROLLOUT_STEPS,
@@ -312,97 +412,56 @@ def select_hparams(config, target):
         "log_interval": LOG_INTERVAL,
         "save_interval": SAVE_INTERVAL,
     }
+
+    hp_cfg = _load_hparams_cfg(HPARAMS_CONFIG_PATH)
+    if hp_cfg:
+        _apply_hp_patch(hp, hp_cfg.get("base", {}))
+
     if not AUTO_TUNE_HPARAMS:
         return hp
 
     sig = env_signature(config)
-    target_defaults = {
-        "seeker": {
-            "learning_rate": min(hp["learning_rate"], 2.2e-4),
-            "clip_coef": 0.18,
-            "ent_coef": max(hp["ent_coef"], 6.0e-4),
-            "update_epochs": max(hp["update_epochs"], 4),
-        },
-        "hider": {
-            "learning_rate": min(hp["learning_rate"], 2.0e-4),
-            "clip_coef": 0.20,
-            "ent_coef": max(hp["ent_coef"], 1.2e-3),
-            "update_epochs": max(hp["update_epochs"], 5),
-        },
-    }
-    hp.update(target_defaults.get(target, {}))
+    defaults_cfg = hp_cfg.get("defaults", {}) if isinstance(hp_cfg, dict) else {}
+    default_patch = defaults_cfg.get(target, {}) if isinstance(defaults_cfg, dict) else {}
+    if isinstance(default_patch, dict):
+        _apply_hp_patch(hp, default_patch)
 
-    target_presets = {
-        "seeker": {
-            "s1_h2_b2_r1": {
-                "total_timesteps": 600_000,
-                "rollout_steps": 192,
-                "update_epochs": 5,
-                "minibatch_size": 96,
-                "learning_rate": 2.0e-4,
-                "clip_coef": 0.17,
-                "ent_coef": 6.0e-4,
-                "log_interval": 5,
-                "save_interval": 25,
-            },
-            "s2_h3_b2_r3": {
-                "total_timesteps": 900_000,
-                "rollout_steps": 256,
-                "update_epochs": 4,
-                "minibatch_size": 128,
-                "learning_rate": 1.7e-4,
-                "clip_coef": 0.18,
-                "ent_coef": 7.0e-4,
-                "log_interval": 5,
-                "save_interval": 25,
-            },
-        },
-        "hider": {
-            "s1_h2_b2_r1": {
-                "total_timesteps": 700_000,
-                "rollout_steps": 192,
-                "update_epochs": 6,
-                "minibatch_size": 96,
-                "learning_rate": 1.8e-4,
-                "clip_coef": 0.20,
-                "ent_coef": 1.4e-3,
-                "log_interval": 5,
-                "save_interval": 25,
-            },
-            "s2_h3_b2_r3": {
-                "total_timesteps": 1_000_000,
-                "rollout_steps": 256,
-                "update_epochs": 5,
-                "minibatch_size": 128,
-                "learning_rate": 1.6e-4,
-                "clip_coef": 0.20,
-                "ent_coef": 1.6e-3,
-                "log_interval": 5,
-                "save_interval": 25,
-            },
-        },
-    }
-    presets = target_presets.get(target, {})
+    presets_cfg = hp_cfg.get("presets", {}) if isinstance(hp_cfg, dict) else {}
+    presets = presets_cfg.get(target, {}) if isinstance(presets_cfg, dict) else {}
     if sig in presets:
-        hp.update(presets[sig])
+        preset_patch = presets[sig]
+        if isinstance(preset_patch, dict):
+            _apply_hp_patch(hp, preset_patch)
     else:
+        complexity_cfg = hp_cfg.get("complexity", {}) if hp_cfg else {}
+        if not isinstance(complexity_cfg, dict) or not complexity_cfg:
+            complexity_cfg = {}
+        complexity_threshold = int(complexity_cfg.get("threshold", 0) or 0)
         complexity = (
             config["n_seekers"]
             + config["n_hiders"]
             + config["n_boxes"]
             + config["n_ramps"]
         )
-        if complexity >= 8:
-            hp["rollout_steps"] = max(hp["rollout_steps"], 192)
-            hp["minibatch_size"] = max(hp["minibatch_size"], 96)
-            hp["learning_rate"] = min(hp["learning_rate"], 2.0e-4)
-            hp["ent_coef"] = max(hp["ent_coef"], 1.0e-3)
-            hp["total_timesteps"] = max(hp["total_timesteps"], 700_000)
+        if complexity_threshold > 0 and complexity >= complexity_threshold:
+            if "rollout_steps_min" in complexity_cfg:
+                hp["rollout_steps"] = max(hp["rollout_steps"], int(complexity_cfg["rollout_steps_min"]))
+            if "minibatch_size_min" in complexity_cfg:
+                hp["minibatch_size"] = max(hp["minibatch_size"], int(complexity_cfg["minibatch_size_min"]))
+            if "learning_rate_max" in complexity_cfg:
+                hp["learning_rate"] = min(hp["learning_rate"], float(complexity_cfg["learning_rate_max"]))
+            if "ent_coef_min" in complexity_cfg:
+                hp["ent_coef"] = max(hp["ent_coef"], float(complexity_cfg["ent_coef_min"]))
+            if "total_timesteps_min" in complexity_cfg:
+                hp["total_timesteps"] = max(hp["total_timesteps"], int(complexity_cfg["total_timesteps_min"]))
             if target == "hider":
-                hp["clip_coef"] = max(hp["clip_coef"], 0.20)
-                hp["ent_coef"] = max(hp["ent_coef"], 1.4e-3)
+                if "hider_clip_coef_min" in complexity_cfg:
+                    hp["clip_coef"] = max(hp["clip_coef"], float(complexity_cfg["hider_clip_coef_min"]))
+                if "hider_ent_coef_min" in complexity_cfg:
+                    hp["ent_coef"] = max(hp["ent_coef"], float(complexity_cfg["hider_ent_coef_min"]))
             else:
-                hp["clip_coef"] = min(hp["clip_coef"], 0.19)
+                if "seeker_clip_coef_max" in complexity_cfg:
+                    hp["clip_coef"] = min(hp["clip_coef"], float(complexity_cfg["seeker_clip_coef_max"]))
 
     if hp["rollout_steps"] % hp["minibatch_size"] != 0:
         hp["minibatch_size"] = max(32, min(hp["rollout_steps"], hp["minibatch_size"]))
@@ -694,22 +753,57 @@ def run_ramp_check_viewer(mode, target, agent, device, episodes=3, max_steps=220
 
 
 def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker"):
-    enemy_visible = any(obs[en.VISIBLE] > 0.5 for en in idx.OTHERS)
+    action = np.asarray(action, dtype=np.float32)
+    enemy_visible_count = 0
     min_enemy_dist = 999.0
+    min_visible_enemy_dist = 999.0
     for en in idx.OTHERS:
         d = math.sqrt(obs[en.REL_X] ** 2 + obs[en.REL_Y] ** 2)
         if d < min_enemy_dist:
             min_enemy_dist = d
+        if obs[en.VISIBLE] > 0.5:
+            enemy_visible_count += 1
+            if d < min_visible_enemy_dist:
+                min_visible_enemy_dist = d
     speed = math.sqrt(obs[idx.SELF.VEL_X] ** 2 + obs[idx.SELF.VEL_Y] ** 2)
+    lidar_vals = np.asarray(obs[idx.LIDAR], dtype=np.float32)
+    lidar_min = float(np.min(lidar_vals)) if lidar_vals.size > 0 else 1.0
+
+    move = float(action[0]) if action.shape[0] > 0 else 0.0
+    turn = float(action[1]) if action.shape[0] > 1 else 0.0
+    lock_a = float(action[2]) if action.shape[0] > 2 else 0.0
+    grab_a = float(action[3]) if action.shape[0] > 3 else 0.0
+    visible = enemy_visible_count > 0
 
     bonus = 0.0
     if target_team == "seeker":
-        if enemy_visible:
-            bonus += 0.05
-        bonus += 0.02 / (min_enemy_dist + 0.5)
+        if visible:
+            bonus += RW_SEEK_VISIBLE_BONUS * enemy_visible_count
+            bonus += RW_SEEK_DIST_GAIN / (min_visible_enemy_dist + 0.2)
+        bonus += RW_SEEK_FORWARD_GAIN * max(move, 0.0)
         if speed < 0.01:
-            bonus -= 0.02
-    control_cost = -0.005 * np.sum(np.square(action))
+            bonus -= RW_SEEK_IDLE_PENALTY
+    else:
+        if visible:
+            bonus -= RW_HIDE_VISIBLE_PENALTY * enemy_visible_count
+        else:
+            bonus += RW_HIDE_HIDDEN_BONUS
+        bonus += RW_HIDE_DIST_GAIN * min(min_enemy_dist, 1.5)
+        bonus += RW_HIDE_FORWARD_GAIN * max(move, 0.0)
+        bonus -= RW_HIDE_BACKWARD_PENALTY * max(-move, 0.0)
+        if speed < 0.01:
+            bonus -= RW_HIDE_IDLE_PENALTY
+        if (not visible) and speed < RW_HIDE_STILL_SPEED_THRESHOLD:
+            bonus -= RW_HIDE_CAMP_PENALTY
+        if lidar_min < RW_HIDE_WALL_NEAR_THRESHOLD and speed < RW_HIDE_STILL_SPEED_THRESHOLD:
+            bonus -= RW_HIDE_WALL_STICK_PENALTY
+
+    turn_sat_cost = RW_TURN_SAT_PENALTY * max(abs(turn) - 0.9, 0.0)
+    control_cost = -(
+        RW_MOVE_CTRL_COST * (move * move + turn * turn)
+        + RW_HAND_CTRL_COST * (lock_a * lock_a + grab_a * grab_a)
+        + turn_sat_cost
+    )
     return base_reward + bonus + control_cost
 
 
@@ -779,6 +873,23 @@ def _apply_policy_state(env, vec_envs, agent_keys, state_dict, label):
     return False
 
 
+def _set_override_learnable_policy(env, vec_envs, enabled):
+    if vec_envs is not None:
+        try:
+            vec_envs.call("set_override_learnable_policy", bool(enabled))
+            return True
+        except Exception as exc:
+            print(f"set_override_learnable_policy: vector sync failed ({exc})")
+            return False
+    if env is not None:
+        try:
+            return bool(env.set_override_learnable_policy(bool(enabled)))
+        except Exception as exc:
+            print(f"set_override_learnable_policy failed ({exc})")
+            return False
+    return False
+
+
 def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_state_dict):
     if ref_env is None:
         return
@@ -811,10 +922,32 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
     if seeker_mode == POLICY_MODEL_IF_AVAILABLE:
         _apply_policy_state(env, vec_envs, seeker_keys, seeker_state, "Seeker inference policy")
 
+    symmetric_hider_debug = (
+        (not TRAIN_MODE)
+        and runtime_target == "hider"
+        and hider_mode == POLICY_MODEL_IF_AVAILABLE
+        and (hider_state is not None)
+    )
+    if symmetric_hider_debug:
+        all_hider_keys = list(ref_env.hider_keys)
+        ok = _apply_policy_state(
+            env,
+            vec_envs,
+            all_hider_keys,
+            hider_state,
+            "Debug symmetric hider policy",
+        )
+        _set_override_learnable_policy(env, vec_envs, ok)
+        if ok:
+            print("Debug mode: all hiders use same model inference path")
+    else:
+        _set_override_learnable_policy(env, vec_envs, False)
+
 
 def run_debug_or_playback(env, agent, device, model_loaded):
     idx = env.idx
     obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
     history = ObsHistory(1, SEQ_LEN, obs_dim, device)
 
     target_npc = None
@@ -836,6 +969,9 @@ def run_debug_or_playback(env, agent, device, model_loaded):
         grab_events_window = 0
         sat_count = 0
         boosted_count = 0
+        action_sum_window = np.zeros(act_dim, dtype=np.float64)
+        action_sq_sum_window = np.zeros(act_dim, dtype=np.float64)
+        action_count_window = 0
 
         if USE_VIEWER:
             env.render()
@@ -849,7 +985,10 @@ def run_debug_or_playback(env, agent, device, model_loaded):
             elif model_loaded:
                 with torch.no_grad():
                     seq = history.get()
-                    out = agent.get_action_and_value(seq)
+                    if DEBUG_DETERMINISTIC_INFERENCE and hasattr(agent, "get_deterministic_action_and_value"):
+                        out = agent.get_deterministic_action_and_value(seq)
+                    else:
+                        out = agent.get_action_and_value(seq)
                     action = out[0].cpu().numpy().reshape(-1)
             else:
                 action = np.zeros(env.action_space.shape, dtype=np.float32)
@@ -866,6 +1005,9 @@ def run_debug_or_playback(env, agent, device, model_loaded):
             lock_events_window += int(info.get("lock_event", 0))
             grab_events_window += int(info.get("grab_event", 0))
             boosted_count += int(info.get("dbg_boosted_agents", 0) > 0)
+            action_sum_window += action.astype(np.float64)
+            action_sq_sum_window += np.square(action.astype(np.float64))
+            action_count_window += 1
             if float(np.max(np.abs(action[:2]))) >= 0.9:
                 sat_count += 1
 
@@ -879,10 +1021,27 @@ def run_debug_or_playback(env, agent, device, model_loaded):
             done = bool(term or trun)
 
             if step_count % 100 == 0:
+                action_mean_window = action_sum_window / max(action_count_window, 1)
+                action_var_window = np.maximum(
+                    action_sq_sum_window / max(action_count_window, 1) - np.square(action_mean_window),
+                    0.0,
+                )
+                action_std_window = np.sqrt(action_var_window)
+
+                move_v = float(action[0]) if action.shape[0] > 0 else 0.0
+                turn_v = float(action[1]) if action.shape[0] > 1 else 0.0
+                lock_v = float(action[2]) if action.shape[0] > 2 else 0.0
+                grab_v = float(action[3]) if action.shape[0] > 3 else 0.0
+
                 print(
                     "Ep "
                     f"{episode} - Step {step_count} | "
-                    f"Steer={action[1]:.2f} "
+                    f"Move={move_v:.2f} "
+                    f"Turn={turn_v:.2f} "
+                    f"LockAct={lock_v:.2f} "
+                    f"GrabAct={grab_v:.2f} "
+                    f"ActMean=[{action_mean_window[0]:.2f},{action_mean_window[1]:.2f},{action_mean_window[2]:.2f},{action_mean_window[3]:.2f}] "
+                    f"ActStd=[{action_std_window[0]:.2f},{action_std_window[1]:.2f},{action_std_window[2]:.2f},{action_std_window[3]:.2f}] "
                     f"LockBtnMax={info.get('dbg_lock_btn_max', 0.0):.2f} "
                     f"GrabBtnMax={info.get('dbg_grab_btn_max', 0.0):.2f} "
                     f"LockPressed={int(info.get('dbg_lock_pressed', 0))} "
@@ -904,6 +1063,9 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                 )
                 lock_events_window = 0
                 grab_events_window = 0
+                action_sum_window.fill(0.0)
+                action_sq_sum_window.fill(0.0)
+                action_count_window = 0
 
         print(
             f"Ep {episode} Finished. Steps={step_count}, Reward={ep_reward:.2f}, "
@@ -1435,9 +1597,10 @@ def run_train_vector(
 
 
 def run():
+    _parse_cli_args()
     runtime_target = _resolve_runtime_target()
     print("Initializing Environment...")
-    print(f"Run profile: {RUN_PROFILE}")
+    print(f"Run profile: {RUN_PROFILE} (source: {RUN_PROFILE_SOURCE})")
     print(
         "Resolved flags: "
         f"TRAIN_MODE={TRAIN_MODE}, "
@@ -1446,6 +1609,11 @@ def run():
         f"RUNTIME_TARGET={runtime_target}, "
         f"DEBUG_HIDER_POLICY={DEBUG_HIDER_POLICY}, "
         f"DEBUG_SEEKER_POLICY={DEBUG_SEEKER_POLICY}, "
+        f"DEBUG_DETERMINISTIC_INFERENCE={DEBUG_DETERMINISTIC_INFERENCE}, "
+        f"USE_CUSTOM_REWARD={USE_CUSTOM_REWARD}, "
+        f"HPARAMS_CONFIG_PATH={HPARAMS_CONFIG_PATH}, "
+        f"RESUME_TRAINING={RESUME_TRAINING}, "
+        f"RESET_MODEL_ON_TRAIN={RESET_MODEL_ON_TRAIN}, "
         f"TRAIN_OTHER_HIDER_POLICY={TRAIN_OTHER_HIDER_POLICY}, "
         f"TRAIN_OTHER_SEEKER_POLICY={TRAIN_OTHER_SEEKER_POLICY}, "
         f"NUM_ENVS={NUM_ENVS}, "
@@ -1505,13 +1673,25 @@ def run():
     agent = AgentV2(obs_dim, act_dim, HIDDEN_DIM, SEQ_LEN).to(device)
     wandb_run = init_wandb_run(hp, model_path, runtime_target) if TRAIN_MODE else None
     model_loaded = False
-    if os.path.exists(model_path):
+    should_load_model = True
+    if TRAIN_MODE:
+        should_load_model = bool(RESUME_TRAINING)
+        if RESET_MODEL_ON_TRAIN and os.path.exists(model_path):
+            try:
+                os.remove(model_path)
+                print(f"Removed existing checkpoint: {model_path}")
+            except Exception as exc:
+                print(f"Failed to remove checkpoint ({exc})")
+
+    if should_load_model and os.path.exists(model_path):
         try:
             agent.load_state_dict(torch.load(model_path, map_location=device))
             model_loaded = True
             print(f"Loaded model: {model_path}")
         except Exception as exc:
             print(f"Model load skipped ({exc})")
+    elif TRAIN_MODE and (not RESUME_TRAINING):
+        print("Training from scratch (resume disabled).")
 
     primary_state_dict = _snapshot_state_dict_cpu(agent) if model_loaded else None
     configure_team_policy_modes(

@@ -112,7 +112,8 @@ class TeamCosEnv(gym.Env):
 
     def __init__(self, mode="initial", target="hider", n_seekers=1,
                  n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None,
-                 inference_policies=None, show_turn_lines=True):
+                 inference_policies=None, show_turn_lines=True,
+                 policy_source_log=False, policy_source_log_each_reset=False):
         super().__init__()
         self.n_seekers = int(n_seekers)
         self.n_hiders = int(n_hiders)
@@ -143,11 +144,17 @@ class TeamCosEnv(gym.Env):
         self.viewer = None
         self.inference_policies = inference_policies or {}
         self._inference_models = {}
+        self._inference_seq_lens = {}
         self.shared_team_policy = False
         self.shared_policy_model = None
         self.shared_policy_seq_len = 8
         self.shared_policy_hidden_dim = 128
         self.shared_team_prefix = "h" if self.learnable_agent_key.startswith("h") else "s"
+        self._policy_histories = {}
+        self.override_learnable_policy = False
+        self._policy_source_logged = set()
+        self.policy_source_log = bool(policy_source_log)
+        self.policy_source_log_each_reset = bool(policy_source_log_each_reset)
         
         self.last_debug_ctrl = {k: (0.0, 0.0) for k in self.agent_keys}
         
@@ -191,6 +198,8 @@ class TeamCosEnv(gym.Env):
         policy_model.load_state_dict(state_dict)
         policy_model.eval()
         self.shared_policy_model = policy_model
+        for ak in self.agent_keys:
+            self._policy_histories.pop((ak, self.shared_policy_seq_len), None)
         return True
 
     def set_inference_policy_state(self, agent_keys, state_dict, seq_len=8, hidden_dim=128):
@@ -207,22 +216,55 @@ class TeamCosEnv(gym.Env):
         policy_model.load_state_dict(state_dict)
         policy_model.eval()
 
-        def _policy(norm_obs):
-            obs_np = np.asarray(norm_obs, dtype=np.float32).reshape(1, -1)
-            seq_np = np.repeat(obs_np[:, None, :], int(seq_len), axis=1)
-            seq_t = torch.as_tensor(seq_np, dtype=torch.float32)
-            with torch.no_grad():
-                arr = policy_model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
-            if arr.size >= 4:
-                return arr[:4]
-            out = np.zeros(4, dtype=np.float32)
-            out[:arr.size] = arr
-            return out
-
         for ak in keys:
-            self.inference_policies[ak] = _policy
             self._inference_models[ak] = policy_model
+            self._inference_seq_lens[ak] = int(seq_len)
+            self._policy_histories.pop((ak, int(seq_len)), None)
         return True
+
+    def set_override_learnable_policy(self, enabled):
+        self.override_learnable_policy = bool(enabled)
+        return True
+
+    def _ensure_policy_history(self, agent_key, seq_len):
+        sl = int(seq_len)
+        obs_dim = int(self.observation_space.shape[0])
+        key = (agent_key, sl)
+        hist = self._policy_histories.get(key)
+        if hist is None or hist["buffer"].shape != (sl * 2, obs_dim):
+            hist = {
+                "buffer": np.zeros((sl * 2, obs_dim), dtype=np.float32),
+                "ptr": 0,
+            }
+            self._policy_histories[key] = hist
+        return hist
+
+    def _prime_policy_history(self, agent_key, seq_len, norm_obs):
+        hist = self._ensure_policy_history(agent_key, seq_len)
+        obs_np = np.asarray(norm_obs, dtype=np.float32).reshape(-1)
+        sl = int(seq_len)
+        for i in range(sl):
+            hist["buffer"][i] = obs_np
+            hist["buffer"][i + sl] = obs_np
+        hist["ptr"] = 0
+
+    def _update_policy_history(self, agent_key, seq_len, norm_obs):
+        hist = self._ensure_policy_history(agent_key, seq_len)
+        obs_np = np.asarray(norm_obs, dtype=np.float32).reshape(-1)
+        sl = int(seq_len)
+        ptr = int(hist["ptr"])
+        hist["buffer"][ptr] = obs_np
+        hist["buffer"][ptr + sl] = obs_np
+        hist["ptr"] = (ptr + 1) % sl
+
+    def _get_policy_history_seq(self, agent_key, seq_len, norm_obs):
+        hist = self._ensure_policy_history(agent_key, seq_len)
+        if not np.any(hist["buffer"]):
+            self._prime_policy_history(agent_key, seq_len, norm_obs)
+            hist = self._ensure_policy_history(agent_key, seq_len)
+        ptr = int(hist["ptr"])
+        sl = int(seq_len)
+        return hist["buffer"][ptr:ptr + sl]
 
     def _build_dynamic_xml(self):
         arena = self._xml_static_scene()
@@ -631,10 +673,28 @@ class TeamCosEnv(gym.Env):
                 self.model.geom_rgba[gid] = rgba
 
     def _policy_action(self, agent_key, norm_obs):
-        """推論モデルがあれば優先。失敗時は RuleBased にフォールバック。"""
+        """モデルが設定されている場合は必ずそのモデルを使う。"""
+        model = self._inference_models.get(agent_key)
+        if model is not None:
+            self._log_policy_source(agent_key, "model")
+            seq_len = int(self._inference_seq_lens.get(agent_key, 8))
+            seq_np = self._get_policy_history_seq(agent_key, seq_len, norm_obs)
+            seq_t = torch.as_tensor(seq_np[None, :, :], dtype=torch.float32)
+            with torch.no_grad():
+                if hasattr(model, "get_deterministic_action_and_value"):
+                    arr = model.get_deterministic_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+                else:
+                    arr = model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+            if arr.size >= 4:
+                return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
+            if arr.size >= 2:
+                return float(arr[0]), float(arr[1]), 0.0, 0.0
+            raise RuntimeError(f"Invalid model action size: agent={agent_key}, size={arr.size}")
+
         policy = self.inference_policies.get(agent_key)
         if policy is not None:
             try:
+                self._log_policy_source(agent_key, "callable")
                 pred = policy(norm_obs)
                 arr = np.asarray(pred).reshape(-1)
                 if arr.size >= 4:
@@ -650,27 +710,41 @@ class TeamCosEnv(gym.Env):
             and agent_key != self.learnable_agent_key
             and agent_key.startswith(self.shared_team_prefix)
         ):
-            try:
-                obs_np = np.asarray(norm_obs, dtype=np.float32).reshape(1, -1)
-                seq_np = np.repeat(obs_np[:, None, :], self.shared_policy_seq_len, axis=1)
-                seq_t = torch.as_tensor(seq_np, dtype=torch.float32)
-                with torch.no_grad():
+            self._log_policy_source(agent_key, "shared_model")
+            seq_np = self._get_policy_history_seq(agent_key, self.shared_policy_seq_len, norm_obs)
+            seq_t = torch.as_tensor(seq_np[None, :, :], dtype=torch.float32)
+            with torch.no_grad():
+                if hasattr(self.shared_policy_model, "get_deterministic_action_and_value"):
+                    arr = self.shared_policy_model.get_deterministic_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+                else:
                     arr = self.shared_policy_model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
-                if arr.size >= 4:
-                    return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
-                if arr.size >= 2:
-                    return float(arr[0]), float(arr[1]), 0.0, 0.0
-            except Exception:
-                pass
+            if arr.size >= 4:
+                return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
+            if arr.size >= 2:
+                return float(arr[0]), float(arr[1]), 0.0, 0.0
+            raise RuntimeError(f"Invalid shared action size: agent={agent_key}, size={arr.size}")
 
+        self._log_policy_source(agent_key, "rule")
         arr = np.asarray(self.npcs[agent_key].get_action(norm_obs, self.idx)).reshape(-1)
         if arr.size >= 4:
             return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
         return float(arr[0]), float(arr[1]), 0.0, 0.0
 
+    def _log_policy_source(self, agent_key, source):
+        if not self.policy_source_log:
+            return
+        key = (agent_key, source)
+        if key in self._policy_source_logged:
+            return
+        print(f"policy_source[{agent_key}] = {source}")
+        self._policy_source_logged.add(key)
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
+        self._policy_histories.clear()
+        if self.policy_source_log_each_reset:
+            self._policy_source_logged.clear()
         mujoco.mj_resetData(self.model, self.data)
         self._init_agent_intelligence()
         self._init_interaction_state()
@@ -699,6 +773,23 @@ class TeamCosEnv(gym.Env):
                     placed.append((p, self.R_AGENT)); break
         mujoco.mj_forward(self.model, self.data)
         self._cache_planar_object_pose()
+
+        for i, ak in enumerate(self.agent_keys):
+            if ak == self.learnable_agent_key and not self.override_learnable_policy:
+                continue
+            norm_obs = self._normalize_obs(self._get_obs(i))
+            if ak in self._inference_models:
+                self._prime_policy_history(
+                    ak,
+                    int(self._inference_seq_lens.get(ak, 8)),
+                    norm_obs,
+                )
+            if (
+                self.shared_team_policy
+                and self.shared_policy_model is not None
+                and ak.startswith(self.shared_team_prefix)
+            ):
+                self._prime_policy_history(ak, self.shared_policy_seq_len, norm_obs)
         
         # 学習対象の観測を返す
         idx_to_obs = self.learnable_agent_index
@@ -722,6 +813,9 @@ class TeamCosEnv(gym.Env):
             if ak == self.learnable_agent_key:
                 if is_seeker and self.current_step <= self.prep_steps:
                     f, t, lck, grb = 0.0, 0.0, 0.0, 0.0
+                elif self.override_learnable_policy:
+                    norm_obs = self._normalize_obs(self._get_obs(i))
+                    f, t, lck, grb = self._policy_action(ak, norm_obs)
                 else:
                     # 外部アクション（常に4要素）を適用
                     f = af[0] if len(af) > 0 else 0.0
@@ -779,6 +873,24 @@ class TeamCosEnv(gym.Env):
         )
         
         rb, find = self._compute_team_reward()
+
+        for i, ak in enumerate(self.agent_keys):
+            if ak == self.learnable_agent_key and not self.override_learnable_policy:
+                continue
+            norm_obs_next = self._normalize_obs(self._get_obs(i))
+            if ak in self._inference_models:
+                self._update_policy_history(
+                    ak,
+                    int(self._inference_seq_lens.get(ak, 8)),
+                    norm_obs_next,
+                )
+            if (
+                self.shared_team_policy
+                and self.shared_policy_model is not None
+                and ak.startswith(self.shared_team_prefix)
+            ):
+                self._update_policy_history(ak, self.shared_policy_seq_len, norm_obs_next)
+
         # 学習対象に合わせて観測を生成
         idx_to_obs = self.learnable_agent_index
         

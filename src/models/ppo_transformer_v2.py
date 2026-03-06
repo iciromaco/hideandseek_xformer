@@ -136,3 +136,27 @@ class AgentV2(nn.Module):
         value = self.critic(latent_eval)
         
         return action, log_prob_sum, entropy_sum, value
+
+    def get_deterministic_action_and_value(self, x):
+        """
+        推論用: 行動分布の平均値（deterministic action）を返す。
+        """
+        batch_size = x.shape[0]
+
+        flat_x_eval = x.reshape(-1, self.obs_dim)
+        encoded_eval = self.obs_encoder(flat_x_eval)
+        encoded_eval_seq = encoded_eval.reshape(batch_size, self.seq_len, self.hidden_dim)
+        context_eval = self.transformer(encoded_eval_seq)
+        latent_eval = context_eval[:, -1, :]
+
+        action_mean = self.actor_mean(latent_eval)
+
+        logstd_clamped = torch.clamp(self.actor_logstd, -5.0, 2.0)
+        action_logstd_eval = logstd_clamped.expand_as(action_mean)
+        action_std_eval = torch.exp(action_logstd_eval)
+        probs = distributions.Normal(action_mean, action_std_eval)
+
+        log_prob = probs.log_prob(action_mean).sum(dim=1)
+        entropy = probs.entropy().sum(dim=1)
+        value = self.critic(latent_eval)
+        return action_mean, log_prob, entropy, value
