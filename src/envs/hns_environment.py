@@ -114,7 +114,8 @@ class TeamCosEnv(gym.Env):
                  n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None,
                  inference_policies=None, show_turn_lines=True,
                  policy_source_log=False, policy_source_log_each_reset=False,
-                 debug_log_interval_steps=200):
+                 debug_log_interval_steps=200,
+                 mode4_sdf_cell_size=0.05):
         super().__init__()
         self.n_seekers = int(n_seekers)
         self.n_hiders = int(n_hiders)
@@ -126,6 +127,7 @@ class TeamCosEnv(gym.Env):
             raise ValueError("n_ramps must be >= 1")
         self.mode, self.target, self.render_mode = mode, target, render_mode
         self.show_turn_lines = bool(show_turn_lines)
+        self.mode4_sdf_cell_size = float(mode4_sdf_cell_size)
         self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
         if self.n_seekers == 1:
             self.seeker_keys = ["s"]
@@ -141,7 +143,11 @@ class TeamCosEnv(gym.Env):
 
         self.model = mujoco.MjModel.from_xml_string(self._build_dynamic_xml())
         self.data = mujoco.MjData(self.model)
-        self.vis_engine = VisibilityEngine(self.model, self.data)
+        self.vis_engine = VisibilityEngine(
+            self.model,
+            self.data,
+            mode4_sdf_cell_size=self.mode4_sdf_cell_size,
+        )
         self.viewer = None
         self.inference_policies = inference_policies or {}
         self._inference_models = {}
@@ -318,17 +324,17 @@ class TeamCosEnv(gym.Env):
 
     def _xml_static_scene(self):
         s = self.ARENA_HALF
-        attr = 'rgba="0.65 0.65 0.65 0.35" friction="0.1 0.1 0.1" solref="0.01 1" solimp="0.95 0.99 0.001"'
+        attr = 'friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"'
         return f"""
     <geom name="floor" type="plane" size="{s} {s} 0.1" material="grid" friction="1.1 0.15 0.003"/>
-    <geom name="wall_n" type="box" size="{s+0.15} 0.1 2.0" pos="0 6.1 2.0" {attr}/>
-    <geom name="wall_s" type="box" size="{s+0.15} 0.1 2.0" pos="0 -6.1 2.0" {attr}/>
-    <geom name="wall_e" type="box" size="0.1 {s} 2.0" pos="6.1 0 2.0" {attr}/>
-    <geom name="wall_w" type="box" size="0.1 {s} 2.0" pos="-6.1 0 2.0" {attr}/>
-    <geom name="maze_w0" type="box" size="1.5 0.2 0.5" pos="3.0 1.5 0.5" rgba="0 0.7 0.7 1"/>
-    <geom name="maze_w1" type="box" size="1.5 0.2 0.5" pos="-3.0 -1.5 0.5" rgba="0 0.7 0.7 1"/>
-    <geom name="maze_w2" type="box" size="0.2 1.5 0.5" pos="0.0 -3.0 0.5" rgba="0 0.7 0.7 1"/>
-    <geom name="maze_w3" type="box" size="0.2 1.5 0.5" pos="0.0 3.0 0.5" rgba="0 0.7 0.7 1"/>
+    <geom name="wall_n" type="box" size="{s+0.15} 0.1 2.0" pos="0 6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
+    <geom name="wall_s" type="box" size="{s+0.15} 0.1 2.0" pos="0 -6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
+    <geom name="wall_e" type="box" size="0.1 {s} 2.0" pos="6.1 0 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
+    <geom name="wall_w" type="box" size="0.1 {s} 2.0" pos="-6.1 0 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
+    <geom name="maze_w0" type="box" size="1.5 0.2 0.5" pos="3.0 1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_w1" type="box" size="1.5 0.2 0.5" pos="-3.0 -1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_w2" type="box" size="0.2 1.5 0.5" pos="0.0 -3.0 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_w3" type="box" size="0.2 1.5 0.5" pos="0.0 3.0 0.5" rgba="0 0.7 0.7 1" {attr}/>
 """
 
     def _xml_ramp(self, i, xy, rot):
@@ -830,10 +836,17 @@ class TeamCosEnv(gym.Env):
                 and ak.startswith(self.shared_team_prefix)
             ):
                 self._prime_policy_history(ak, self.shared_policy_seq_len, norm_obs)
-        
-        # 学習対象の観測を返す
+
         idx_to_obs = self.learnable_agent_index
-        return self._normalize_obs(self._get_obs(idx_to_obs)), {"is_detected": False}
+        
+        # wall_distance を計算
+        learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
+        learnable_agent_pos = self.data.xpos[learnable_agent_body_id]
+        wall_dist = self.vis_engine.wall_distance(
+            learnable_agent_pos[0], 
+            learnable_agent_pos[1]
+        )
+        return self._normalize_obs(self._get_obs(idx_to_obs)), {"is_detected": False, "wall_distance": wall_dist}
 
     def step(self, action):
         self.current_step += 1
@@ -933,6 +946,14 @@ class TeamCosEnv(gym.Env):
 
         # 学習対象に合わせて観測を生成
         idx_to_obs = self.learnable_agent_index
+
+        # 壁までの最短距離を計算
+        learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
+        learnable_agent_pos = self.data.xpos[learnable_agent_body_id]
+        wall_dist = self.vis_engine.wall_distance(
+               learnable_agent_pos[0], 
+               learnable_agent_pos[1]
+        )
         
         return (self._normalize_obs(self._get_obs(idx_to_obs)), 
                 float(rb if self.target == "hider" else -rb), 
@@ -959,6 +980,7 @@ class TeamCosEnv(gym.Env):
                     "dbg_seek_gaze_cos_front_max": float(gaze_cos_front_max),
                     "dbg_seek_gaze_cos_front_dist_max": float(gaze_cos_front_dist_max),
                     "dbg_learnable_hider_seen": bool(learnable_hider_seen),
+                    "wall_distance": wall_dist,
                 })
 
     def _compute_team_reward(self):

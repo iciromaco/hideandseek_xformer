@@ -9,6 +9,8 @@ N_SEEKERS = 1
 N_HIDERS = 2
 N_BOXES = 2
 N_RAMPS = 1
+# MODE4（HybridSphere）用の静的SDFグリッド解像度[m]
+MODE4_SDF_CELL_SIZE = 0.05
 # デバッグ表示
 SHOW_TURN_LINES = false
 # policy_source ログ制御（大量ログ抑制）

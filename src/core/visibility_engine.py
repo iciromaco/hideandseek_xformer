@@ -12,6 +12,105 @@ import mujoco
 import math
 from numba import njit
 
+SDF_CELL_SIZE = 0.02 # 2cm セルサイズで静的SDFグリッドを構築
+
+@njit(cache=True)
+def _compute_wall_sdf_grid_jit(min_x, min_y, cell_size, n_x, n_y, walls_xpos, walls_size, max_dist):
+    grid = np.empty((n_y, n_x), dtype=np.float32)
+    for iy in range(n_y):
+        py = min_y + iy * cell_size
+        for ix in range(n_x):
+            px = min_x + ix * cell_size
+            d_min = max_dist
+            for j in range(len(walls_xpos)):
+                dx = abs(px - walls_xpos[j, 0]) - walls_size[j, 0]
+                dy = abs(py - walls_xpos[j, 1]) - walls_size[j, 1]
+                d_box = math.sqrt(max(dx, 0.0) ** 2 + max(dy, 0.0) ** 2) + min(max(dx, dy), 0.0)
+                if d_box < d_min:
+                    d_min = d_box
+            grid[iy, ix] = d_min
+    return grid
+
+
+@njit(cache=True)
+def _sample_sdf_grid_bilinear(px, py, sdf_grid, min_x, min_y, cell_size, max_dist):
+    n_y = sdf_grid.shape[0]
+    n_x = sdf_grid.shape[1]
+    gx = (px - min_x) / cell_size
+    gy = (py - min_y) / cell_size
+
+    if gx < 0.0 or gy < 0.0 or gx > (n_x - 1) or gy > (n_y - 1):
+        return max_dist
+
+    x0 = int(math.floor(gx))
+    y0 = int(math.floor(gy))
+    x1 = x0 + 1
+    y1 = y0 + 1
+    if x1 >= n_x:
+        x1 = n_x - 1
+    if y1 >= n_y:
+        y1 = n_y - 1
+
+    tx = gx - x0
+    ty = gy - y0
+
+    v00 = float(sdf_grid[y0, x0])
+    v10 = float(sdf_grid[y0, x1])
+    v01 = float(sdf_grid[y1, x0])
+    v11 = float(sdf_grid[y1, x1])
+
+    v0 = v00 * (1.0 - tx) + v10 * tx
+    v1 = v01 * (1.0 - tx) + v11 * tx
+    return v0 * (1.0 - ty) + v1 * ty
+
+
+@njit(cache=True)
+def _get_dynamic_sdf_scalar(px, py, ag_pos, ag_radii, ag_b_ids, box_pos, box_size, box_quats, box_b_ids, ex1, ignore_id, max_dist):
+    d_min = max_dist
+
+    num_ags = len(ag_pos)
+    for i in range(num_ags):
+        bid = ag_b_ids[i]
+        if bid == ex1:
+            continue
+        if bid == ignore_id:
+            continue
+        dist_c = math.sqrt((px - ag_pos[i, 0]) ** 2 + (py - ag_pos[i, 1]) ** 2)
+        d_agent = dist_c - ag_radii[i]
+        if d_agent < d_min:
+            d_min = d_agent
+
+    num_boxes = len(box_pos)
+    for i in range(num_boxes):
+        bid = box_b_ids[i]
+        if bid == ex1:
+            continue
+        if bid == ignore_id:
+            continue
+
+        q = box_quats[i]
+        y_sq = q[2] * q[2]
+        z_sq = q[3] * q[3]
+        term1 = 2.0 * (q[0] * q[3] + q[1] * q[2])
+        term2 = 1.0 - 2.0 * (y_sq + z_sq)
+        yaw = math.atan2(term1, term2)
+
+        cs = math.cos(-yaw)
+        sn = math.sin(-yaw)
+
+        rx = px - box_pos[i, 0]
+        ry = py - box_pos[i, 1]
+        lx = rx * cs - ry * sn
+        ly = rx * sn + ry * cs
+
+        dx_b = abs(lx) - box_size[i, 0]
+        dy_b = abs(ly) - box_size[i, 1]
+        d_obb = math.sqrt(max(dx_b, 0.0) ** 2 + max(dy_b, 0.0) ** 2) + min(max(dx_b, dy_b), 0.0)
+        if d_obb < d_min:
+            d_min = d_obb
+
+    return d_min
+
 @njit(cache=True)
 def _get_sdf_scalar(px, py, walls_xpos, walls_size, ag_pos, ag_radii, ag_b_ids, box_pos, box_size, box_quats, box_b_ids, ex1, ex2, ignore_id):
     """SDF演算コア：スカラー変数による最短距離算出"""
@@ -83,7 +182,8 @@ def _get_sdf_scalar(px, py, walls_xpos, walls_size, ag_pos, ag_radii, ag_b_ids, 
 def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin, 
                              walls_xpos, walls_size, ag_pos, ag_radii, ag_b_ids, 
                              box_pos, box_size, box_quats, box_b_ids,
-                             mode, exclude_body_id, ignore_id, max_dist):
+                             mode, exclude_body_id, ignore_id, max_dist,
+                             static_sdf_grid, static_min_x, static_min_y, static_cell_size):
     """Lidar 演算コア：近距離死角を完全に排除"""
     res = np.full(12, max_dist, dtype=np.float32)
     
@@ -225,20 +325,143 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
                 if curr_t >= max_dist:
                     res[i] = max_dist
                     break
+        elif mode == 4: # Hybrid Sphere Tracing (precomputed static SDF + dynamic correction)
+            curr_t = SAFE_MARGIN
+            for _step in range(40):
+                cx = pos_x + vx * curr_t
+                cy = pos_y + vy * curr_t
+                dist_static = _sample_sdf_grid_bilinear(
+                    cx,
+                    cy,
+                    static_sdf_grid,
+                    static_min_x,
+                    static_min_y,
+                    static_cell_size,
+                    max_dist,
+                )
+                dist_dynamic = _get_dynamic_sdf_scalar(
+                    cx,
+                    cy,
+                    ag_pos,
+                    ag_radii,
+                    ag_b_ids,
+                    box_pos,
+                    box_size,
+                    box_quats,
+                    box_b_ids,
+                    exclude_body_id,
+                    ignore_id,
+                    max_dist,
+                )
+                dist_sdf = dist_static
+                if dist_dynamic < dist_sdf:
+                    dist_sdf = dist_dynamic
+                if dist_sdf < 0.005:
+                    res[i] = curr_t
+                    break
+                curr_t = curr_t + dist_sdf
+                if curr_t >= max_dist:
+                    res[i] = max_dist
+                    break
     return res
 
+
+
 class VisibilityEngine:
-    def __init__(self, m, d):
+    def wall_distance(self, px, py):
+        """
+        px, py: 環境のx, y座標（Mujocoワールド座標系）
+        壁までの最短距離（SDFグリッドによるバイリニア補間）を返す。
+        """
+        self._ensure_mode4_sdf()
+        return _sample_sdf_grid_bilinear(
+            px, py,
+            self._mode4_sdf_grid,
+            self._mode4_min_x,
+            self._mode4_min_y,
+            self._mode4_cell_size,
+            self.max_dist
+        )
+    
+    def __init__(self, m, d, mode4_sdf_cell_size=SDF_CELL_SIZE):
         self.m = m
         self.d = d
         self.max_dist = 15.0
+        self.mode4_sdf_cell_size = float(mode4_sdf_cell_size)
+        if self.mode4_sdf_cell_size <= 0.0:
+            self.mode4_sdf_cell_size = 0.05
         angles = [0, 15, -15, 30, -30, 45, -45, 90, -90, 135, -135, 180]
         self.base_angles = np.array(angles, dtype=np.float32)
         self.base_cos = np.cos(np.deg2rad(self.base_angles))
         self.base_sin = np.sin(np.deg2rad(self.base_angles))
         self.group_mask = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)
         self._geomid_out = np.zeros(1, dtype=np.int32)
+        self._mode4_sdf_grid = np.empty((1, 1), dtype=np.float32)
+        self._mode4_min_x = -self.max_dist
+        self._mode4_min_y = -self.max_dist
+        self._mode4_cell_size = self.mode4_sdf_cell_size
+        self._mode4_ready = False
         self._extract_indices()
+
+    def _ensure_mode4_sdf(self):
+        if self._mode4_ready:
+            return
+        import os
+        import pickle
+        walls = self.d.geom_xpos[self.idx_wall_geom]
+        wall_sizes = self.m.geom_size[self.idx_wall_geom]
+
+        if len(walls) == 0:
+            min_x = -self.max_dist
+            max_x = self.max_dist
+            min_y = -self.max_dist
+            max_y = self.max_dist
+        else:
+            min_x = float(np.min(walls[:, 0] - wall_sizes[:, 0]) - 0.5)
+            max_x = float(np.max(walls[:, 0] + wall_sizes[:, 0]) + 0.5)
+            min_y = float(np.min(walls[:, 1] - wall_sizes[:, 1]) - 0.5)
+            max_y = float(np.max(walls[:, 1] + wall_sizes[:, 1]) + 0.5)
+
+        cell = self.mode4_sdf_cell_size
+        n_x = max(2, int(math.ceil((max_x - min_x) / cell)) + 1)
+        n_y = max(2, int(math.ceil((max_y - min_y) / cell)) + 1)
+
+        # ファイル名を壁配置・サイズ・cell_sizeで一意に決定
+        wall_hash = hash((tuple(np.round(walls.flatten(), 4)), tuple(np.round(wall_sizes.flatten(), 4)), round(cell, 4)))
+        sdf_dir = os.path.join(os.path.dirname(__file__), "../../envs")
+        os.makedirs(sdf_dir, exist_ok=True)
+        sdf_path = os.path.join(sdf_dir, f"sdfgrid_mode4_{wall_hash}.pkl")
+
+        if os.path.exists(sdf_path):
+            with open(sdf_path, "rb") as f:
+                data = pickle.load(f)
+            self._mode4_sdf_grid = data["grid"]
+            self._mode4_min_x = data["min_x"]
+            self._mode4_min_y = data["min_y"]
+            self._mode4_cell_size = data["cell_size"]
+        else:
+            self._mode4_sdf_grid = _compute_wall_sdf_grid_jit(
+                float(min_x),
+                float(min_y),
+                float(cell),
+                int(n_x),
+                int(n_y),
+                self.d.geom_xpos[self.idx_wall_geom, :2],
+                self.m.geom_size[self.idx_wall_geom, :2],
+                float(self.max_dist),
+            )
+            self._mode4_min_x = float(min_x)
+            self._mode4_min_y = float(min_y)
+            self._mode4_cell_size = float(cell)
+            # 保存
+            with open(sdf_path, "wb") as f:
+                pickle.dump({
+                    "grid": self._mode4_sdf_grid,
+                    "min_x": self._mode4_min_x,
+                    "min_y": self._mode4_min_y,
+                    "cell_size": self._mode4_cell_size,
+                }, f)
+        self._mode4_ready = True
 
     def _extract_indices(self):
         self.idx_wall_geom = []
@@ -287,7 +510,33 @@ class VisibilityEngine:
                 if dist >= 0:
                     res_native[i] = dist
             return res_native
-        return _compute_lidar_jit_core(pos[0], pos[1], h_cos, h_sin, self.base_cos, self.base_sin, self.d.geom_xpos[self.idx_wall_geom], self.m.geom_size[self.idx_wall_geom], self.d.geom_xpos[self.idx_agent_geom, :2], self.agent_radii, self.idx_agent_body, self.d.geom_xpos[self.idx_box_geom, :2], self.m.geom_size[self.idx_box_geom, :2], self.d.xquat[self.idx_box_body], self.idx_box_body, mode, int(body_exclude), int(ignore_body_id), self.max_dist)
+        if mode == 4:
+            self._ensure_mode4_sdf()
+        return _compute_lidar_jit_core(
+            pos[0],
+            pos[1],
+            h_cos,
+            h_sin,
+            self.base_cos,
+            self.base_sin,
+            self.d.geom_xpos[self.idx_wall_geom],
+            self.m.geom_size[self.idx_wall_geom],
+            self.d.geom_xpos[self.idx_agent_geom, :2],
+            self.agent_radii,
+            self.idx_agent_body,
+            self.d.geom_xpos[self.idx_box_geom, :2],
+            self.m.geom_size[self.idx_box_geom, :2],
+            self.d.xquat[self.idx_box_body],
+            self.idx_box_body,
+            mode,
+            int(body_exclude),
+            int(ignore_body_id),
+            self.max_dist,
+            self._mode4_sdf_grid,
+            float(self._mode4_min_x),
+            float(self._mode4_min_y),
+            float(self._mode4_cell_size),
+        )
 
     def is_visible(self, p1, p2, mode=1, body_exclude=-1, target_body_id=-1):
         diff_v = p2[:2] - p1[:2]

@@ -1,33 +1,98 @@
-# main27_train_final.py v6.0
 
+
+# --- すべてのimport文を最上部に集約 ---
+
+import sys
+import os
+import time
 import math
 import argparse
-import os
-import subprocess
-import sys
-import time
-import tomllib
 import traceback
-from functools import partial
-
-import gymnasium as gym
-import mujoco
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import gymnasium as gym
+from functools import partial
 from numba import njit, prange
 
 try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import toml as tomllib  # pip install toml
+
+
+
+# wandbはtry-import
+try:
     import wandb
-except Exception:
+except Exception as exc:
+    print(f"Exception in wandb import: {exc}")
     wandb = None
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
-from agents.scripted_agents import RuleBasedHider, RuleBasedSeeker
+# sys.path拡張（src配下の独自モジュール用）
+sys.path.append(
+    os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "src")
+    )
+)
+
+
+# --- 必要な独自モジュール ---
 from envs.hns_environment import TeamCosEnv
 from models.ppo_transformer_v2 import AgentV2
+from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
+
+
+# --- ここから定数・関数・本体 ---
+
+# --- ポリシーモード定数 ---
+POLICY_MODEL_IF_AVAILABLE = "model_if_available"
+POLICY_RULE = "rule"
+
+
+# --- ユーティリティ関数 ---
+def init_wandb_run(hp, model_path, runtime_target):
+    """
+    wandbのランを初期化して返す（暫定実装）。必要に応じて設定を拡張してください。
+    """
+    if wandb is None:
+        return None
+    run_name = WANDB_RUN_NAME or f"{runtime_target}_{os.path.basename(model_path)}"
+    return wandb.init(
+        project=WANDB_PROJECT,
+        entity=WANDB_ENTITY or None,
+        name=run_name,
+        config=hp,
+        mode=WANDB_MODE,
+        dir=WANDB_CODE_ROOT,
+        save_code=WANDB_LOG_CODE,
+        reinit=True,
+    )
+
+
+def select_hparams(env_config, runtime_target):
+    """
+    環境設定とターゲットに応じたハイパーパラメータ辞書を返す（暫定実装）
+    必要に応じて詳細なロジックに拡張してください。
+    """
+    # ここではENV_CONFIGとTRAIN_MODE等から最低限のパラメータを組み立てる例
+    return {
+        "total_timesteps": TOTAL_TIMESTEPS,
+        "rollout_steps": ROLLOUT_STEPS,
+        "update_epochs": UPDATE_EPOCHS,
+        "minibatch_size": MINIBATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "gamma": GAMMA,
+        "gae_lambda": GAE_LAMBDA,
+        "clip_coef": CLIP_COEF,
+        "vf_coef": VF_COEF,
+        "ent_coef": ENT_COEF,
+        "max_grad_norm": MAX_GRAD_NORM,
+        "log_interval": LOG_INTERVAL,
+        "save_interval": SAVE_INTERVAL,
+    }
 
 
 CONFIG_PATH = "configs/hparams_main27.toml"
@@ -35,12 +100,12 @@ CONFIG_PATH = "configs/hparams_main27.toml"
 CLI_EXAMPLES = (
     "実行例:\n"
     "  1) 学習を実行する（TOMLで train を選択）\n"
-    "     # configs/hparams_main27.toml の runtime.active_profile = \"train\"\n"
+    "     # configs/hparams_main27.toml の runtime.active_profile = 'train'\n"
     "     uv run mjpython main27_train_final.py\n\n"
     "  1-b) 実行時オプションで train を選択（TOMLを編集しない）\n"
     "     uv run mjpython main27_train_final.py --profile train\n\n"
     "  2) 学習結果を確認する（デバッグ再生）\n"
-    "     # configs/hparams_main27.toml の runtime.active_profile = \"debug\"\n"
+    "     # configs/hparams_main27.toml の runtime.active_profile = 'debug'\n"
     "     uv run mjpython main27_train_final.py\n\n"
     "  2-b) 実行時オプションで debug を選択（TOMLを編集しない）\n"
     "     uv run mjpython main27_train_final.py --profile debug\n\n"
@@ -49,6 +114,227 @@ CLI_EXAMPLES = (
     "  3) ヘルプと実行例を表示\n"
     "     uv run mjpython main27_train_final.py -h\n"
 )
+
+
+
+
+class ObsHistory:
+    def __init__(self, num_envs, seq_len, obs_dim, device):
+        self.num_envs = int(num_envs)
+        self.seq_len = seq_len
+        self.obs_dim = obs_dim
+        self.device = device
+        self.buffer = torch.zeros(
+            (self.num_envs, seq_len * 2, obs_dim),
+            device=device,
+        )
+        self.ptr = 0
+
+    def reset(self):
+        self.buffer.zero_()
+        self.ptr = 0
+
+    def prime(self, obs):
+        self.reset()
+        obs_t = torch.as_tensor(
+            obs,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        obs_t = obs_t.reshape(self.num_envs, self.obs_dim)
+        for i in range(self.seq_len):
+            self.buffer[:, i] = obs_t
+            self.buffer[:, i + self.seq_len] = obs_t
+
+    def update(self, obs):
+        obs_t = torch.as_tensor(
+            obs,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        obs_t = obs_t.reshape(self.num_envs, self.obs_dim)
+        self.buffer[:, self.ptr] = obs_t
+        self.buffer[:, self.ptr + self.seq_len] = obs_t
+        self.ptr = (self.ptr + 1) % self.seq_len
+
+    def prime_single(self, obs):
+        self.prime(np.asarray(obs, dtype=np.float32).reshape(1, -1))
+
+    def update_single(self, obs):
+        self.update(np.asarray(obs, dtype=np.float32).reshape(1, -1))
+
+    def reset_env(self, env_idx, obs):
+        obs_t = torch.as_tensor(
+            obs,
+            dtype=torch.float32,
+            device=self.device,
+        ).reshape(self.obs_dim)
+        for i in range(self.seq_len):
+            self.buffer[env_idx, i] = obs_t
+            self.buffer[env_idx, i + self.seq_len] = obs_t
+
+    def get(self):
+        start = self.ptr
+        end = self.ptr + self.seq_len
+        return self.buffer[:, start:end]
+
+# --- 未定義関数・変数のダミー実装（必要に応じて本実装に差し替えてください） ---
+def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_idx_cache=None):
+    """
+    カスタム報酬関数（ユーザー定義版）。
+    obs: 観測（1次元np.array）
+    action: 行動（1次元np.array）
+    base_reward: 環境からの基本報酬
+    idx: env.idx
+    target: "hider" or "seeker"
+    info: info dict
+    reward_idx_cache: インデックスキャッシュ（省略可）
+    """
+    cache = (
+        reward_idx_cache
+        if reward_idx_cache is not None
+        else _build_reward_index_cache(idx)
+    )
+    move = float(action[0]) if len(action) > 0 else 0.0
+    turn = float(action[1]) if len(action) > 1 else 0.0
+    vel_x = float(obs[cache["self_vel_x"]])
+    vel_y = float(obs[cache["self_vel_y"]])
+    speed = math.sqrt(vel_x * vel_x + vel_y * vel_y)
+    control_cost = -RW_MOVE_CTRL_COST * (move * move + turn * turn)
+    bonus = 0.0
+    AGENT_RADIUS = 0.4
+    WALL_NEAR = AGENT_RADIUS + 0.2  # 0.6
+    WALL_SAFE = AGENT_RADIUS + 0.5  # 0.9
+
+    if target == "hider":
+        if speed < 0.1:
+            bonus -= RW_IDLE_PENALTY
+        elif speed > 0.3:
+            bonus += RW_MOVE_INCENTIVE
+    else:
+        if speed < 0.1:
+            bonus -= RW_IDLE_PENALTY
+        for j in range(len(cache["enemy_visible"])):
+            if obs[cache["enemy_visible"][j]] > 0.5:
+                dx = float(obs[cache["enemy_rel_x"][j]])
+                dy = float(obs[cache["enemy_rel_y"][j]])
+                dist = math.sqrt(dx * dx + dy * dy)
+                bonus += 0.05 / (dist + 1.0)
+
+    # --- wall_distanceベースの壁ペナルティ（hider/seeker共通） ---
+    if info is not None and 'wall_distance' in info:
+        wall_distance = info['wall_distance']
+        if isinstance(wall_distance, (list, tuple, np.ndarray)):
+            wall_distance = float(np.min(wall_distance))
+        else:
+            wall_distance = float(wall_distance)
+        if wall_distance < WALL_NEAR:
+            bonus -= RW_WALL_AVOID_PENALTY * (
+                1.0 - np.clip(wall_distance / WALL_NEAR, 0, 1)
+            )
+        elif wall_distance < WALL_SAFE:
+            bonus -= (
+                RW_WALL_AVOID_PENALTY
+                * (WALL_SAFE - wall_distance)
+                / (WALL_SAFE - WALL_NEAR)
+                / 2.0
+            )
+    return float(base_reward) + bonus + control_cost
+
+def evaluate_fixed_ramp_climb(mode, target, agent, device, episodes=3, max_steps=220):
+    """
+    固定ランプ登坂評価（ユーザー定義版）。
+    mode: 環境モード
+    target: "hider" or "seeker"
+    agent: 学習済みエージェント
+    device: torchデバイス
+    episodes: 評価エピソード数
+    max_steps: 1エピソードの最大ステップ数
+    """
+    from collections import deque
+    env = build_env(mode, target, ENV_CONFIG, render_mode=None)
+    idx = env.idx
+    obs_dim = env.observation_space.shape[0]
+    history = ObsHistory(1, SEQ_LEN, obs_dim, device)
+    success_count = 0
+    peak_heights = []
+    peak_progress = []
+    for ep in range(episodes):
+        obs, _ = env.reset()
+        history.prime_single(obs)
+        done = False
+        max_height = -float('inf')
+        max_progress = -float('inf')
+        for step in range(max_steps):
+            with torch.no_grad():
+                seq = history.get()
+                out = agent.get_action_and_value(seq)
+                action = out[0].cpu().numpy().reshape(-1)
+            next_obs, _, term, trun, info = env.step(action)
+            history.update(next_obs)
+            obs = next_obs
+            if 'dbg_ramp_height' in info:
+                h = float(info['dbg_ramp_height'])
+                if h > max_height:
+                    max_height = h
+            if 'dbg_ramp_progress' in info:
+                p = float(info['dbg_ramp_progress'])
+                if p > max_progress:
+                    max_progress = p
+            done = bool(term or trun)
+            if done:
+                break
+        peak_heights.append(max_height)
+        peak_progress.append(max_progress)
+        # 成功判定: 進捗0.9以上 or 高さ0.18以上
+        if (
+            max_progress >= RAMP_SUCCESS_PROG
+            or max_height >= RAMP_SUCCESS_Z_RISE
+        ):
+            success_count += 1
+    env.close()
+    return {
+        "success_rate": success_count / max(episodes, 1),
+        "peak_height_mean": (
+            float(np.mean(peak_heights)) if peak_heights else 0.0
+        ),
+        "peak_progress_mean": (
+            float(np.mean(peak_progress)) if peak_progress else 0.0
+        ),
+    }
+
+def run_ramp_check_viewer(mode, target, agent, device, episodes=1, max_steps=220):
+    """
+    ランプ登坂デバッグビューワ（ユーザー定義版）。
+    mode: 環境モード
+    target: "hider" or "seeker"
+    agent: 学習済みエージェント
+    device: torchデバイス
+    episodes: 評価エピソード数
+    max_steps: 1エピソードの最大ステップ数
+    """
+    env = build_env(mode, target, ENV_CONFIG, render_mode="human")
+    idx = env.idx
+    obs_dim = env.observation_space.shape[0]
+    history = ObsHistory(1, SEQ_LEN, obs_dim, device)
+    for ep in range(episodes):
+        obs, _ = env.reset()
+        history.prime_single(obs)
+        done = False
+        for step in range(max_steps):
+            with torch.no_grad():
+                seq = history.get()
+                out = agent.get_action_and_value(seq)
+                action = out[0].cpu().numpy().reshape(-1)
+            next_obs, _, term, trun, info = env.step(action)
+            history.update(next_obs)
+            obs = next_obs
+            env.render()
+            time.sleep(0.025)
+            done = bool(term or trun)
+            if done:
+                break
+    env.close()
 
 
 def _cli_profile_override_from_argv(argv=None):
@@ -94,7 +380,8 @@ def _get_available_runtime_profiles(path):
                 if isinstance(value, dict):
                     names.add(str(key).strip().lower())
         return sorted(names)
-    except Exception:
+    except Exception as exc:
+        print(f"Exception in _get_available_runtime_profiles: {exc}")
         return ["train", "debug"]
 
 
@@ -148,11 +435,21 @@ def _load_runtime_config(path, profile_override=None):
         runtime_cfg = raw.get("runtime", {}) if isinstance(raw, dict) else {}
         if not isinstance(runtime_cfg, dict):
             runtime_cfg = {}
-        profile_value = profile_override if profile_override is not None else runtime_cfg.get("active_profile", "train")
-        profile_origin = "cli(--profile)" if profile_override is not None else "toml(runtime.active_profile)"
+        profile_value = (
+            profile_override
+            if profile_override is not None
+            else runtime_cfg.get("active_profile", "train")
+        )
+        profile_origin = (
+            "cli(--profile)" if profile_override is not None else "toml(runtime.active_profile)"
+        )
         profile = _normalize_profile_name(profile_value)
-        common = runtime_cfg.get("common", {}) if isinstance(runtime_cfg, dict) else {}
-        profile_cfg = runtime_cfg.get(profile, {}) if isinstance(runtime_cfg, dict) else {}
+        common = (
+            runtime_cfg.get("common", {}) if isinstance(runtime_cfg, dict) else {}
+        )
+        profile_cfg = (
+            runtime_cfg.get(profile, {}) if isinstance(runtime_cfg, dict) else {}
+        )
         if not isinstance(common, dict):
             common = {}
         if not isinstance(profile_cfg, dict):
@@ -167,7 +464,9 @@ def _load_runtime_config(path, profile_override=None):
         ) from exc
 
 
-RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(CONFIG_PATH, CLI_PROFILE_OVERRIDE)
+RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(
+    CONFIG_PATH, CLI_PROFILE_OVERRIDE
+)
 
 
 def _to_bool(value):
@@ -211,6 +510,7 @@ ENV_CONFIG = {
     "n_hiders": _cfg("N_HIDERS", "2", int),
     "n_boxes": _cfg("N_BOXES", "2", int),
     "n_ramps": _cfg("N_RAMPS", "1", int),
+    "mode4_sdf_cell_size": _cfg("MODE4_SDF_CELL_SIZE", "0.05", float),
     "show_turn_lines": SHOW_TURN_LINES,
     "policy_source_log": _cfg("POLICY_SOURCE_LOG", "0", _to_bool),
     "policy_source_log_each_reset": _cfg("POLICY_SOURCE_LOG_EACH_RESET", "0", _to_bool),
@@ -333,9 +633,9 @@ def _compute_custom_reward_batch_numba(
     for i in prange(n_envs):
         move = float(action_batch[i, 0])
         turn = float(action_batch[i, 1])
-        vel_x = float(obs_batch[i, self_vel_x_idx])
-        vel_y = float(obs_batch[i, self_vel_y_idx])
-        speed = math.sqrt(vel_x * vel_x + vel_y * vel_y)
+        vel_x = float(obs_batch[i, int(self_vel_x_idx)])
+        vel_y = float(obs_batch[i, int(self_vel_y_idx)])
+        speed = np.sqrt(vel_x * vel_x + vel_y * vel_y)
 
         control_cost = -move_ctrl_cost * (move * move + turn * turn)
         bonus = 0.0
@@ -348,7 +648,8 @@ def _compute_custom_reward_batch_numba(
 
             lidar_min = 1.0
             for j in range(lidar_indices.shape[0]):
-                lidar_val = float(obs_batch[i, lidar_indices[j]])
+                idx = int(lidar_indices[j])
+                lidar_val = float(obs_batch[i, idx])
                 if lidar_val < lidar_min:
                     lidar_min = lidar_val
             if lidar_min < 0.3:
@@ -363,585 +664,18 @@ def _compute_custom_reward_batch_numba(
                 bonus -= idle_penalty
 
             for j in range(enemy_visible_indices.shape[0]):
-                if obs_batch[i, enemy_visible_indices[j]] > 0.5:
-                    dx = float(obs_batch[i, enemy_rel_x_indices[j]])
-                    dy = float(obs_batch[i, enemy_rel_y_indices[j]])
-                    dist = math.sqrt(dx * dx + dy * dy)
+                idx_vis = int(enemy_visible_indices[j])
+                if obs_batch[i, idx_vis] > 0.5:
+                    idx_x = int(enemy_rel_x_indices[j])
+                    idx_y = int(enemy_rel_y_indices[j])
+                    dx = float(obs_batch[i, idx_x])
+                    dy = float(obs_batch[i, idx_y])
+                    dist = np.sqrt(dx * dx + dy * dy)
                     bonus += 0.05 / (dist + 1.0)
 
         rewards[i] = float(base_reward_batch[i]) + bonus + control_cost
     return rewards
 
-class ObsHistory:
-    def __init__(self, num_envs, seq_len, obs_dim, device):
-        self.num_envs = int(num_envs)
-        self.seq_len = seq_len
-        self.obs_dim = obs_dim
-        self.device = device
-        self.buffer = torch.zeros(
-            (self.num_envs, seq_len * 2, obs_dim),
-            device=device,
-        )
-        self.ptr = 0
-
-    def reset(self):
-        self.buffer.zero_()
-        self.ptr = 0
-
-    def prime(self, obs):
-        self.reset()
-        obs_t = torch.as_tensor(
-            obs,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        obs_t = obs_t.reshape(self.num_envs, self.obs_dim)
-        for i in range(self.seq_len):
-            self.buffer[:, i] = obs_t
-            self.buffer[:, i + self.seq_len] = obs_t
-
-    def update(self, obs):
-        obs_t = torch.as_tensor(
-            obs,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        obs_t = obs_t.reshape(self.num_envs, self.obs_dim)
-        self.buffer[:, self.ptr] = obs_t
-        self.buffer[:, self.ptr + self.seq_len] = obs_t
-        self.ptr = (self.ptr + 1) % self.seq_len
-
-    def prime_single(self, obs):
-        self.prime(np.asarray(obs, dtype=np.float32).reshape(1, -1))
-
-    def update_single(self, obs):
-        self.update(np.asarray(obs, dtype=np.float32).reshape(1, -1))
-
-    def reset_env(self, env_idx, obs):
-        obs_t = torch.as_tensor(
-            obs,
-            dtype=torch.float32,
-            device=self.device,
-        ).reshape(self.obs_dim)
-        for i in range(self.seq_len):
-            self.buffer[env_idx, i] = obs_t
-            self.buffer[env_idx, i + self.seq_len] = obs_t
-
-    def get(self):
-        start = self.ptr
-        end = self.ptr + self.seq_len
-        return self.buffer[:, start:end]
-
-
-def env_signature(config):
-    return (
-        f"s{config['n_seekers']}_h{config['n_hiders']}_"
-        f"b{config['n_boxes']}_r{config['n_ramps']}"
-    )
-
-
-def model_path_for_config(target, config):
-    sig = env_signature(config)
-    os.makedirs("checkpoints", exist_ok=True)
-    return os.path.join("checkpoints", f"HNS_V27_{target}_{sig}.pt")
-
-
-POLICY_RULE = "rule"
-POLICY_MODEL_IF_AVAILABLE = "model_if_available"
-
-
-def _wandb_include_code_file(path, root):
-    rel = os.path.relpath(path, root).replace("\\", "/")
-    if rel in {"pyproject.toml", "README.md"}:
-        return True
-    if not rel.endswith(".py"):
-        return False
-    if rel.startswith("src/"):
-        return True
-    name = os.path.basename(rel)
-    return name.startswith("main")
-
-
-def init_wandb_run(hp, model_path, training_target):
-    if not TRAIN_MODE or not WANDB_ENABLED:
-        return None
-    if wandb is None:
-        print("wandb not available. Continue without wandb logging.")
-        return None
-
-    env_sig = env_signature(ENV_CONFIG)
-    run_name = WANDB_RUN_NAME or f"v27_{training_target}_{env_sig}"
-    try:
-        run = wandb.init(
-            project=WANDB_PROJECT,
-            entity=(WANDB_ENTITY or None),
-            name=run_name,
-            mode=WANDB_MODE,
-            config={
-                "training_target": training_target,
-                "mode": MODE,
-                "env_signature": env_sig,
-                "num_envs": NUM_ENVS,
-                "seq_len": SEQ_LEN,
-                "hidden_dim": HIDDEN_DIM,
-                "use_custom_reward": USE_CUSTOM_REWARD,
-                "model_path": model_path,
-                **hp,
-            },
-            reinit=True,
-        )
-        if WANDB_LOG_CODE:
-            print("wandb: uploading code snapshot...")
-            run.log_code(
-                root=WANDB_CODE_ROOT,
-                include_fn=_wandb_include_code_file,
-            )
-            print("wandb: code snapshot uploaded")
-        run.log({"run_initialized": 1}, step=0)
-        run.define_metric("global_step")
-        run.define_metric("train/*", step_metric="global_step")
-        run.define_metric("perf/*", step_metric="global_step")
-        run.define_metric("env/*", step_metric="global_step")
-        run.define_metric("system/*", step_metric="global_step")
-        run.define_metric("eval/*", step_metric="global_step")
-        run.define_metric("perf/reward_compute_ms_per_step", summary="min")
-        run.define_metric("perf/env_step_ms_per_step", summary="mean")
-        run.define_metric("perf/reward_to_env_time_ratio", summary="mean")
-        if getattr(run, "url", None):
-            print(f"wandb run url: {run.url}")
-        return run
-    except Exception as exc:
-        print(f"wandb init failed ({exc}). Continue without wandb logging.")
-        return None
-
-
-def select_hparams(config, target):
-    def _apply_hp_patch(dst, patch):
-        for key in dst.keys():
-            if key not in patch:
-                continue
-            try:
-                if isinstance(dst[key], int):
-                    dst[key] = int(patch[key])
-                else:
-                    dst[key] = float(patch[key])
-            except Exception:
-                pass
-
-    def _load_hparams_cfg(path):
-        if not path or not os.path.exists(path):
-            return {}
-        try:
-            with open(path, "rb") as f:
-                raw = tomllib.load(f)
-            if isinstance(raw, dict):
-                return raw
-        except Exception as exc:
-            print(f"hparams config load failed ({exc})")
-        return {}
-
-    hp = {
-        "total_timesteps": TOTAL_TIMESTEPS,
-        "rollout_steps": ROLLOUT_STEPS,
-        "update_epochs": UPDATE_EPOCHS,
-        "minibatch_size": MINIBATCH_SIZE,
-        "learning_rate": LEARNING_RATE,
-        "gamma": GAMMA,
-        "gae_lambda": GAE_LAMBDA,
-        "clip_coef": CLIP_COEF,
-        "vf_coef": VF_COEF,
-        "ent_coef": ENT_COEF,
-        "max_grad_norm": MAX_GRAD_NORM,
-        "log_interval": LOG_INTERVAL,
-        "save_interval": SAVE_INTERVAL,
-    }
-
-    hp_cfg = _load_hparams_cfg(HPARAMS_CONFIG_PATH)
-    if hp_cfg:
-        _apply_hp_patch(hp, hp_cfg.get("base", {}))
-
-    if not AUTO_TUNE_HPARAMS:
-        if "TOTAL_TIMESTEPS" in RUNTIME_OVERRIDES:
-            hp["total_timesteps"] = int(TOTAL_TIMESTEPS)
-        return hp
-
-    sig = env_signature(config)
-    defaults_cfg = hp_cfg.get("defaults", {}) if isinstance(hp_cfg, dict) else {}
-    default_patch = defaults_cfg.get(target, {}) if isinstance(defaults_cfg, dict) else {}
-    if isinstance(default_patch, dict):
-        _apply_hp_patch(hp, default_patch)
-
-    presets_cfg = hp_cfg.get("presets", {}) if isinstance(hp_cfg, dict) else {}
-    presets = presets_cfg.get(target, {}) if isinstance(presets_cfg, dict) else {}
-    if sig in presets:
-        preset_patch = presets[sig]
-        if isinstance(preset_patch, dict):
-            _apply_hp_patch(hp, preset_patch)
-    else:
-        complexity_cfg = hp_cfg.get("complexity", {}) if hp_cfg else {}
-        if not isinstance(complexity_cfg, dict) or not complexity_cfg:
-            complexity_cfg = {}
-        complexity_threshold = int(complexity_cfg.get("threshold", 0) or 0)
-        complexity = (
-            config["n_seekers"]
-            + config["n_hiders"]
-            + config["n_boxes"]
-            + config["n_ramps"]
-        )
-        if complexity_threshold > 0 and complexity >= complexity_threshold:
-            if "rollout_steps_min" in complexity_cfg:
-                hp["rollout_steps"] = max(hp["rollout_steps"], int(complexity_cfg["rollout_steps_min"]))
-            if "minibatch_size_min" in complexity_cfg:
-                hp["minibatch_size"] = max(hp["minibatch_size"], int(complexity_cfg["minibatch_size_min"]))
-            if "learning_rate_max" in complexity_cfg:
-                hp["learning_rate"] = min(hp["learning_rate"], float(complexity_cfg["learning_rate_max"]))
-            if "ent_coef_min" in complexity_cfg:
-                hp["ent_coef"] = max(hp["ent_coef"], float(complexity_cfg["ent_coef_min"]))
-            if "total_timesteps_min" in complexity_cfg:
-                hp["total_timesteps"] = max(hp["total_timesteps"], int(complexity_cfg["total_timesteps_min"]))
-            if target == "hider":
-                if "hider_clip_coef_min" in complexity_cfg:
-                    hp["clip_coef"] = max(hp["clip_coef"], float(complexity_cfg["hider_clip_coef_min"]))
-                if "hider_ent_coef_min" in complexity_cfg:
-                    hp["ent_coef"] = max(hp["ent_coef"], float(complexity_cfg["hider_ent_coef_min"]))
-            else:
-                if "seeker_clip_coef_max" in complexity_cfg:
-                    hp["clip_coef"] = min(hp["clip_coef"], float(complexity_cfg["seeker_clip_coef_max"]))
-
-    if hp["rollout_steps"] % hp["minibatch_size"] != 0:
-        hp["minibatch_size"] = max(32, min(hp["rollout_steps"], hp["minibatch_size"]))
-        while hp["rollout_steps"] % hp["minibatch_size"] != 0 and hp["minibatch_size"] > 32:
-            hp["minibatch_size"] //= 2
-
-    if "TOTAL_TIMESTEPS" in RUNTIME_OVERRIDES:
-        hp["total_timesteps"] = int(TOTAL_TIMESTEPS)
-
-    return hp
-
-
-def evaluate_fixed_ramp_climb(
-    mode,
-    target,
-    agent,
-    device,
-    episodes=3,
-    max_steps=220,
-):
-    eval_cfg = dict(ENV_CONFIG)
-    eval_cfg["show_turn_lines"] = False
-    eval_env = build_env(mode, target, eval_cfg, render_mode=None)
-    eval_env.prep_steps = 0
-    peak_heights = []
-    peak_progress = []
-    success_count = 0
-    try:
-        obs_dim = eval_env.observation_space.shape[0]
-        expected_obs_dim = int(getattr(agent, "obs_dim", obs_dim))
-        if obs_dim != expected_obs_dim:
-            print(
-                "Ramp check skipped: obs_dim mismatch "
-                f"(env={obs_dim}, model={expected_obs_dim})"
-            )
-            return None
-        history = ObsHistory(1, SEQ_LEN, obs_dim, device)
-        learn_key = eval_env.learnable_agent_key
-        body_id = eval_env.body_ids[learn_key]
-        qidx = eval_env.qpos_indices[learn_key]
-
-        for _ in range(max(episodes, 1)):
-            obs, _ = eval_env.reset()
-
-            rid = eval_env.ramp_ids[0]
-            rkey = "ramp1"
-            rpos = eval_env.data.xpos[rid][:2].copy()
-            quat = eval_env.data.xquat[rid]
-            yaw = math.atan2(
-                2.0 * (quat[0] * quat[3] + quat[1] * quat[2]),
-                1.0 - 2.0 * (quat[2] ** 2 + quat[3] ** 2),
-            )
-            up = np.array([math.cos(yaw), math.sin(yaw)], dtype=np.float32)
-            side = np.array([-up[1], up[0]], dtype=np.float32)
-
-            start_xy = rpos - 1.0 * up + np.random.uniform(-0.15, 0.15) * side
-            start_prog = float(np.dot(start_xy - rpos, up))
-            prog_sign = -1.0 if start_prog > 0.0 else 1.0
-            qx = eval_env.model.jnt_qposadr[qidx["x"]]
-            qy = eval_env.model.jnt_qposadr[qidx["y"]]
-            qz = eval_env.model.jnt_qposadr[qidx["z"]]
-            qr = eval_env.model.jnt_qposadr[qidx["rot"]]
-            vx = eval_env.model.jnt_dofadr[qidx["x"]]
-            vy = eval_env.model.jnt_dofadr[qidx["y"]]
-            vz = eval_env.model.jnt_dofadr[qidx["z"]]
-            vr = eval_env.model.jnt_dofadr[qidx["rot"]]
-            eval_env.data.qpos[qx] = float(start_xy[0])
-            eval_env.data.qpos[qy] = float(start_xy[1])
-            eval_env.data.qpos[qz] = 0.55
-            eval_env.data.qpos[qr] = float(yaw)
-            eval_env.data.qvel[vx] = 0.0
-            eval_env.data.qvel[vy] = 0.0
-            eval_env.data.qvel[vz] = 0.0
-            eval_env.data.qvel[vr] = 0.0
-
-            qadr, vadr = eval_env._obj_addr(rkey)
-            st = eval_env.object_state[rkey]
-            st["mode"] = "locked"
-            st["owner"] = "eval"
-            st["locked_pose"] = eval_env.data.qpos[qadr:qadr + 7].copy()
-            eval_env.data.qvel[vadr:vadr + 6] = 0.0
-            mujoco.mj_forward(eval_env.model, eval_env.data)
-
-            obs = eval_env._normalize_obs(eval_env._get_obs(eval_env.learnable_agent_index))
-            history.prime_single(obs)
-
-            ep_peak_h = float(eval_env.data.xpos[body_id][2])
-            ep_start_h = ep_peak_h
-            ep_peak_prog = 0.0
-            ep_peak_top = -1e9
-            ep_best_lat = 1e9
-            ep_success = False
-
-            for _ in range(max_steps):
-                with torch.no_grad():
-                    seq = history.get()
-                    act = agent.get_action_and_value(seq)[0].cpu().numpy().reshape(-1)
-                next_obs, _, term, trun, _ = eval_env.step(act)
-                apos = eval_env.data.xpos[body_id]
-                rel = apos[:2] - rpos
-                prog = float(np.dot(rel, up))
-                lat = float(np.dot(rel, side))
-                directed_prog = prog_sign * (prog - start_prog)
-                top_side = prog_sign * prog
-                h = float(apos[2])
-                rise = h - ep_start_h
-                ep_peak_h = max(ep_peak_h, h)
-                ep_peak_prog = max(ep_peak_prog, directed_prog)
-                ep_peak_top = max(ep_peak_top, top_side)
-                ep_best_lat = min(ep_best_lat, abs(lat))
-                if (
-                    directed_prog >= RAMP_SUCCESS_PROG
-                    and top_side >= RAMP_SUCCESS_TOP
-                    and abs(lat) <= RAMP_SUCCESS_LAT
-                    and rise >= RAMP_SUCCESS_Z_RISE
-                ):
-                    ep_success = True
-                history.update_single(next_obs)
-                if term or trun:
-                    break
-
-            success_count += int(ep_success)
-            peak_heights.append(ep_peak_h)
-            peak_progress.append(ep_peak_prog)
-
-        episodes_n = max(len(peak_heights), 1)
-        return {
-            "success_rate": success_count / episodes_n,
-            "peak_height_mean": float(np.mean(peak_heights)) if peak_heights else 0.0,
-            "peak_progress_mean": float(np.mean(peak_progress)) if peak_progress else 0.0,
-            "episodes": episodes_n,
-        }
-    finally:
-        eval_env.close()
-
-
-def run_ramp_check_viewer(mode, target, agent, device, episodes=3, max_steps=220):
-    eval_cfg = dict(ENV_CONFIG)
-    eval_cfg["show_turn_lines"] = True
-    eval_env = build_env(mode, target, eval_cfg, render_mode="human")
-    eval_env.prep_steps = 0
-    try:
-        obs_dim = eval_env.observation_space.shape[0]
-        expected_obs_dim = int(getattr(agent, "obs_dim", obs_dim))
-        if obs_dim != expected_obs_dim:
-            print(
-                "Ramp viewer check skipped: obs_dim mismatch "
-                f"(env={obs_dim}, model={expected_obs_dim})"
-            )
-            return
-
-        history = ObsHistory(1, SEQ_LEN, obs_dim, device)
-        learn_key = eval_env.learnable_agent_key
-        body_id = eval_env.body_ids[learn_key]
-        qidx = eval_env.qpos_indices[learn_key]
-
-        print("--- Ramp Viewer Check Start ---")
-        for ep in range(max(episodes, 1)):
-            obs, _ = eval_env.reset()
-            rid = eval_env.ramp_ids[0]
-            rkey = "ramp1"
-            rpos = eval_env.data.xpos[rid][:2].copy()
-            quat = eval_env.data.xquat[rid]
-            yaw = math.atan2(
-                2.0 * (quat[0] * quat[3] + quat[1] * quat[2]),
-                1.0 - 2.0 * (quat[2] ** 2 + quat[3] ** 2),
-            )
-            up = np.array([math.cos(yaw), math.sin(yaw)], dtype=np.float32)
-            side = np.array([-up[1], up[0]], dtype=np.float32)
-
-            start_xy = rpos - 1.75 * up + np.random.uniform(-0.08, 0.08) * side
-            start_prog = float(np.dot(start_xy - rpos, up))
-            prog_sign = -1.0 if start_prog > 0.0 else 1.0
-            climb_dir = up * prog_sign
-            qx = eval_env.model.jnt_qposadr[qidx["x"]]
-            qy = eval_env.model.jnt_qposadr[qidx["y"]]
-            qz = eval_env.model.jnt_qposadr[qidx["z"]]
-            qr = eval_env.model.jnt_qposadr[qidx["rot"]]
-            vx = eval_env.model.jnt_dofadr[qidx["x"]]
-            vy = eval_env.model.jnt_dofadr[qidx["y"]]
-            vz = eval_env.model.jnt_dofadr[qidx["z"]]
-            vr = eval_env.model.jnt_dofadr[qidx["rot"]]
-            eval_env.data.qpos[qx] = float(start_xy[0])
-            eval_env.data.qpos[qy] = float(start_xy[1])
-            eval_env.data.qpos[qz] = 0.55
-            eval_env.data.qpos[qr] = float(yaw)
-            eval_env.data.qvel[vx] = 0.0
-            eval_env.data.qvel[vy] = 0.0
-            eval_env.data.qvel[vz] = 0.0
-            eval_env.data.qvel[vr] = 0.0
-
-            qadr, vadr = eval_env._obj_addr(rkey)
-            st = eval_env.object_state[rkey]
-            st["mode"] = "locked"
-            st["owner"] = "eval"
-            st["locked_pose"] = eval_env.data.qpos[qadr:qadr + 7].copy()
-            eval_env.data.qvel[vadr:vadr + 6] = 0.0
-            mujoco.mj_forward(eval_env.model, eval_env.data)
-
-            obs = eval_env._normalize_obs(eval_env._get_obs(eval_env.learnable_agent_index))
-            history.prime_single(obs)
-            eval_env.render()
-
-            peak_prog = 0.0
-            peak_top = -1e9
-            best_lat = 1e9
-            start_h = float(eval_env.data.xpos[body_id][2])
-            peak_rise = 0.0
-            success = False
-            switched = False
-            stall_count = 0
-            unstick_ticks = 0
-            for t in range(max_steps):
-                if eval_env.viewer and not eval_env.viewer.is_running():
-                    print("Viewer closed.")
-                    return
-                if RAMP_CHECK_FORCE_UPHILL:
-                    if unstick_ticks > 0:
-                        zig = 1.0 if (unstick_ticks // 4) % 2 == 0 else -1.0
-                        action = np.array([1.0, 0.85 * zig, 0.0, 0.0], dtype=np.float32)
-                        unstick_ticks -= 1
-                    else:
-                        rot = float(eval_env.data.qpos[qr])
-                        apos_xy = eval_env.data.xpos[body_id][:2]
-                        rel_xy = apos_xy - rpos
-                        lat_now = float(np.dot(rel_xy, side))
-                        prog_now = prog_sign * float(np.dot(rel_xy, up))
-                        if prog_now < 0.15:
-                            target_xy = rpos - 0.20 * climb_dir - 0.95 * lat_now * side
-                        else:
-                            target_xy = rpos + 1.35 * climb_dir - 0.75 * lat_now * side
-                        to_target = target_xy - apos_xy
-                        target_yaw = math.atan2(float(to_target[1]), float(to_target[0]))
-                        yaw_err = target_yaw - rot
-                        yaw_err = (yaw_err + math.pi) % (2.0 * math.pi) - math.pi
-                        turn = float(np.clip(2.4 * yaw_err, -1.0, 1.0))
-                        fwd = 1.0 if abs(yaw_err) < 1.15 else 0.35
-                        action = np.array([fwd, turn, 0.0, 0.0], dtype=np.float32)
-                else:
-                    with torch.no_grad():
-                        seq = history.get()
-                        action = agent.get_action_and_value(seq)[0].cpu().numpy().reshape(-1)
-                next_obs, _, term, trun, _ = eval_env.step(action)
-                apos = eval_env.data.xpos[body_id]
-                rel = apos[:2] - rpos
-                prog = float(np.dot(rel, up))
-                lat = float(np.dot(rel, side))
-                directed_prog = prog_sign * (prog - start_prog)
-                top_side = prog_sign * prog
-                peak_prog = max(peak_prog, directed_prog)
-                peak_top = max(peak_top, top_side)
-                best_lat = min(best_lat, abs(lat))
-                rise = float(apos[2] - start_h)
-                peak_rise = max(peak_rise, rise)
-                vel_xy = float(np.linalg.norm(eval_env.data.qvel[vx:vy + 1]))
-                if RAMP_CHECK_FORCE_UPHILL:
-                    if t > 24 and directed_prog < 0.35 and vel_xy < 0.08:
-                        stall_count += 1
-                    else:
-                        stall_count = 0
-                    if stall_count >= 16:
-                        unstick_ticks = 22
-                        stall_count = 0
-                        print(f"RampViewer Ep {ep + 1}: edge-stuck assist")
-                if RAMP_CHECK_FORCE_UPHILL and (not switched) and t >= 60 and peak_prog < 0.35:
-                    climb_dir = -climb_dir
-                    prog_sign = -prog_sign
-                    switched = True
-                    print(f"RampViewer Ep {ep + 1}: switching climb direction")
-                if (
-                    directed_prog >= RAMP_SUCCESS_PROG
-                    and top_side >= RAMP_SUCCESS_TOP
-                    and abs(lat) <= RAMP_SUCCESS_LAT
-                    and rise >= RAMP_SUCCESS_Z_RISE
-                ):
-                    success = True
-                history.update_single(next_obs)
-                eval_env.render()
-                time.sleep(0.02)
-                if term or trun:
-                    break
-
-            print(
-                f"RampViewer Ep {ep + 1}/{episodes}: "
-                f"success={int(success)} peak_prog={peak_prog:.2f} "
-                f"peak_top={peak_top:.2f} best_lat={best_lat:.2f} "
-                f"peak_rise={peak_rise:.2f}"
-            )
-        print("--- Ramp Viewer Check End ---")
-    finally:
-        eval_env.close()
-
-def compute_custom_reward(obs, action, base_reward, idx, target_team="seeker", info=None, reward_idx_cache=None):
-    """
-    版改１：高水準な行動インセンティブのみ
-    パラメータ数：13 個 → 3 個に削減
-    """
-    bonus = 0.0
-    
-    # 共通
-    cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
-    speed = math.sqrt(obs[cache["self_vel_x"]] ** 2 + obs[cache["self_vel_y"]] ** 2)
-    move = float(action[0])
-    turn = float(action[1])
-    
-    # 制御コスト（全員共通、最小限）
-    control_cost = -RW_MOVE_CTRL_COST * (move**2 + turn**2)
-    
-    if target_team == "hider":
-        # ① 移動インセンティブ（アイドル防止）
-        if speed < 0.1:
-            bonus -= RW_IDLE_PENALTY
-        elif speed > 0.3:
-            bonus += RW_MOVE_INCENTIVE
-        
-        # ② 壁回避
-        lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
-        if lidar_min < 0.3:  # 危険に近い
-            bonus -= RW_WALL_AVOID_PENALTY * (1.0 - np.clip(lidar_min / 0.3, 0, 1))
-    
-    else:  # seeker
-        # ① 移動奨励
-        if speed < 0.1:
-            bonus -= RW_IDLE_PENALTY
-        
-        # ② 敵に接近（見えている場合）
-        for enemy_idx in range(cache["enemy_visible"].shape[0]):
-            if obs[cache["enemy_visible"][enemy_idx]] > 0.5:
-                dx = float(obs[cache["enemy_rel_x"][enemy_idx]])
-                dy = float(obs[cache["enemy_rel_y"][enemy_idx]])
-                dist = math.sqrt(dx**2 + dy**2)
-                # 距離に反比例の報酬（最大距離でも信号がある）
-                bonus += 0.05 / (dist + 1.0)
-    
-    return base_reward + bonus + control_cost
 
 def _is_wall_stick_state(obs, idx, reward_idx_cache=None):
     cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
@@ -952,6 +686,26 @@ def _is_wall_stick_state(obs, idx, reward_idx_cache=None):
         and (speed < RW_HIDE_STILL_SPEED_THRESHOLD)
     )
 
+
+def env_signature(config):
+    """
+    環境設定のシグネチャ文字列を生成（wandb名やログ用）
+    """
+    keys = [
+        "n_seekers",
+        "n_hiders",
+        "n_boxes",
+        "n_ramps",
+        "mode4_sdf_cell_size",
+    ]
+    return ",".join(f"{k}={config.get(k)}" for k in keys if k in config)
+
+def model_path_for_config(target, config):
+    """
+    モデルの保存・読み込み用パスを一意に決定する
+    """
+    fname = f"HNS_V27_{target}_s{config.get('n_seekers', 1)}_h{config.get('n_hiders', 2)}_b{config.get('n_boxes', 2)}_r{config.get('n_ramps', 1)}.pt"
+    return os.path.join("checkpoints", fname)
 
 def build_env(mode, target, config, render_mode=None):
     return TeamCosEnv(
@@ -1259,6 +1013,7 @@ def run_debug_or_playback(env, agent, device, model_loaded):
 
 def run_train(
     env,
+    ref_env,
     agent,
     optimizer,
     model_path,
@@ -1319,309 +1074,6 @@ def run_train(
                     print("Viewer closed. Stop training loop.")
                     return
                 seq = history.get()
-                rollout_obs[t] = seq[0]
-
-                with torch.no_grad():
-                    action, logp, _, value = agent.get_action_and_value(seq)
-
-                action_np = action.cpu().numpy().reshape(-1)
-                step_t0 = time.perf_counter()
-                next_obs, base_r, term, trun, info = env.step(action_np)
-                env_step_sec_sum += time.perf_counter() - step_t0
-                reward_t0 = time.perf_counter()
-                reward = (
-                    compute_custom_reward(obs, action_np, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
-                    if USE_CUSTOM_REWARD else base_r
-                )
-                reward_compute_sec_sum += time.perf_counter() - reward_t0
-
-                done = bool(term or trun)
-                done_last = float(done)
-                global_step += 1
-
-                rollout_actions[t] = action[0]
-                rollout_logp[t] = logp[0]
-                rollout_rewards[t] = float(reward)
-                rollout_dones[t] = done_last
-                rollout_values[t] = value.view(-1)[0]
-
-                lock_evt_sum += int(info.get("lock_event", 0))
-                grab_evt_sum += int(info.get("grab_event", 0))
-                max_box_speed = max(max_box_speed, float(info.get("dbg_max_box_speed", 0.0)))
-                max_ramp_speed = max(max_ramp_speed, float(info.get("dbg_max_ramp_speed", 0.0)))
-                blocked_ramp_sum += int(info.get("dbg_blocked_ramp_count", 0))
-                rewards_sum += float(reward)
-                if not bool(info.get("is_detected", False)):
-                    hidden_steps += 1
-                seen_learnable = bool(info.get("dbg_learnable_hider_seen", info.get("is_detected", False)))
-                if seen_learnable:
-                    learnable_seen_steps += 1
-                is_wall_stick = _is_wall_stick_state(next_obs, idx, reward_idx_cache=reward_idx_cache)
-                if is_wall_stick:
-                    wall_stick_steps += 1
-                    if seen_learnable:
-                        wall_stick_seen_steps += 1
-
-                if done:
-                    obs, _ = env.reset()
-                    history.prime_single(obs)
-                    if USE_VIEWER:
-                        env.render()
-                else:
-                    obs = next_obs
-                    history.update_single(obs)
-
-                if USE_VIEWER:
-                    env.render()
-
-            with torch.no_grad():
-                next_value = agent.get_value(history.get()).view(-1)[0]
-
-            advantages = torch.zeros(hp["rollout_steps"], device=device)
-            lastgaelam = 0.0
-            for t in reversed(range(hp["rollout_steps"])):
-                if t == hp["rollout_steps"] - 1:
-                    next_nonterminal = 1.0 - done_last
-                    next_vals = next_value
-                else:
-                    next_nonterminal = 1.0 - rollout_dones[t + 1]
-                    next_vals = rollout_values[t + 1]
-                delta = rollout_rewards[t] + hp["gamma"] * next_vals * next_nonterminal - rollout_values[t]
-                lastgaelam = delta + hp["gamma"] * hp["gae_lambda"] * next_nonterminal * lastgaelam
-                advantages[t] = lastgaelam
-            returns = advantages + rollout_values
-
-            b_obs = rollout_obs
-            b_actions = rollout_actions
-            b_logp = rollout_logp
-            b_adv = advantages
-            b_ret = returns
-
-            inds = np.arange(hp["rollout_steps"])
-            for _ in range(hp["update_epochs"]):
-                np.random.shuffle(inds)
-                for start in range(0, hp["rollout_steps"], hp["minibatch_size"]):
-                    mb_idx = inds[start:start + hp["minibatch_size"]]
-
-                    _, new_logp, entropy, new_value = agent.get_action_and_value(
-                        b_obs[mb_idx], b_actions[mb_idx]
-                    )
-                    logratio = new_logp - b_logp[mb_idx]
-                    ratio = logratio.exp()
-
-                    mb_adv = b_adv[mb_idx]
-                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
-
-                    pg_loss1 = -mb_adv * ratio
-                    pg_loss2 = -mb_adv * torch.clamp(
-                        ratio,
-                        1.0 - hp["clip_coef"],
-                        1.0 + hp["clip_coef"],
-                    )
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                    v_loss = 0.5 * ((new_value.view(-1) - b_ret[mb_idx]) ** 2).mean()
-                    ent_loss = entropy.mean()
-                    loss = pg_loss + hp["vf_coef"] * v_loss - hp["ent_coef"] * ent_loss
-                    entropy_sum += float(ent_loss.detach().cpu().item())
-                    entropy_count += 1
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), hp["max_grad_norm"])
-                    optimizer.step()
-
-            elapsed = max(time.time() - train_start_time, 1e-6)
-            sps = int(global_step / elapsed)
-            hide_rate = hidden_steps / max(hp["rollout_steps"], 1)
-            learnable_seen_rate = learnable_seen_steps / max(hp["rollout_steps"], 1)
-            wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"], 1)
-            wall_stick_seen_ratio = wall_stick_seen_steps / max(wall_stick_steps, 1)
-            avg_reward = rewards_sum / hp["rollout_steps"]
-            avg_blocked_ramp = blocked_ramp_sum / hp["rollout_steps"]
-            avg_entropy = entropy_sum / max(entropy_count, 1)
-            reward_compute_ms_per_step = 1000.0 * reward_compute_sec_sum / max(hp["rollout_steps"], 1)
-            env_step_ms_per_step = 1000.0 * env_step_sec_sum / max(hp["rollout_steps"], 1)
-            reward_time_ratio = reward_compute_sec_sum / max(env_step_sec_sum, 1e-9)
-            ramp_eval = None
-            if (
-                RAMP_CHECK_ENABLED
-                and RAMP_CHECK_INTERVAL > 0
-                and update % RAMP_CHECK_INTERVAL == 0
-            ):
-                ramp_eval = evaluate_fixed_ramp_climb(
-                    MODE,
-                    training_target,
-                    agent,
-                    device,
-                    episodes=RAMP_CHECK_EPISODES,
-                    max_steps=RAMP_CHECK_STEPS,
-                )
-                last_ramp_eval = ramp_eval
-            if wandb_run is not None:
-                payload = {
-                    "global_step": global_step,
-                    "train/update": update,
-                    "train/sps": sps,
-                    "train/hide_rate": hide_rate,
-                    "train/avg_reward": avg_reward,
-                    "train/entropy": avg_entropy,
-                    "train/learnable_seen_rate": learnable_seen_rate,
-                    "train/wall_stick_ratio": wall_stick_ratio,
-                    "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
-                    "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,
-                    "perf/env_step_ms_per_step": env_step_ms_per_step,
-                    "perf/reward_to_env_time_ratio": reward_time_ratio,
-                    "env/lock_events": lock_evt_sum,
-                    "env/grab_events": grab_evt_sum,
-                    "env/max_box_speed": max_box_speed,
-                    "env/max_ramp_speed": max_ramp_speed,
-                    "env/avg_blocked_ramp": avg_blocked_ramp,
-                    "system/num_envs": 1,
-                }
-                if ramp_eval is not None:
-                    payload.update(
-                        {
-                            "eval/ramp_climb_success_rate": ramp_eval["success_rate"],
-                            "eval/ramp_peak_height_mean": ramp_eval["peak_height_mean"],
-                            "eval/ramp_peak_progress_mean": ramp_eval["peak_progress_mean"],
-                        }
-                    )
-                wandb_run.log(payload, step=global_step)
-            if update % hp["log_interval"] == 0:
-                ramp_text = ""
-                if last_ramp_eval is not None:
-                    ramp_text = (
-                        f" RampOK={last_ramp_eval['success_rate']:.2f}"
-                        f" RampProg={last_ramp_eval['peak_progress_mean']:.2f}"
-                    )
-                print(
-                    f"Upd {update}/{num_updates} Step={global_step} "
-                    f"SPS={sps} HideRate={hide_rate:.2f} "
-                    f"SeenRate={learnable_seen_rate:.2f} "
-                    f"WallStick={wall_stick_ratio:.2f} "
-                    f"Seen@WallStick={wall_stick_seen_ratio:.2f} "
-                    f"RwMs={reward_compute_ms_per_step:.3f} "
-                    f"EnvMs={env_step_ms_per_step:.3f} "
-                    f"Rw/Env={reward_time_ratio:.2f} "
-                    f"AvgR={avg_reward:.3f} Ent={avg_entropy:.4f} "
-                    f"LockEvt={lock_evt_sum} GrabEvt={grab_evt_sum} "
-                    f"MaxBoxV={max_box_speed:.2f} MaxRampV={max_ramp_speed:.2f} "
-                    f"AvgBlockedRamp={avg_blocked_ramp:.2f}"
-                    f"{ramp_text}"
-                )
-
-            if update % hp["save_interval"] == 0:
-                _atomic_save(model_path)
-    except KeyboardInterrupt:
-        interrupted = True
-        print("\nTraining interrupted. Saving checkpoint...")
-        raise
-    except WORKER_SHUTDOWN_ERRORS as exc:
-        interrupted = True
-        print(
-            f"\nVector worker terminated ({exc.__class__.__name__}). "
-            "Saving checkpoint and exiting cleanly..."
-        )
-    finally:
-        _atomic_save(model_path)
-        if interrupted:
-            print(f"Interrupted checkpoint saved: {model_path}")
-        else:
-            print(f"Saved model: {model_path}")
-
-
-def safe_close_vector_env(vec_envs):
-    if vec_envs is None:
-        return
-    try:
-        vec_envs.close(terminate=True)
-    except WORKER_SHUTDOWN_ERRORS as exc:
-        print(f"VectorEnv close skipped ({exc.__class__.__name__})")
-    except Exception as exc:
-        print(f"VectorEnv close suppressed ({exc.__class__.__name__}: {exc})")
-
-
-def _info_at(info, key, env_idx, default=0):
-    if key not in info:
-        return default
-    value = info[key]
-    if isinstance(value, (list, tuple, np.ndarray)):
-        if len(value) <= env_idx:
-            return default
-        return value[env_idx]
-    return value
-
-
-def run_train_vector(
-    envs,
-    ref_env,
-    agent,
-    optimizer,
-    model_path,
-    device,
-    hp,
-    training_target,
-    num_envs,
-    wandb_run=None,
-):
-    def _atomic_save(path):
-        tmp_path = f"{path}.tmp"
-        torch.save(agent.state_dict(), tmp_path)
-        os.replace(tmp_path, path)
-
-    idx = ref_env.idx
-    reward_idx_cache = _build_reward_index_cache(idx)
-    obs_dim = ref_env.observation_space.shape[0]
-    act_dim = ref_env.action_space.shape[0]
-    history = ObsHistory(num_envs, SEQ_LEN, obs_dim, device)
-
-    obs, _ = envs.reset()
-    history.prime(obs)
-
-    rollout_obs = torch.zeros(
-        (hp["rollout_steps"], num_envs, SEQ_LEN, obs_dim),
-        device=device,
-    )
-    rollout_actions = torch.zeros(
-        (hp["rollout_steps"], num_envs, act_dim),
-        device=device,
-    )
-    rollout_logp = torch.zeros((hp["rollout_steps"], num_envs), device=device)
-    rollout_rewards = torch.zeros((hp["rollout_steps"], num_envs), device=device)
-    rollout_dones = torch.zeros((hp["rollout_steps"], num_envs), device=device)
-    rollout_values = torch.zeros((hp["rollout_steps"], num_envs), device=device)
-
-    num_updates = max(1, hp["total_timesteps"] // (hp["rollout_steps"] * num_envs))
-    global_step = 0
-    train_start_time = time.time()
-    print(
-        f"Vector training: envs={num_envs}, updates={num_updates}, "
-        f"model={model_path}"
-    )
-    interrupted = False
-    last_ramp_eval = None
-    try:
-        for update in range(1, num_updates + 1):
-            lock_evt_sum = 0
-            grab_evt_sum = 0
-            max_box_speed = 0.0
-            max_ramp_speed = 0.0
-            blocked_ramp_sum = 0
-            hidden_steps = 0
-            learnable_seen_steps = 0
-            wall_stick_steps = 0
-            wall_stick_seen_steps = 0
-            entropy_sum = 0.0
-            entropy_count = 0
-            reward_compute_sec_sum = 0.0
-            env_step_sec_sum = 0.0
-
-            done_last = np.zeros(num_envs, dtype=np.float32)
-            rewards_sum = 0.0
-
-            for t in range(hp["rollout_steps"]):
-                seq = history.get()
                 rollout_obs[t] = seq
 
                 with torch.no_grad():
@@ -1629,7 +1081,7 @@ def run_train_vector(
 
                 action_np = action.cpu().numpy()
                 step_t0 = time.perf_counter()
-                next_obs, base_r, term, trun, info = envs.step(action_np)
+                next_obs, base_r, term, trun, info = env.step(action_np)
                 env_step_sec_sum += time.perf_counter() - step_t0
                 done_np = np.logical_or(term, trun).astype(np.float32)
                 done_last = done_np
@@ -1822,27 +1274,376 @@ def run_train_vector(
                     )
                 wandb_run.log(payload, step=global_step)
             if update % hp["log_interval"] == 0:
-                ramp_text = ""
-                if last_ramp_eval is not None:
-                    ramp_text = (
-                        f" RampOK={last_ramp_eval['success_rate']:.2f}"
-                        f" RampProg={last_ramp_eval['peak_progress_mean']:.2f}"
+                print(f"Upd {update}/{num_updates} Step={global_step} SPS={sps} HideRate={hide_rate:.2f} WallStick={wall_stick_ratio:.2f} AvgR={avg_reward:.3f}")
+            # wall_distance統計バッファ
+            if not hasattr(run_train_vector, '_wall_distance_buffer'):
+                run_train_vector._wall_distance_buffer = []
+            if not hasattr(run_train_vector, '_info_buffer'):
+                run_train_vector._info_buffer = []
+            # 1000ステップごとにinfoからwall_distance統計を集計・出力
+            if global_step % 1000 == 0:
+                wall_dist_list = []
+                for t in range(len(run_train_vector._info_buffer)):
+                    info = run_train_vector._info_buffer[t]
+                    if isinstance(info, (list, tuple)):
+                        for i in range(num_envs):
+                            info_i = info[i] if len(info) > i else None
+                            if info_i and 'wall_distance' in info_i:
+                                wall_dist_list.append(float(info_i['wall_distance']))
+                    elif isinstance(info, dict):
+                        if 'wall_distance' in info:
+                            wall_dist_list.append(float(info['wall_distance']))
+                if wall_dist_list:
+                    arr = np.array(wall_dist_list, dtype=np.float32)
+                    print(f"[WallDist] step={global_step} mean={np.mean(arr):.3f} min={np.min(arr):.3f} max={np.max(arr):.3f}")
+            # infoバッファをクリア
+            run_train_vector._info_buffer.clear()
+
+            if update % hp["save_interval"] == 0:
+                _atomic_save(model_path)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nTraining interrupted. Saving checkpoint...")
+        raise
+    except WORKER_SHUTDOWN_ERRORS as exc:
+        interrupted = True
+        print(
+            f"\nVector worker terminated ({exc.__class__.__name__}). "
+            "Saving checkpoint and exiting cleanly..."
+        )
+    finally:
+        _atomic_save(model_path)
+        if interrupted:
+            print(f"Interrupted checkpoint saved: {model_path}")
+        else:
+            print(f"Saved model: {model_path}")
+
+
+def safe_close_vector_env(vec_envs):
+    if vec_envs is None:
+        return
+    try:
+        vec_envs.close(terminate=True)
+    except WORKER_SHUTDOWN_ERRORS as exc:
+        print(f"VectorEnv close skipped ({exc.__class__.__name__})")
+    except Exception as exc:
+        print(f"VectorEnv close suppressed ({exc.__class__.__name__}: {exc})")
+
+
+def _info_at(info, key, env_idx, default=0):
+    if key not in info:
+        return default
+    value = info[key]
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) <= env_idx:
+            return default
+        return value[env_idx]
+    return value
+
+
+def run_train_vector(
+    envs,
+    ref_env,
+    agent,
+    optimizer,
+    model_path,
+    device,
+    hp,
+    training_target,
+    num_envs,
+    wandb_run=None,
+):
+    def _atomic_save(path):
+        tmp_path = f"{path}.tmp"
+        torch.save(agent.state_dict(), tmp_path)
+        os.replace(tmp_path, path)
+
+    idx = ref_env.idx
+    reward_idx_cache = _build_reward_index_cache(idx)
+    obs_dim = ref_env.observation_space.shape[0]
+    act_dim = ref_env.action_space.shape[0]
+    history = ObsHistory(num_envs, SEQ_LEN, obs_dim, device)
+
+    obs, _ = envs.reset()
+    history.prime(obs)
+
+    rollout_obs = torch.zeros(
+        (hp["rollout_steps"], num_envs, SEQ_LEN, obs_dim),
+        device=device,
+    )
+    rollout_actions = torch.zeros(
+        (hp["rollout_steps"], num_envs, act_dim),
+        device=device,
+    )
+    rollout_logp = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+    rollout_rewards = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+    rollout_dones = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+    rollout_values = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+
+    num_updates = max(1, hp["total_timesteps"] // (hp["rollout_steps"] * num_envs))
+    global_step = 0
+    train_start_time = time.time()
+    print(
+        f"Vector training: envs={num_envs}, updates={num_updates}, "
+        f"model={model_path}"
+    )
+    interrupted = False
+    last_ramp_eval = None
+
+    try:
+        # バッファをローカル変数で管理
+        wall_distance_buffer = []
+        info_buffer = []
+        for update in range(1, num_updates + 1):
+            lock_evt_sum = 0
+            grab_evt_sum = 0
+            max_box_speed = 0.0
+            max_ramp_speed = 0.0
+            blocked_ramp_sum = 0
+            hidden_steps = 0
+            learnable_seen_steps = 0
+            wall_stick_steps = 0
+            wall_stick_seen_steps = 0
+            entropy_sum = 0.0
+            entropy_count = 0
+            reward_compute_sec_sum = 0.0
+            env_step_sec_sum = 0.0
+
+            done_last = np.zeros(num_envs, dtype=np.float32)
+            rewards_sum = 0.0
+
+            info_buffer.clear()
+            for t in range(hp["rollout_steps"]):
+                seq = history.get()
+                rollout_obs[t] = seq
+
+                with torch.no_grad():
+                    action, logp, _, value = agent.get_action_and_value(seq)
+
+                action_np = action.cpu().numpy()
+                step_t0 = time.perf_counter()
+                next_obs, base_r, term, trun, info = envs.step(action_np)
+                # infoをバッファに追加
+                info_buffer.append(info)
+                env_step_sec_sum += time.perf_counter() - step_t0
+                done_np = np.logical_or(term, trun).astype(np.float32)
+                done_last = done_np
+
+                reward_np = np.asarray(base_r, dtype=np.float32).copy()
+                reward_t0 = time.perf_counter()
+                if USE_CUSTOM_REWARD:
+                    reward_np = _compute_custom_reward_batch_numba(
+                        np.asarray(obs, dtype=np.float32),
+                        np.asarray(action_np, dtype=np.float32),
+                        np.asarray(reward_np, dtype=np.float32),
+                        bool(ref_env.target == "hider"),
+                        reward_idx_cache["self_vel_x"],
+                        reward_idx_cache["self_vel_y"],
+                        reward_idx_cache["lidar"],
+                        reward_idx_cache["enemy_visible"],
+                        reward_idx_cache["enemy_rel_x"],
+                        reward_idx_cache["enemy_rel_y"],
+                        float(RW_MOVE_CTRL_COST),
+                        float(RW_MOVE_INCENTIVE),
+                        float(RW_IDLE_PENALTY),
+                        float(RW_WALL_AVOID_PENALTY),
                     )
-                print(
-                    f"Upd {update}/{num_updates} Step={global_step} "
-                    f"SPS={sps} HideRate={hide_rate:.2f} "
-                    f"SeenRate={learnable_seen_rate:.2f} "
-                    f"WallStick={wall_stick_ratio:.2f} "
-                    f"Seen@WallStick={wall_stick_seen_ratio:.2f} "
-                    f"RwMs={reward_compute_ms_per_step:.3f} "
-                    f"EnvMs={env_step_ms_per_step:.3f} "
-                    f"Rw/Env={reward_time_ratio:.2f} "
-                    f"AvgR={avg_reward:.3f} Ent={avg_entropy:.4f} "
-                    f"LockEvt={lock_evt_sum} GrabEvt={grab_evt_sum} "
-                    f"MaxBoxV={max_box_speed:.2f} MaxRampV={max_ramp_speed:.2f} "
-                    f"AvgBlockedRamp={avg_blocked_ramp:.2f}"
-                    f"{ramp_text}"
+                reward_compute_sec_sum += time.perf_counter() - reward_t0
+
+                global_step += num_envs
+                rollout_actions[t] = action
+                rollout_logp[t] = logp
+                rollout_rewards[t] = torch.as_tensor(reward_np, device=device)
+                rollout_dones[t] = torch.as_tensor(done_np, device=device)
+                rollout_values[t] = value.view(-1)
+
+                for i in range(num_envs):
+                    lock_evt_sum += int(_info_at(info, "lock_event", i, 0))
+                    grab_evt_sum += int(_info_at(info, "grab_event", i, 0))
+                    max_box_speed = max(
+                        max_box_speed,
+                        float(_info_at(info, "dbg_max_box_speed", i, 0.0)),
+                    )
+                    max_ramp_speed = max(
+                        max_ramp_speed,
+                        float(_info_at(info, "dbg_max_ramp_speed", i, 0.0)),
+                    )
+                    blocked_ramp_sum += int(
+                        _info_at(info, "dbg_blocked_ramp_count", i, 0)
+                    )
+                    if not bool(_info_at(info, "is_detected", i, False)):
+                        hidden_steps += 1
+                    seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
+                    if seen_learnable:
+                        learnable_seen_steps += 1
+                    is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache)
+                    if is_wall_stick:
+                        wall_stick_steps += 1
+                        if seen_learnable:
+                            wall_stick_seen_steps += 1
+
+                rewards_sum += float(np.sum(reward_np))
+
+                history.update(next_obs)
+                for i in range(num_envs):
+                    if done_np[i] > 0.5:
+                        history.reset_env(i, next_obs[i])
+                obs = next_obs
+
+            with torch.no_grad():
+                next_value = agent.get_value(history.get()).view(num_envs)
+
+            advantages = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+            lastgaelam = torch.zeros(num_envs, device=device)
+            done_last_t = torch.as_tensor(done_last, device=device)
+            for t in reversed(range(hp["rollout_steps"])):
+                if t == hp["rollout_steps"] - 1:
+                    next_nonterminal = 1.0 - done_last_t
+                    next_vals = next_value
+                else:
+                    next_nonterminal = 1.0 - rollout_dones[t + 1]
+                    next_vals = rollout_values[t + 1]
+                delta = (
+                    rollout_rewards[t]
+                    + hp["gamma"] * next_vals * next_nonterminal
+                    - rollout_values[t]
                 )
+                lastgaelam = (
+                    delta
+                    + hp["gamma"]
+                    * hp["gae_lambda"]
+                    * next_nonterminal
+                    * lastgaelam
+                )
+                advantages[t] = lastgaelam
+            returns = advantages + rollout_values
+
+            b_obs = rollout_obs.reshape(-1, SEQ_LEN, obs_dim)
+            b_actions = rollout_actions.reshape(-1, act_dim)
+            b_logp = rollout_logp.reshape(-1)
+            b_adv = advantages.reshape(-1)
+            b_ret = returns.reshape(-1)
+
+            batch_size = hp["rollout_steps"] * num_envs
+            inds = np.arange(batch_size)
+            for _ in range(hp["update_epochs"]):
+                np.random.shuffle(inds)
+                for start in range(0, batch_size, hp["minibatch_size"]):
+                    mb_idx = inds[start:start + hp["minibatch_size"]]
+                    _, new_logp, entropy, new_value = agent.get_action_and_value(
+                        b_obs[mb_idx],
+                        b_actions[mb_idx],
+                    )
+                    logratio = new_logp - b_logp[mb_idx]
+                    ratio = logratio.exp()
+
+                    mb_adv = b_adv[mb_idx]
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+
+                    pg_loss1 = -mb_adv * ratio
+                    pg_loss2 = -mb_adv * torch.clamp(
+                        ratio,
+                        1.0 - hp["clip_coef"],
+                        1.0 + hp["clip_coef"],
+                    )
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    v_loss = 0.5 * ((new_value.view(-1) - b_ret[mb_idx]) ** 2).mean()
+                    ent_loss = entropy.mean()
+                    loss = pg_loss + hp["vf_coef"] * v_loss - hp["ent_coef"] * ent_loss
+                    entropy_sum += float(ent_loss.detach().cpu().item())
+                    entropy_count += 1
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), hp["max_grad_norm"])
+                    optimizer.step()
+
+            elapsed = max(time.time() - train_start_time, 1e-6)
+            sps = int(global_step / elapsed)
+            hide_rate = hidden_steps / max(hp["rollout_steps"] * num_envs, 1)
+            learnable_seen_rate = learnable_seen_steps / max(hp["rollout_steps"] * num_envs, 1)
+            wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"] * num_envs, 1)
+            wall_stick_seen_ratio = wall_stick_seen_steps / max(wall_stick_steps, 1)
+            avg_reward = rewards_sum / (hp["rollout_steps"] * num_envs)
+            avg_blocked_ramp = blocked_ramp_sum / (hp["rollout_steps"] * num_envs)
+            avg_entropy = entropy_sum / max(entropy_count, 1)
+            reward_compute_ms_per_step = 1000.0 * reward_compute_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
+            env_step_ms_per_step = 1000.0 * env_step_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
+            reward_time_ratio = reward_compute_sec_sum / max(env_step_sec_sum, 1e-9)
+            ramp_eval = None
+            if (
+                RAMP_CHECK_ENABLED
+                and RAMP_CHECK_INTERVAL > 0
+                and update % RAMP_CHECK_INTERVAL == 0
+            ):
+                ramp_eval = evaluate_fixed_ramp_climb(
+                    MODE,
+                    training_target,
+                    agent,
+                    device,
+                    episodes=RAMP_CHECK_EPISODES,
+                    max_steps=RAMP_CHECK_STEPS,
+                )
+                last_ramp_eval = ramp_eval
+            if wandb_run is not None:
+                payload = {
+                    "global_step": global_step,
+                    "train/update": update,
+                    "train/sps": sps,
+                    "train/hide_rate": hide_rate,
+                    "train/avg_reward": avg_reward,
+                    "train/entropy": avg_entropy,
+                    "train/learnable_seen_rate": learnable_seen_rate,
+                    "train/wall_stick_ratio": wall_stick_ratio,
+                    "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
+                    "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,
+                    "perf/env_step_ms_per_step": env_step_ms_per_step,
+                    "perf/reward_to_env_time_ratio": reward_time_ratio,
+                    "env/lock_events": lock_evt_sum,
+                    "env/grab_events": grab_evt_sum,
+                    "env/max_box_speed": max_box_speed,
+                    "env/max_ramp_speed": max_ramp_speed,
+                    "env/avg_blocked_ramp": avg_blocked_ramp,
+                    "system/num_envs": num_envs,
+                }
+                if ramp_eval is not None:
+                    payload.update(
+                        {
+                            "eval/ramp_climb_success_rate": ramp_eval["success_rate"],
+                            "eval/ramp_peak_height_mean": ramp_eval["peak_height_mean"],
+                            "eval/ramp_peak_progress_mean": ramp_eval["peak_progress_mean"],
+                        }
+                    )
+                wandb_run.log(payload, step=global_step)
+            if update % hp["log_interval"] == 0:
+                print(f"Upd {update}/{num_updates} Step={global_step} SPS={sps} HideRate={hide_rate:.2f} WallStick={wall_stick_ratio:.2f} AvgR={avg_reward:.3f}")
+
+            # wall_distance統計バッファ（ローカル変数で管理）
+            for info in info_buffer:
+                if isinstance(info, (list, tuple)):
+                    for i in range(num_envs):
+                        info_i = info[i] if len(info) > i else None
+                        if info_i and 'wall_distance' in info_i:
+                            wd = info_i['wall_distance']
+                            if isinstance(wd, (list, tuple, np.ndarray)):
+                                for v in wd:
+                                    wall_distance_buffer.append(float(v))
+                            else:
+                                wall_distance_buffer.append(float(wd))
+                elif isinstance(info, dict):
+                    if 'wall_distance' in info:
+                        wd = info['wall_distance']
+                        if isinstance(wd, (list, tuple, np.ndarray)):
+                            for v in wd:
+                                wall_distance_buffer.append(float(v))
+                        else:
+                            wall_distance_buffer.append(float(wd))
+            if global_step % 1000 == 0 and wall_distance_buffer:
+                arr = np.array(wall_distance_buffer, dtype=np.float32)
+                print(f"[WallDist] step={global_step} mean={np.mean(arr):.3f} min={np.min(arr):.3f} max={np.max(arr):.3f}")
+                wall_distance_buffer.clear()
+            info_buffer.clear()
 
             if update % hp["save_interval"] == 0:
                 _atomic_save(model_path)
@@ -1998,6 +1799,7 @@ def run():
             else:
                 run_train(
                     env,
+                    ref_env,
                     agent,
                     optimizer,
                     model_path,
