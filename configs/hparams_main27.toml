@@ -25,13 +25,14 @@ use_custom_reward = true
 # 前進飽和抑制（常時前進ボーナスは使わない）
 rw_move_sat_penalty = 0.02
 # 壁張り付き対策（hider）
-rw_hide_wall_stick_penalty = 0.03
+rw_hide_wall_stick_penalty = 0.1
 rw_hide_wall_near_threshold = 0.18
 rw_hide_still_speed_threshold = 0.05
 rw_hide_visible_front_penalty = 0.04
 rw_hide_visible_near_penalty = 0.015
 rw_hide_seeker_gaze_cos_penalty = 0.03
 rw_hide_seeker_gaze_cos_dist_penalty = 0.01
+rw_wall_avoid_penalty = 0.15
 ramp_check_enabled = true
 ramp_check_viewer = false
 ramp_check_force_uphill = true

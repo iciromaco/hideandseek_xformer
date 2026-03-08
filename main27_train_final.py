@@ -262,6 +262,9 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
             bonus -= RW_IDLE_PENALTY
         elif speed > 0.3:
             bonus += RW_MOVE_INCENTIVE
+        # --- 壁張り付き状態なら明示的にペナルティ加算 ---
+        if _is_wall_stick_state(obs, idx, reward_idx_cache=reward_idx_cache):
+            bonus -= RW_HIDE_WALL_STICK_PENALTY
     else:
         if speed < 0.1:
             bonus -= RW_IDLE_PENALTY
