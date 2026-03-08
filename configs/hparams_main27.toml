@@ -1,3 +1,4 @@
+# hparams_main27.toml
 # 実行時プロファイル選択（train / debug）
 [runtime]
 active_profile = "train"
@@ -225,8 +226,12 @@ RW_HIDE_WALL_STICK_PENALTY = 0.0
 
 # base: PPOの基本ハイパーパラメータ（全ターゲット共通）
 [base]
+# 隠れ層
+hidden_dim = 256
+# シーケンス長
+seq_len = 16
 # 総ステップ数
-total_timesteps = 300000
+total_timesteps = 500000
 # 1回のロールアウト長
 rollout_steps = 128
 # 1更新あたりの学習エポック数
@@ -236,7 +241,7 @@ minibatch_size = 64
 # 学習率
 learning_rate = 3.0e-4
 # 割引率
-gamma = 0.99
+gamma = 0.995
 # GAE λ
 gae_lambda = 0.95
 # PPOクリップ係数

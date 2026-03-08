@@ -516,8 +516,8 @@ ENV_CONFIG = {
 
 SEQ_LEN = _cfg("SEQ_LEN", "8", int)
 HIDDEN_DIM = _cfg("HIDDEN_DIM", "128", int)
-NUM_ENVS = _cfg("NUM_ENVS", "4", int)
-ACTION_REPEAT = _cfg("ACTION_REPEAT", "16", int)
+NUM_ENVS = _cfg("NUM_ENVS", "8", int)
+ACTION_REPEAT = _cfg("ACTION_REPEAT", "10", int)
 
 WORKER_SHUTDOWN_ERRORS = (EOFError, BrokenPipeError, ConnectionResetError)
 
@@ -526,7 +526,7 @@ ROLLOUT_STEPS = _cfg("ROLLOUT_STEPS", "128", int)
 UPDATE_EPOCHS = _cfg("UPDATE_EPOCHS", "4", int)
 MINIBATCH_SIZE = _cfg("MINIBATCH_SIZE", "64", int)
 LEARNING_RATE = _cfg("LEARNING_RATE", "3e-4", float)
-GAMMA = _cfg("GAMMA", "0.99", float)
+GAMMA = _cfg("GAMMA", "0.995", float)
 GAE_LAMBDA = _cfg("GAE_LAMBDA", "0.95", float)
 CLIP_COEF = _cfg("CLIP_COEF", "0.2", float)
 VF_COEF = _cfg("VF_COEF", "0.5", float)
