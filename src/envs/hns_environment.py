@@ -1,3 +1,5 @@
+# mathのimportを明示的に追加
+import math
 # src/envs/hns_environment.py
 # hns_environment.py v4.5９
 
@@ -15,6 +17,41 @@ from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
 from core.obs_indices import ObsIdx
 from models.ppo_transformer_v2 import AgentV2
 
+# --- DebugLoggerクラス ---
+class DebugLogger:
+    def __init__(self, enabled=False, log_interval_steps=100):
+        self.enabled = enabled
+        self.log_interval_steps = log_interval_steps
+        self._log_last_step = {}
+        self._policy_source_logged = set()
+
+    def print(self, message):
+        if self.enabled:
+            print(message)
+
+    def print_throttled(self, key, message, current_step, force=False):
+        if not self.enabled:
+            return
+        if force:
+            print(message)
+            self._log_last_step[key] = int(current_step)
+            return
+        now = int(current_step)
+        last = int(self._log_last_step.get(key, -10**9))
+        if (now - last) < self.log_interval_steps:
+            return
+        print(message)
+        self._log_last_step[key] = now
+
+    def log_policy_source(self, agent_key, source, current_step, force=False):
+        key = (agent_key, source)
+        if key in self._policy_source_logged:
+            return
+        self.print_throttled(f"policy_source:{agent_key}:{source}", f"policy_source[{agent_key}] = {source}", current_step, force=force)
+        self._policy_source_logged.add(key)
+
+    def clear_policy_source_log(self):
+        self._policy_source_logged.clear()
 
 def _euler_z_to_quat(yaw):
     """Z軸回転角からクォータニオン文字列を生成。"""
@@ -115,7 +152,9 @@ class TeamCosEnv(gym.Env):
                  inference_policies=None, show_turn_lines=True,
                  policy_source_log=False, policy_source_log_each_reset=False,
                  debug_log_interval_steps=200,
-                 mode4_sdf_cell_size=0.05):
+                 mode4_sdf_cell_size=0.05,
+                 debug_mode=False,
+                 action_repeat=16):
         super().__init__()
         self.n_seekers = int(n_seekers)
         self.n_hiders = int(n_hiders)
@@ -129,6 +168,9 @@ class TeamCosEnv(gym.Env):
         self.show_turn_lines = bool(show_turn_lines)
         self.mode4_sdf_cell_size = float(mode4_sdf_cell_size)
         self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
+        self.debug_mode = debug_mode
+        self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=debug_log_interval_steps)
+        self.action_repeat = action_repeat
         if self.n_seekers == 1:
             self.seeker_keys = ["s"]
         else:
@@ -160,11 +202,7 @@ class TeamCosEnv(gym.Env):
         self._policy_histories = {}
         self.override_learnable_policy = False
         self.model_policy_deterministic = True
-        self._policy_source_logged = set()
-        self.policy_source_log = bool(policy_source_log)
-        self.policy_source_log_each_reset = bool(policy_source_log_each_reset)
-        self.debug_log_interval_steps = max(1, int(debug_log_interval_steps))
-        self._debug_log_last_step = {}
+        # デバッグ用ロガーに移譲
         
         self.last_debug_ctrl = {k: (0.0, 0.0) for k in self.agent_keys}
         
@@ -745,30 +783,14 @@ class TeamCosEnv(gym.Env):
             return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
         return float(arr[0]), float(arr[1]), 0.0, 0.0
 
+
     def _log_policy_source(self, agent_key, source):
-        if not self.policy_source_log:
+        if not self.debug_mode:
             return
-        key = (agent_key, source)
-        if key in self._policy_source_logged:
-            return
-        self._debug_print_throttled(
-            f"policy_source:{agent_key}:{source}",
-            f"policy_source[{agent_key}] = {source}",
-            force=True,
-        )
-        self._policy_source_logged.add(key)
+        self.debug_logger.log_policy_source(agent_key, source, self.current_step, force=True)
 
     def _debug_print_throttled(self, key, message, force=False):
-        if force:
-            print(message)
-            self._debug_log_last_step[key] = int(self.current_step)
-            return
-        now = int(self.current_step)
-        last = int(self._debug_log_last_step.get(key, -10**9))
-        if (now - last) < self.debug_log_interval_steps:
-            return
-        print(message)
-        self._debug_log_last_step[key] = now
+        self.debug_logger.print_throttled(key, message, self.current_step, force=force)
 
     def _is_spawn_position_valid(self, pos_xy, radius, placed, margin):
         px = float(pos_xy[0])
@@ -788,9 +810,9 @@ class TeamCosEnv(gym.Env):
         super().reset(seed=seed)
         self.current_step = 0
         self._policy_histories.clear()
-        self._debug_log_last_step.clear()
-        if self.policy_source_log_each_reset:
-            self._policy_source_logged.clear()
+        self.debug_logger._log_last_step.clear()
+        if self.debug_mode:
+            self.debug_logger.clear_policy_source_log()
         mujoco.mj_resetData(self.model, self.data)
         self._init_agent_intelligence()
         self._init_interaction_state()
@@ -907,7 +929,7 @@ class TeamCosEnv(gym.Env):
             self.last_debug_ctrl[ak] = (f, t)
             
         self.data.ctrl[:] = cv
-        for _ in range(5):
+        for _ in range(self.action_repeat):
             mujoco.mj_step(self.model, self.data)
             self._apply_object_constraints()
             self._stabilize_agent_vertical_motion()
@@ -1118,18 +1140,27 @@ class TeamCosEnv(gym.Env):
         if self.viewer is None:
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
             with self.viewer.lock():
-                self.viewer.cam.lookat[:] = [0, 0, 0.8]; self.viewer.cam.distance, self.viewer.cam.elevation, self.viewer.cam.azimuth = 18.0, -35.0, 90.0
+                self.viewer.cam.lookat[:] = [0, 0, 0.8]
+                self.viewer.cam.distance = 18.0
+                self.viewer.cam.elevation = -35.0
+                self.viewer.cam.azimuth = 90.0
         with self.viewer.lock():
             self.viewer.user_scn.ngeom = 0
             for ak in self.agent_keys:
-                sid = self.body_ids[ak]; pos = self.data.xpos[sid]; rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]['rot']]]
+                sid = self.body_ids[ak]
+                pos = self.data.xpos[sid]
+                rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]['rot']]]
                 t_val = self.last_debug_ctrl[ak][1]
-                if self.show_turn_lines and abs(t_val) > 0.005:
+                # デバッグ可視化はdebug_logger.enabledで制御
+                if self.debug_logger.enabled and self.show_turn_lines and abs(t_val) > 0.005:
                     is_seeker = ak.startswith("s")
                     h = 1.1 if is_seeker else 1.3
                     color = [0, 1, 1, 1.0] if is_seeker else [0, 0.2, 1, 1.0]
-                    p_start = pos.copy(); p_start[2] = h; p_end = p_start.copy()
-                    p_end[0] += -math.sin(rot) * t_val * 2.0; p_end[1] += math.cos(rot) * t_val * 2.0
+                    p_start = pos.copy()
+                    p_start[2] = h
+                    p_end = p_start.copy()
+                    p_end[0] += -math.sin(rot) * t_val * 2.0
+                    p_end[1] += math.cos(rot) * t_val * 2.0
                     if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
                         g = self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom]
                         mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 8.0 + abs(t_val)*25, p_start, p_end)

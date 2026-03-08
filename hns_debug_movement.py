@@ -120,11 +120,12 @@ def _build_xml(n_seekers, n_hiders, n_boxes, n_ramps):
 class TeamCosEnv(gym.Env):
     def __init__(self, mode="initial", target="hider", 
                  n_seekers=1, n_hiders=2, n_boxes=2, n_ramps=1,
-                 render_mode=None):
+                 render_mode=None, action_repeat=16):
         super().__init__()
         self.mode, self.target, self.render_mode = mode, target, render_mode
         self.counts = {"s": n_seekers, "h": n_hiders, "box": n_boxes, "ramp": n_ramps}
         self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
+        self.action_repeat = action_repeat
 
         self.model = mujoco.MjModel.from_xml_string(_build_xml(n_seekers, n_hiders, n_boxes, n_ramps))
         self.data = mujoco.MjData(self.model)
@@ -256,7 +257,8 @@ class TeamCosEnv(gym.Env):
             cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = f, t
 
         self.data.ctrl[:] = cv
-        for _ in range(5): mujoco.mj_step(self.model, self.data)
+        for _ in range(self.action_repeat):
+            mujoco.mj_step(self.model, self.data)
         self._stabilize_interaction_poses()
         self._sync_visual_states()
 

@@ -1,14 +1,11 @@
-
-
-# --- すべてのimport文を最上部に集約 ---
-
+# main27_train_final.py
 import sys
 import os
 import time
-import math
 import argparse
 import traceback
 import numpy as np
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -97,6 +94,7 @@ def select_hparams(env_config, runtime_target):
 
 CONFIG_PATH = "configs/hparams_main27.toml"
 
+
 CLI_EXAMPLES = (
     "実行例:\n"
     "  1) 学習を実行する（TOMLで train を選択）\n"
@@ -114,8 +112,6 @@ CLI_EXAMPLES = (
     "  3) ヘルプと実行例を表示\n"
     "     uv run mjpython main27_train_final.py -h\n"
 )
-
-
 
 
 class ObsHistory:
@@ -515,11 +511,13 @@ ENV_CONFIG = {
     "policy_source_log": _cfg("POLICY_SOURCE_LOG", "0", _to_bool),
     "policy_source_log_each_reset": _cfg("POLICY_SOURCE_LOG_EACH_RESET", "0", _to_bool),
     "debug_log_interval_steps": _cfg("DEBUG_LOG_INTERVAL_STEPS", "200", int),
+    "action_repeat": _cfg("ACTION_REPEAT", "16", int),
 }
 
 SEQ_LEN = _cfg("SEQ_LEN", "8", int)
 HIDDEN_DIM = _cfg("HIDDEN_DIM", "128", int)
 NUM_ENVS = _cfg("NUM_ENVS", "4", int)
+ACTION_REPEAT = _cfg("ACTION_REPEAT", "16", int)
 
 WORKER_SHUTDOWN_ERRORS = (EOFError, BrokenPipeError, ConnectionResetError)
 
@@ -707,6 +705,7 @@ def model_path_for_config(target, config):
     fname = f"HNS_V27_{target}_s{config.get('n_seekers', 1)}_h{config.get('n_hiders', 2)}_b{config.get('n_boxes', 2)}_r{config.get('n_ramps', 1)}.pt"
     return os.path.join("checkpoints", fname)
 
+
 def build_env(mode, target, config, render_mode=None):
     return TeamCosEnv(
         mode=mode,
@@ -722,13 +721,11 @@ def _snapshot_state_dict_cpu(agent):
         for key, value in agent.state_dict().items()
     }
 
-
 def _normalize_policy_mode(value):
     text = str(value).strip().lower()
     if text in {"model", "model_if_available", "inference"}:
         return POLICY_MODEL_IF_AVAILABLE
     return POLICY_RULE
-
 
 def _resolve_runtime_target():
     if TRAIN_MODE:
