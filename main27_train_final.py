@@ -888,29 +888,32 @@ def run_debug_or_playback(env, agent, device, model_loaded):
     print("--- Start Simulation ---")
     print(f"Physics Step: {env.model.opt.timestep * 5}s")
 
-    for episode in range(PLAY_EPISODES):
+    # --- trainと同じlog_interval統計出力に統一 ---
+    log_interval = 1  # debug時は必ずUpd ...を出す
+    wall_dist_interval = 1000
+    num_episodes = PLAY_EPISODES
+    episode_rewards = []
+    hide_rates = []
+    wall_distance_buffer = []
+    lock_events_list = []
+    wall_stick_list = []
+    info_buffer = []
+    global_step = 0
+    debug_start_time = time.time()
+    steps_per_episode = None
+    num_updates = max(1, num_episodes // log_interval)
+    for episode in range(num_episodes):
         obs, _ = env.reset()
         history.prime_single(obs)
         done = False
         ep_reward = 0.0
         step_count = 0
         lock_events = 0
-        grab_events = 0
-        lock_events_window = 0
-        grab_events_window = 0
-        sat_count = 0
-        boosted_count = 0
-        action_sum_window = np.zeros(act_dim, dtype=np.float64)
-        action_sq_sum_window = np.zeros(act_dim, dtype=np.float64)
-        action_count_window = 0
-
-        if USE_VIEWER:
-            env.render()
-
+        wall_stick = 0.0
+        wall_dist = []
         while not done:
             if USE_VIEWER and env.viewer and not env.viewer.is_running():
                 return
-
             if NPC_ONLY_DEBUG and target_npc is not None:
                 action = target_npc.get_action(obs, idx)
             elif model_loaded:
@@ -923,89 +926,49 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                     action = out[0].cpu().numpy().reshape(-1)
             else:
                 action = np.zeros(env.action_space.shape, dtype=np.float32)
-
             next_obs, base_r, term, trun, info = env.step(action)
             reward = (
                 compute_custom_reward(obs, action, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
                 if USE_CUSTOM_REWARD else base_r
             )
-
             history.update(next_obs)
+            ep_reward += reward
+            step_count += 1
             lock_events += int(info.get("lock_event", 0))
-            grab_events += int(info.get("grab_event", 0))
-            lock_events_window += int(info.get("lock_event", 0))
-            grab_events_window += int(info.get("grab_event", 0))
-            boosted_count += int(info.get("dbg_boosted_agents", 0) > 0)
-            action_sum_window += action.astype(np.float64)
-            action_sq_sum_window += np.square(action.astype(np.float64))
-            action_count_window += 1
-            if float(np.max(np.abs(action[:2]))) >= 0.9:
-                sat_count += 1
-
+            wall_stick += float(info.get("wall_stick", 0.0))
+            if "wall_distance" in info:
+                wd = info["wall_distance"]
+                if isinstance(wd, (list, tuple, np.ndarray)):
+                    wall_dist.extend([float(v) for v in wd])
+                else:
+                    wall_dist.append(float(wd))
+            info_buffer.append(info)
             if USE_VIEWER:
                 env.render()
                 time.sleep(0.025)
-
             obs = next_obs
-            ep_reward += reward
-            step_count += 1
             done = bool(term or trun)
-
-            if step_count % 100 == 0:
-                action_mean_window = action_sum_window / max(action_count_window, 1)
-                action_var_window = np.maximum(
-                    action_sq_sum_window / max(action_count_window, 1) - np.square(action_mean_window),
-                    0.0,
-                )
-                action_std_window = np.sqrt(action_var_window)
-
-                move_v = float(action[0]) if action.shape[0] > 0 else 0.0
-                turn_v = float(action[1]) if action.shape[0] > 1 else 0.0
-                lock_v = float(action[2]) if action.shape[0] > 2 else 0.0
-                grab_v = float(action[3]) if action.shape[0] > 3 else 0.0
-
-                print(
-                    "Ep "
-                    f"{episode} - Step {step_count} | "
-                    f"Move={move_v:.2f} "
-                    f"Turn={turn_v:.2f} "
-                    f"LockAct={lock_v:.2f} "
-                    f"GrabAct={grab_v:.2f} "
-                    f"ActMean=[{action_mean_window[0]:.2f},{action_mean_window[1]:.2f},{action_mean_window[2]:.2f},{action_mean_window[3]:.2f}] "
-                    f"ActStd=[{action_std_window[0]:.2f},{action_std_window[1]:.2f},{action_std_window[2]:.2f},{action_std_window[3]:.2f}] "
-                    f"LockBtnMax={info.get('dbg_lock_btn_max', 0.0):.2f} "
-                    f"GrabBtnMax={info.get('dbg_grab_btn_max', 0.0):.2f} "
-                    f"LockPressed={int(info.get('dbg_lock_pressed', 0))} "
-                    f"GrabPressed={int(info.get('dbg_grab_pressed', 0))} "
-                    f"LockTarget={int(info.get('dbg_lock_target', 0))} "
-                    f"GrabTarget={int(info.get('dbg_grab_target', 0))} "
-                    f"LockEvt={int(info.get('lock_event', 0))} "
-                    f"GrabEvt={int(info.get('grab_event', 0))} "
-                    f"WinLock={lock_events_window} "
-                    f"WinGrab={grab_events_window} "
-                    f"CumLock={lock_events} "
-                    f"CumGrab={grab_events} "
-                    f"BoxMove={int(info.get('dbg_box_moving_count', 0))} "
-                    f"RampMove={int(info.get('dbg_ramp_moving_count', 0))} "
-                    f"MaxBoxV={float(info.get('dbg_max_box_speed', 0.0)):.2f} "
-                    f"MaxRampV={float(info.get('dbg_max_ramp_speed', 0.0)):.2f} "
-                    f"BlockedRamp={int(info.get('dbg_blocked_ramp_count', 0))} "
-                    f"Boosted={int(info.get('dbg_boosted_agents', 0))} "
-                    f"OverrideLP={int(info.get('dbg_override_learnable_policy', 0))} "
-                    f"ModelDet={int(info.get('dbg_model_policy_deterministic', 1))}"
-                )
-                lock_events_window = 0
-                grab_events_window = 0
-                action_sum_window.fill(0.0)
-                action_sq_sum_window.fill(0.0)
-                action_count_window = 0
-
-        print(
-            f"Ep {episode} Finished. Steps={step_count}, Reward={ep_reward:.2f}, "
-            f"LockEvents={lock_events}, GrabEvents={grab_events}, "
-            f"ActSatRatio={sat_count / max(step_count, 1):.2f}, "
-            f"BoostUseRatio={boosted_count / max(step_count, 1):.2f}"
-        )
+        episode_rewards.append(ep_reward)
+        hide_rates.append(float(info.get("hide_rate", 0.0)))
+        lock_events_list.append(lock_events)
+        wall_stick_list.append(wall_stick / max(step_count, 1))
+        wall_distance_buffer.extend(wall_dist)
+        global_step += step_count
+        if steps_per_episode is None:
+            steps_per_episode = step_count
+        # log_intervalごとに統計出力
+        if (episode + 1) % log_interval == 0:
+            elapsed = time.time() - debug_start_time
+            sps = int(global_step / elapsed) if elapsed > 0 else 0
+            avg_reward = np.mean(episode_rewards[-log_interval:])
+            avg_hide = np.mean(hide_rates[-log_interval:])
+            avg_wall_stick = np.mean(wall_stick_list[-log_interval:])
+            print(f"Upd {(episode + 1) // log_interval}/{num_updates} Step={global_step} SPS={sps} HideRate={avg_hide:.2f} WallStick={avg_wall_stick:.2f} AvgR={avg_reward:.3f}")
+        # wall_distance統計出力
+        if global_step % wall_dist_interval == 0 and wall_distance_buffer:
+            arr = np.array(wall_distance_buffer, dtype=np.float32)
+            print(f"[WallDist] step={global_step} mean={np.mean(arr):.3f} min={np.min(arr):.3f} max={np.max(arr):.3f}")
+            wall_distance_buffer.clear()
 
 
 def run_train(
@@ -1636,11 +1599,12 @@ def run_train_vector(
                                 wall_distance_buffer.append(float(v))
                         else:
                             wall_distance_buffer.append(float(wd))
-            if global_step % 1000 == 0 and wall_distance_buffer:
+            if update % hp["log_interval"] == 0 and wall_distance_buffer:
                 arr = np.array(wall_distance_buffer, dtype=np.float32)
                 print(f"[WallDist] step={global_step} mean={np.mean(arr):.3f} min={np.min(arr):.3f} max={np.max(arr):.3f}")
                 wall_distance_buffer.clear()
-            info_buffer.clear()
+            if update % hp["log_interval"] == 0:
+                info_buffer.clear()
 
             if update % hp["save_interval"] == 0:
                 _atomic_save(model_path)

@@ -30,25 +30,12 @@ class DebugLogger:
             print(message)
 
     def print_throttled(self, key, message, current_step, force=False):
-        if not self.enabled:
-            return
-        if force:
-            print(message)
-            self._log_last_step[key] = int(current_step)
-            return
-        now = int(current_step)
-        last = int(self._log_last_step.get(key, -10**9))
-        if (now - last) < self.log_interval_steps:
-            return
-        print(message)
-        self._log_last_step[key] = now
+        # debug統計以外の出力は抑制
+        return
 
     def log_policy_source(self, agent_key, source, current_step, force=False):
-        key = (agent_key, source)
-        if key in self._policy_source_logged:
-            return
-        self.print_throttled(f"policy_source:{agent_key}:{source}", f"policy_source[{agent_key}] = {source}", current_step, force=force)
-        self._policy_source_logged.add(key)
+        # policy_sourceログも抑制
+        return
 
     def clear_policy_source_log(self):
         self._policy_source_logged.clear()
@@ -112,6 +99,43 @@ def _blocked_by_static_walls_numba(p1x, p1y, p2x, p2y, walls, margin):
 
 
 class TeamCosEnv(gym.Env):
+    # --- 統計バッファ初期化 ---
+    def _init_debug_stats(self):
+        self._debug_reward_buffer = []
+        self._debug_hide_buffer = []
+        self._debug_wall_distance_buffer = []
+        self._debug_step_counter = 0
+        self._debug_log_interval = getattr(self, 'debug_logger', None) and getattr(self.debug_logger, 'log_interval_steps', 100) or 100
+
+    def _debug_collect_stats(self, reward, info):
+        if not self.debug_mode:
+            return
+        self._debug_reward_buffer.append(reward)
+        # 隠れ率: is_detected==False なら隠れているとみなす
+        self._debug_hide_buffer.append(0 if info.get('is_detected', False) else 1)
+        wd = info.get('wall_distance', None)
+        if wd is not None:
+            if isinstance(wd, (list, tuple, np.ndarray)):
+                self._debug_wall_distance_buffer.extend([float(v) for v in wd])
+            else:
+                self._debug_wall_distance_buffer.append(float(wd))
+        self._debug_step_counter += 1
+        # log_intervalごとに統計出力
+        if self._debug_step_counter % self._debug_log_interval == 0:
+            self._debug_print_stats()
+
+    def _debug_print_stats(self):
+        if not self.debug_mode:
+            return
+        n = max(len(self._debug_reward_buffer), 1)
+        avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
+        hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
+        wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
+        print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} WallDist(mean/min/max)={wd_arr.mean():.3f}/{wd_arr.min():.3f}/{wd_arr.max():.3f}")
+        self._debug_reward_buffer.clear()
+        self._debug_hide_buffer.clear()
+        self._debug_wall_distance_buffer.clear()
+
     """
     Hide and Seek 高度物理環境 (単一エージェント学習最適化版)
     """
@@ -171,6 +195,7 @@ class TeamCosEnv(gym.Env):
         self.debug_mode = debug_mode
         self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=debug_log_interval_steps)
         self.action_repeat = action_repeat
+        self._init_debug_stats()
         if self.n_seekers == 1:
             self.seeker_keys = ["s"]
         else:
@@ -669,51 +694,111 @@ class TeamCosEnv(gym.Env):
             return False, grab_evt
         return False, False
 
+
+    # ---
+    # 旧実装: 複雑なGrab/Lock拘束ロジック
+    # 復元用にコメントアウトで保存
+    # def _apply_object_constraints(self):
+    #     for ak in self.agent_keys:
+    #         if self.btn_cooldown[ak] > 0:
+    #             self.btn_cooldown[ak] -= 1
+    #     for tk, st in self.object_state.items():
+    #         qadr, vadr = self._obj_addr(tk)
+    #         if st["mode"] == "locked" and st["locked_pose"] is not None:
+    #             self.data.qpos[qadr:qadr+7] = st["locked_pose"]
+    #             self.data.qvel[vadr:vadr+6] = 0.0
+    #         elif st["mode"] == "grabbed" and st["owner"] is not None:
+    #             owner = st["owner"]
+    #             opos = self.data.xpos[self.body_ids[owner]][:2]
+    #             cur_xy = self.data.qpos[qadr:qadr+2].copy()
+    #             grab_dist = float(np.linalg.norm(cur_xy - opos))
+    #             if grab_dist > self.GRAB_BREAK_DIST or self._interaction_blocked_by_static_walls(opos, cur_xy):
+    #                 st["mode"] = "free"
+    #                 st["owner"] = None
+    #                 self.data.qvel[vadr:vadr+2] *= 0.5
+    #                 continue
+    #             rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[owner]['rot']]]
+    #             target_xy = opos + np.array([math.cos(rot), math.sin(rot)]) * self.GRAB_OFFSET
+    #             err_xy = target_xy - cur_xy
+    #             desired_xy = np.clip(
+    #                 err_xy * self.GRAB_FOLLOW_GAIN,
+    #                 -self.GRAB_MAX_SPEED,
+    #                 self.GRAB_MAX_SPEED,
+    #             )
+    #             owner_xy = self.data.qvel[
+    #                 self.model.jnt_dofadr[self.qpos_indices[owner]['x']]:
+    #                 self.model.jnt_dofadr[self.qpos_indices[owner]['x']] + 2
+    #             ]
+    #             self.data.qvel[vadr:vadr+2] = 0.75 * desired_xy + 0.25 * owner_xy
+    #             self.data.qvel[vadr+2] = 0.0
+    #             self.data.qvel[vadr+3:vadr+6] *= 0.6
+    #         else:
+    #             self.data.qvel[vadr:vadr+2] *= self.FREE_OBJ_LINEAR_DAMP
+    #             speed_xy = float(np.linalg.norm(self.data.qvel[vadr:vadr+2]))
+    #             if speed_xy < self.FREE_OBJ_STOP_EPS:
+    #                 self.data.qvel[vadr:vadr+2] = 0.0
+    #
+    #         if self.OBJECT_PLANAR_LOCK and st["planar_z"] is not None:
+    #             self.data.qpos[qadr + 2] = st["planar_z"]
+    #             self.data.qpos[qadr + 3:qadr + 7] = st["planar_quat"]
+    #             self.data.qvel[vadr + 2] = 0.0
+    #             self.data.qvel[vadr + 3:vadr + 6] = 0.0
+    #     for tk, geom_ids in self.obj_geom_ids.items():
+    #         mode = self.object_state[tk]["mode"]
+    #         if mode == "locked":
+    #             rgba = np.array([0.2, 0.2, 0.2, 1.0])
+    #         elif mode == "grabbed":
+    #             rgba = np.array([1.0, 0.85, 0.1, 1.0])
+    #         else:
+    #             rgba = self.obj_default_rgba[tk]
+    #         for gid in geom_ids:
+    #             self.model.geom_rgba[gid] = rgba
+
     def _apply_object_constraints(self):
+        """
+        より単純なGrab/Lock拘束ロジック。
+        - Grab: ownerの位置に線形追従（弱い溶接的）
+        - Lock: pose固定
+        - Free: 減衰のみ
+        マジックナンバーは定数化。
+        """
+        # --- 定数定義 ---
+        POSE_SIZE = 7  # qposのpose成分長
+        VEL_SIZE = 6   # qvelの成分長
+        XY_START, XY_STOP = 0, 2  # x, y成分
+        Z_IDX = 2
+        QUAT_START, QUAT_STOP = 3, 7
+        XY_VEL_START, XY_VEL_STOP = 0, 2
+        Z_VEL_IDX = 2
+        ANG_VEL_START, ANG_VEL_STOP = 3, 6
+
         for ak in self.agent_keys:
             if self.btn_cooldown[ak] > 0:
                 self.btn_cooldown[ak] -= 1
         for tk, st in self.object_state.items():
             qadr, vadr = self._obj_addr(tk)
             if st["mode"] == "locked" and st["locked_pose"] is not None:
-                self.data.qpos[qadr:qadr+7] = st["locked_pose"]
-                self.data.qvel[vadr:vadr+6] = 0.0
+                self.data.qpos[qadr:qadr+POSE_SIZE] = st["locked_pose"]
+                self.data.qvel[vadr:vadr+VEL_SIZE] = 0.0
             elif st["mode"] == "grabbed" and st["owner"] is not None:
                 owner = st["owner"]
-                opos = self.data.xpos[self.body_ids[owner]][:2]
-                cur_xy = self.data.qpos[qadr:qadr+2].copy()
-                grab_dist = float(np.linalg.norm(cur_xy - opos))
-                if grab_dist > self.GRAB_BREAK_DIST or self._interaction_blocked_by_static_walls(opos, cur_xy):
-                    st["mode"] = "free"
-                    st["owner"] = None
-                    self.data.qvel[vadr:vadr+2] *= 0.5
-                    continue
-                rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[owner]['rot']]]
-                target_xy = opos + np.array([math.cos(rot), math.sin(rot)]) * self.GRAB_OFFSET
-                err_xy = target_xy - cur_xy
-                desired_xy = np.clip(
-                    err_xy * self.GRAB_FOLLOW_GAIN,
-                    -self.GRAB_MAX_SPEED,
-                    self.GRAB_MAX_SPEED,
-                )
-                owner_xy = self.data.qvel[
-                    self.model.jnt_dofadr[self.qpos_indices[owner]['x']]:
-                    self.model.jnt_dofadr[self.qpos_indices[owner]['x']] + 2
-                ]
-                self.data.qvel[vadr:vadr+2] = 0.75 * desired_xy + 0.25 * owner_xy
-                self.data.qvel[vadr+2] = 0.0
-                self.data.qvel[vadr+3:vadr+6] *= 0.6
+                opos = self.data.xpos[self.body_ids[owner]][XY_START:XY_STOP]
+                cur_xy = self.data.qpos[qadr:qadr+POSE_SIZE][XY_START:XY_STOP].copy()
+                err_xy = opos - cur_xy
+                self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = err_xy  # 速度を直接目標方向に
+                self.data.qvel[vadr:vadr+VEL_SIZE][Z_VEL_IDX] = 0.0
+                self.data.qvel[vadr:vadr+VEL_SIZE][ANG_VEL_START:ANG_VEL_STOP] = 0.0
             else:
-                self.data.qvel[vadr:vadr+2] *= self.FREE_OBJ_LINEAR_DAMP
-                speed_xy = float(np.linalg.norm(self.data.qvel[vadr:vadr+2]))
-                if speed_xy < self.FREE_OBJ_STOP_EPS:
-                    self.data.qvel[vadr:vadr+2] = 0.0
-
-            if self.OBJECT_PLANAR_LOCK and st["planar_z"] is not None:
-                self.data.qpos[qadr + 2] = st["planar_z"]
-                self.data.qpos[qadr + 3:qadr + 7] = st["planar_quat"]
-                self.data.qvel[vadr + 2] = 0.0
-                self.data.qvel[vadr + 3:vadr + 6] = 0.0
+                self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP] *= 0.9
+                speed_xy = float(np.linalg.norm(self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP]))
+                if speed_xy < 1e-3:
+                    self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = 0.0
+            # Planar lock
+            if self.OBJECT_PLANAR_LOCK and st.get("planar_z") is not None:
+                self.data.qpos[qadr + Z_IDX] = st["planar_z"]
+                self.data.qpos[qadr + QUAT_START : qadr + QUAT_STOP] = st["planar_quat"]
+                self.data.qvel[vadr + Z_VEL_IDX] = 0.0
+                self.data.qvel[vadr + ANG_VEL_START : vadr + ANG_VEL_STOP] = 0.0
         for tk, geom_ids in self.obj_geom_ids.items():
             mode = self.object_state[tk]["mode"]
             if mode == "locked":
@@ -977,33 +1062,34 @@ class TeamCosEnv(gym.Env):
                learnable_agent_pos[1]
         )
         
-        return (self._normalize_obs(self._get_obs(idx_to_obs)), 
-                float(rb if self.target == "hider" else -rb), 
-                False, 
-                self.current_step >= self.max_episode_steps, 
-                {
-                    "is_detected": find,
-                    "lock_event": any_lock_event,
-                    "grab_event": any_grab_event,
-                    "dbg_lock_pressed": any_lock_pressed,
-                    "dbg_grab_pressed": any_grab_pressed,
-                    "dbg_lock_target": any_lock_target,
-                    "dbg_grab_target": any_grab_target,
-                    "dbg_lock_btn_max": max_lock_btn,
-                    "dbg_grab_btn_max": max_grab_btn,
-                    "dbg_box_moving_count": moving_box_count,
-                    "dbg_ramp_moving_count": moving_ramp_count,
-                    "dbg_max_box_speed": float(max(box_speeds) if box_speeds else 0.0),
-                    "dbg_max_ramp_speed": float(max(ramp_speeds) if ramp_speeds else 0.0),
-                    "dbg_blocked_ramp_count": blocked_ramp_count,
-                    "dbg_boosted_agents": boosted_agents,
-                    "dbg_override_learnable_policy": bool(self.override_learnable_policy),
-                    "dbg_model_policy_deterministic": bool(self.model_policy_deterministic),
-                    "dbg_seek_gaze_cos_front_max": float(gaze_cos_front_max),
-                    "dbg_seek_gaze_cos_front_dist_max": float(gaze_cos_front_dist_max),
-                    "dbg_learnable_hider_seen": bool(learnable_hider_seen),
-                    "wall_distance": wall_dist,
-                })
+        obs = self._normalize_obs(self._get_obs(idx_to_obs))
+        reward = float(rb if self.target == "hider" else -rb)
+        done = self.current_step >= self.max_episode_steps
+        info = {
+            "is_detected": find,
+            "lock_event": any_lock_event,
+            "grab_event": any_grab_event,
+            "dbg_lock_pressed": any_lock_pressed,
+            "dbg_grab_pressed": any_grab_pressed,
+            "dbg_lock_target": any_lock_target,
+            "dbg_grab_target": any_grab_target,
+            "dbg_lock_btn_max": max_lock_btn,
+            "dbg_grab_btn_max": max_grab_btn,
+            "dbg_box_moving_count": moving_box_count,
+            "dbg_ramp_moving_count": moving_ramp_count,
+            "dbg_max_box_speed": float(max(box_speeds) if box_speeds else 0.0),
+            "dbg_max_ramp_speed": float(max(ramp_speeds) if ramp_speeds else 0.0),
+            "dbg_blocked_ramp_count": blocked_ramp_count,
+            "dbg_boosted_agents": boosted_agents,
+            "dbg_override_learnable_policy": bool(self.override_learnable_policy),
+            "dbg_model_policy_deterministic": bool(self.model_policy_deterministic),
+            "dbg_seek_gaze_cos_front_max": float(gaze_cos_front_max),
+            "dbg_seek_gaze_cos_front_dist_max": float(gaze_cos_front_dist_max),
+            "dbg_learnable_hider_seen": bool(learnable_hider_seen),
+            "wall_distance": wall_dist,
+        }
+        self._debug_collect_stats(reward, info)
+        return obs, reward, False, done, info
 
     def _compute_team_reward(self):
         if self.current_step <= self.prep_steps:
