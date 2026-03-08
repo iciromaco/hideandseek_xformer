@@ -33,63 +33,118 @@ sys.path.append(
     os.path.abspath(
         os.path.join(os.path.dirname(__file__), "src")
     )
-)
-
-
+)   
 # --- 必要な独自モジュール ---
 from envs.hns_environment import TeamCosEnv
 from models.ppo_transformer_v2 import AgentV2
 from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
 
 
-# --- ここから定数・関数・本体 ---
-
-# --- ポリシーモード定数 ---
+ # --- ポリシーモード定数 ---
 POLICY_MODEL_IF_AVAILABLE = "model_if_available"
 POLICY_RULE = "rule"
 
 
-# --- ユーティリティ関数 ---
-def init_wandb_run(hp, model_path, runtime_target):
-    """
-    wandbのランを初期化して返す（暫定実装）。必要に応じて設定を拡張してください。
-    """
-    if wandb is None:
-        return None
-    run_name = WANDB_RUN_NAME or f"{runtime_target}_{os.path.basename(model_path)}"
-    return wandb.init(
-        project=WANDB_PROJECT,
-        entity=WANDB_ENTITY or None,
-        name=run_name,
-        config=hp,
-        mode=WANDB_MODE,
-        dir=WANDB_CODE_ROOT,
-        save_code=WANDB_LOG_CODE,
-        reinit=True,
+
+CONFIG_PATH = "configs/hparams_main27.toml"
+
+# CLI_PROFILE_OVERRIDE等の初期化を先に
+def _cli_profile_override_from_argv(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    for i, token in enumerate(args):
+        if token.startswith("--profile="):
+            return token.split("=", 1)[1]
+        if token in {"--profile", "-p"}:
+            if i + 1 < len(args):
+                return args[i + 1]
+    return None
+
+CLI_PROFILE_OVERRIDE = _cli_profile_override_from_argv()
+
+
+
+# AVAILABLE_RUNTIME_PROFILESを先に初期化
+def _get_available_runtime_profiles(path):
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+        runtime_cfg = raw.get("runtime", {}) if isinstance(raw, dict) else {}
+        names = {"train", "debug"}
+        if isinstance(runtime_cfg, dict):
+            for key, value in runtime_cfg.items():
+                if key in {"active_profile", "common"}:
+                    continue
+                if isinstance(value, dict):
+                    names.add(str(key).strip().lower())
+        return sorted(names)
+    except Exception as exc:
+        print(f"Exception in _get_available_runtime_profiles: {exc}")
+        return ["train", "debug"]
+
+AVAILABLE_RUNTIME_PROFILES = _get_available_runtime_profiles("configs/hparams_main27.toml")
+
+def _normalize_profile_name(value):
+    text = str(value).strip().lower()
+    if text in AVAILABLE_RUNTIME_PROFILES:
+        return text
+    print(
+        f"Invalid runtime.active_profile={value}. "
+        f"Fallback to train. available={AVAILABLE_RUNTIME_PROFILES}"
     )
+    return "train"
 
+def _load_runtime_config(path, profile_override=None):
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+        runtime_cfg = raw.get("runtime", {}) if isinstance(raw, dict) else {}
+        if not isinstance(runtime_cfg, dict):
+            runtime_cfg = {}
+        profile_value = (
+            profile_override
+            if profile_override is not None
+            else runtime_cfg.get("active_profile", "train")
+        )
+        profile_origin = (
+            "cli(--profile)" if profile_override is not None else "toml(runtime.active_profile)"
+        )
+        profile = _normalize_profile_name(profile_value)
+        common = (
+            runtime_cfg.get("common", {}) if isinstance(runtime_cfg, dict) else {}
+        )
+        profile_cfg = (
+            runtime_cfg.get(profile, {}) if isinstance(runtime_cfg, dict) else {}
+        )
+        if not isinstance(common, dict):
+            common = {}
+        if not isinstance(profile_cfg, dict):
+            profile_cfg = {}
+        merged = dict(common)
+        merged.update(profile_cfg)
+        return merged, profile, profile_origin
+    except Exception as exc:
+        raise SystemExit(
+            f"runtime config load failed: {path} ({exc}). "
+            "Fix the TOML and retry."
+        ) from exc
 
-def select_hparams(env_config, runtime_target):
-    """
-    環境設定とターゲットに応じたハイパーパラメータ辞書を返す（暫定実装）
-    必要に応じて詳細なロジックに拡張してください。
-    """
-    # ここではENV_CONFIGとTRAIN_MODE等から最低限のパラメータを組み立てる例
-    return {
-        "total_timesteps": TOTAL_TIMESTEPS,
-        "rollout_steps": ROLLOUT_STEPS,
-        "update_epochs": UPDATE_EPOCHS,
-        "minibatch_size": MINIBATCH_SIZE,
-        "learning_rate": LEARNING_RATE,
-        "gamma": GAMMA,
-        "gae_lambda": GAE_LAMBDA,
-        "clip_coef": CLIP_COEF,
-        "vf_coef": VF_COEF,
-        "ent_coef": ENT_COEF,
-        "max_grad_norm": MAX_GRAD_NORM,
-        "log_interval": LOG_INTERVAL,
-        "save_interval": SAVE_INTERVAL,
-    }
+with open(CONFIG_PATH, "rb") as f:
+    config = tomllib.load(f)
+
+RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(
+    CONFIG_PATH, CLI_PROFILE_OVERRIDE
+)
+
+# ここでhpを構築
+hp = dict(config.get("base", {}))
+runtime_common = config.get("runtime", {}).get("common", {})
+if runtime_common:
+    hp.update(runtime_common)
+runtime_profile = config.get("runtime", {}).get(RUN_PROFILE, {})
+if runtime_profile:
+    hp.update(runtime_profile)
+if RUNTIME_OVERRIDES:
+    hp.update(RUNTIME_OVERRIDES)
 
 
 CONFIG_PATH = "configs/hparams_main27.toml"
@@ -460,9 +515,7 @@ def _load_runtime_config(path, profile_override=None):
         ) from exc
 
 
-RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(
-    CONFIG_PATH, CLI_PROFILE_OVERRIDE
-)
+
 
 
 def _to_bool(value):
@@ -481,103 +534,87 @@ def _cfg(name, default, cast=None):
     return cast(raw)
 
 
-TRAIN_MODE = _cfg("TRAIN_MODE", "0", _to_bool)
-USE_VIEWER = _cfg("USE_VIEWER", "1", _to_bool)
-NPC_ONLY_DEBUG = _cfg("NPC_ONLY_DEBUG", "1", _to_bool)
-SHOW_TURN_LINES = _cfg("SHOW_TURN_LINES", "0", _to_bool)
-USE_CUSTOM_REWARD = _cfg("USE_CUSTOM_REWARD", "1", _to_bool)
-AUTO_TUNE_HPARAMS = _cfg("AUTO_TUNE_HPARAMS", "1", _to_bool)
-DEBUG_HIDER_POLICY = _cfg("DEBUG_HIDER_POLICY", "rule", str)
-DEBUG_SEEKER_POLICY = _cfg("DEBUG_SEEKER_POLICY", "rule", str)
-DEBUG_DETERMINISTIC_INFERENCE = _cfg("DEBUG_DETERMINISTIC_INFERENCE", "0", _to_bool)
-DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("DEBUG_SYMMETRIC_HIDER_POLICY", "0", _to_bool)
-TRAIN_OTHER_HIDER_POLICY = _cfg("TRAIN_OTHER_HIDER_POLICY", "rule", str)
-TRAIN_OTHER_SEEKER_POLICY = _cfg("TRAIN_OTHER_SEEKER_POLICY", "rule", str)
+
+TRAIN_MODE = _cfg("train_mode", "0", _to_bool)
+USE_VIEWER = _cfg("use_viewer", "1", _to_bool)
+NPC_ONLY_DEBUG = _cfg("npc_only_debug", "1", _to_bool)
+SHOW_TURN_LINES = _cfg("show_turn_lines", "0", _to_bool)
+USE_CUSTOM_REWARD = _cfg("use_custom_reward", "1", _to_bool)
+AUTO_TUNE_HPARAMS = _cfg("auto_tune_hparams", "1", _to_bool)
+DEBUG_HIDER_POLICY = _cfg("debug_hider_policy", "rule", str)
+DEBUG_SEEKER_POLICY = _cfg("debug_seeker_policy", "rule", str)
+DEBUG_DETERMINISTIC_INFERENCE = _cfg("debug_deterministic_inference", "0", _to_bool)
+DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("debug_symmetric_hider_policy", "0", _to_bool)
+TRAIN_OTHER_HIDER_POLICY = _cfg("train_other_hider_policy", "rule", str)
+TRAIN_OTHER_SEEKER_POLICY = _cfg("train_other_seeker_policy", "rule", str)
 
 if not TRAIN_MODE:
     USE_VIEWER = True
     AUTO_TUNE_HPARAMS = False
 
-MODE = _cfg("MODE", "refinement", str)
-TRAINING_TARGET = _cfg("TRAINING_TARGET", "seeker", str)
+MODE = _cfg("mode", "refinement", str)
+TRAINING_TARGET = _cfg("training_target", "seeker", str)
 
 ENV_CONFIG = {
-    "n_seekers": _cfg("N_SEEKERS", "1", int),
-    "n_hiders": _cfg("N_HIDERS", "2", int),
-    "n_boxes": _cfg("N_BOXES", "2", int),
-    "n_ramps": _cfg("N_RAMPS", "1", int),
-    "mode4_sdf_cell_size": _cfg("MODE4_SDF_CELL_SIZE", "0.05", float),
+    "n_seekers": _cfg("n_seekers", "1", int),
+    "n_hiders": _cfg("n_hiders", "2", int),
+    "n_boxes": _cfg("n_boxes", "2", int),
+    "n_ramps": _cfg("n_ramps", "1", int),
+    "mode4_sdf_cell_size": _cfg("mode4_sdf_cell_size", "0.05", float),
     "show_turn_lines": SHOW_TURN_LINES,
-    "policy_source_log": _cfg("POLICY_SOURCE_LOG", "0", _to_bool),
-    "policy_source_log_each_reset": _cfg("POLICY_SOURCE_LOG_EACH_RESET", "0", _to_bool),
-    "debug_log_interval_steps": _cfg("DEBUG_LOG_INTERVAL_STEPS", "200", int),
-    "action_repeat": _cfg("ACTION_REPEAT", "16", int),
+    "policy_source_log": _cfg("policy_source_log", "0", _to_bool),
+    "policy_source_log_each_reset": _cfg("policy_source_log_each_reset", "0", _to_bool),
+    "debug_log_interval_steps": _cfg("debug_log_interval_steps", "200", int),
+    "action_repeat": _cfg("action_repeat", "16", int),
 }
 
-SEQ_LEN = _cfg("SEQ_LEN", "8", int)
-HIDDEN_DIM = _cfg("HIDDEN_DIM", "128", int)
-NUM_ENVS = _cfg("NUM_ENVS", "8", int)
-ACTION_REPEAT = _cfg("ACTION_REPEAT", "10", int)
+SEQ_LEN = _cfg("seq_len", "16", int)
+HIDDEN_DIM = _cfg("hidden_dim", "256", int)
+NUM_ENVS = _cfg("num_envs", "8", int)
+ACTION_REPEAT = _cfg("action_repeat", "10", int)
 
 WORKER_SHUTDOWN_ERRORS = (EOFError, BrokenPipeError, ConnectionResetError)
 
-TOTAL_TIMESTEPS = _cfg("TOTAL_TIMESTEPS", "300000", int)
-ROLLOUT_STEPS = _cfg("ROLLOUT_STEPS", "128", int)
-UPDATE_EPOCHS = _cfg("UPDATE_EPOCHS", "4", int)
-MINIBATCH_SIZE = _cfg("MINIBATCH_SIZE", "64", int)
-LEARNING_RATE = _cfg("LEARNING_RATE", "3e-4", float)
-GAMMA = _cfg("GAMMA", "0.995", float)
-GAE_LAMBDA = _cfg("GAE_LAMBDA", "0.95", float)
-CLIP_COEF = _cfg("CLIP_COEF", "0.2", float)
-VF_COEF = _cfg("VF_COEF", "0.5", float)
-ENT_COEF = _cfg("ENT_COEF", "0.001", float)
-MAX_GRAD_NORM = _cfg("MAX_GRAD_NORM", "0.5", float)
+RAMP_CHECK_ENABLED = _cfg("ramp_check_enabled", "1", _to_bool)
+RAMP_CHECK_INTERVAL = _cfg("ramp_check_interval", str(hp["save_interval"]) if "save_interval" in hp else "50", int)
+RAMP_CHECK_EPISODES = _cfg("ramp_check_episodes", "3", int)
+RAMP_CHECK_STEPS = _cfg("ramp_check_steps", "220", int)
+RAMP_CHECK_VIEWER = _cfg("ramp_check_viewer", "0", _to_bool)
+RAMP_CHECK_FORCE_UPHILL = _cfg("ramp_check_force_uphill", "1", _to_bool)
+RAMP_SUCCESS_PROG = _cfg("ramp_success_prog", "0.90", float)
+RAMP_SUCCESS_TOP = _cfg("ramp_success_top", "0.05", float)
+RAMP_SUCCESS_LAT = _cfg("ramp_success_lat", "0.75", float)
+RAMP_SUCCESS_Z_RISE = _cfg("ramp_success_z_rise", "0.18", float)
 
-# 再生/デバッグ（TRAIN_MODE=False）のエピソード数
-PLAY_EPISODES = _cfg("PLAY_EPISODES", "100", int)
-LOG_INTERVAL = _cfg("LOG_INTERVAL", "10", int)
-SAVE_INTERVAL = _cfg("SAVE_INTERVAL", "50", int)
-
-RAMP_CHECK_ENABLED = _cfg("RAMP_CHECK_ENABLED", "1", _to_bool)
-RAMP_CHECK_INTERVAL = _cfg("RAMP_CHECK_INTERVAL", str(SAVE_INTERVAL), int)
-RAMP_CHECK_EPISODES = _cfg("RAMP_CHECK_EPISODES", "3", int)
-RAMP_CHECK_STEPS = _cfg("RAMP_CHECK_STEPS", "220", int)
-RAMP_CHECK_VIEWER = _cfg("RAMP_CHECK_VIEWER", "0", _to_bool)
-RAMP_CHECK_FORCE_UPHILL = _cfg("RAMP_CHECK_FORCE_UPHILL", "1", _to_bool)
-RAMP_SUCCESS_PROG = _cfg("RAMP_SUCCESS_PROG", "0.90", float)
-RAMP_SUCCESS_TOP = _cfg("RAMP_SUCCESS_TOP", "0.05", float)
-RAMP_SUCCESS_LAT = _cfg("RAMP_SUCCESS_LAT", "0.75", float)
-RAMP_SUCCESS_Z_RISE = _cfg("RAMP_SUCCESS_Z_RISE", "0.18", float)
-
-WANDB_ENABLED = _cfg("WANDB_ENABLED", "1", _to_bool)
-WANDB_PROJECT = _cfg("WANDB_PROJECT", "hideandseek-xformer", str)
-WANDB_ENTITY = _cfg("WANDB_ENTITY", "", str)
-WANDB_MODE = _cfg("WANDB_MODE", "online", str)
-WANDB_RUN_NAME = _cfg("WANDB_RUN_NAME", "", str)
-WANDB_LOG_CODE = _cfg("WANDB_LOG_CODE", "1", _to_bool)
-WANDB_CODE_ROOT = _cfg("WANDB_CODE_ROOT", os.path.dirname(__file__), str)
+WANDB_ENABLED = _cfg("wandb_enabled", "1", _to_bool)
+WANDB_PROJECT = _cfg("wandb_project", "hideandseek-xformer", str)
+WANDB_ENTITY = _cfg("wandb_entity", "", str)
+WANDB_MODE = _cfg("wandb_mode", "online", str)
+WANDB_RUN_NAME = _cfg("wandb_run_name", "", str)
+WANDB_LOG_CODE = _cfg("wandb_log_code", "1", _to_bool)
+WANDB_CODE_ROOT = _cfg("wandb_code_root", os.path.dirname(__file__), str)
 
 # Checkpoint handling
-RESUME_TRAINING = _cfg("RESUME_TRAINING", "0", _to_bool)
-RESET_MODEL_ON_TRAIN = _cfg("RESET_MODEL_ON_TRAIN", "0", _to_bool)
+RESUME_TRAINING = _cfg("resume_training", "0", _to_bool)
+RESET_MODEL_ON_TRAIN = _cfg("reset_model_on_train", "0", _to_bool)
 HPARAMS_CONFIG_PATH = CONFIG_PATH
 
 # Reward shaping coefficients
-RW_SEEK_VISIBLE_BONUS = _cfg("RW_SEEK_VISIBLE_BONUS", "0.03", float)
-RW_SEEK_DIST_GAIN = _cfg("RW_SEEK_DIST_GAIN", "0.03", float)
-RW_SEEK_IDLE_PENALTY = _cfg("RW_SEEK_IDLE_PENALTY", "0.01", float)
-RW_HIDE_WALL_NEAR_THRESHOLD = _cfg("RW_HIDE_WALL_NEAR_THRESHOLD", "0.18", float)
-RW_HIDE_STILL_SPEED_THRESHOLD = _cfg("RW_HIDE_STILL_SPEED_THRESHOLD", "0.05", float)
+RW_SEEK_VISIBLE_BONUS = _cfg("rw_seek_visible_bonus", "0.03", float)
+RW_SEEK_DIST_GAIN = _cfg("rw_seek_dist_gain", "0.03", float)
+RW_SEEK_IDLE_PENALTY = _cfg("rw_seek_idle_penalty", "0.01", float)
+RW_HIDE_WALL_NEAR_THRESHOLD = _cfg("rw_hide_wall_near_threshold", "0.18", float)
+RW_HIDE_STILL_SPEED_THRESHOLD = _cfg("rw_hide_still_speed_threshold", "0.05", float)
 
-RW_MOVE_SAT_PENALTY = _cfg("RW_MOVE_SAT_PENALTY", "0.02", float)
-RW_TURN_SAT_PENALTY = _cfg("RW_TURN_SAT_PENALTY", "0.01", float)
-RW_MOVE_CTRL_COST = _cfg("RW_MOVE_CTRL_COST", "0.001", float)
-RW_HAND_CTRL_COST = _cfg("RW_HAND_CTRL_COST", "0.0005", float)
+RW_MOVE_SAT_PENALTY = _cfg("rw_move_sat_penalty", "0.02", float)
+RW_TURN_SAT_PENALTY = _cfg("rw_turn_sat_penalty", "0.01", float)
+RW_MOVE_CTRL_COST = _cfg("rw_move_ctrl_cost", "0.001", float)
+RW_HAND_CTRL_COST = _cfg("rw_hand_ctrl_cost", "0.0005", float)
 
 # ✅ 追加する 3 個のパラメータ
-RW_MOVE_INCENTIVE = _cfg("RW_MOVE_INCENTIVE", "0.02", float)
-RW_IDLE_PENALTY = _cfg("RW_IDLE_PENALTY", "0.03", float)
-RW_WALL_AVOID_PENALTY = _cfg("RW_WALL_AVOID_PENALTY", "0.05", float)
+RW_MOVE_INCENTIVE = _cfg("rw_move_incentive", "0.02", float)
+RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float)
+RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.05", float)
 
 
 def _index_spec_to_array(index_spec):
@@ -889,9 +926,9 @@ def run_debug_or_playback(env, agent, device, model_loaded):
     print(f"Physics Step: {env.model.opt.timestep * 5}s")
 
     # --- trainと同じlog_interval統計出力に統一 ---
-    log_interval = 1  # debug時は必ずUpd ...を出す
+    log_interval = hp["log_interval"]
     wall_dist_interval = 1000
-    num_episodes = PLAY_EPISODES
+    num_episodes = hp["play_episodes"]
     episode_rewards = []
     hide_rates = []
     wall_distance_buffer = []
@@ -1621,6 +1658,29 @@ def run_train_vector(
 
 
 def run():
+    
+    # --- wandb初期化関数 ---
+    def init_wandb_run(hp, model_path, runtime_target):
+        if wandb is None or not WANDB_ENABLED:
+            return None
+        import socket
+        run_name = WANDB_RUN_NAME or f"{runtime_target}_{os.path.basename(model_path)}_{socket.gethostname()}"
+        config_dict = dict(hp)
+        try:
+            run = wandb.init(
+                project=WANDB_PROJECT,
+                entity=WANDB_ENTITY or None,
+                name=run_name,
+                config=config_dict,
+                mode=WANDB_MODE,
+                dir=WANDB_CODE_ROOT,
+                save_code=WANDB_LOG_CODE,
+                reinit=True,
+            )
+            return run
+        except Exception as exc:
+            print(f"wandb.init failed: {exc}")
+            return None
     _parse_cli_args()
     runtime_target = _resolve_runtime_target()
     print("Initializing Environment...")
@@ -1688,7 +1748,7 @@ def run():
     print(f"obs_dim={obs_dim}, act_dim={act_dim}, seq_len={SEQ_LEN}")
 
     model_path = model_path_for_config(runtime_target, ENV_CONFIG)
-    hp = select_hparams(ENV_CONFIG, runtime_target)
+    # hpはTOMLから一元的にロード済み
     print(
         f"HP[{runtime_target}]: T={hp['total_timesteps']} R={hp['rollout_steps']} "
         f"MB={hp['minibatch_size']} LR={hp['learning_rate']:.2e} "

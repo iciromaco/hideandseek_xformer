@@ -6,223 +6,64 @@ active_profile = "train"
 # runtime.common: train/debug 共通の実行設定
 [runtime.common]
 # 環境構成
-N_SEEKERS = 1
-N_HIDERS = 2
-N_BOXES = 2
-N_RAMPS = 1
+num_seekers = 1
+num_hiders = 2
+num_boxes = 2
+num_ramps = 1
 # 1観測あたりのアクション繰り返し回数
-ACTION_REPEAT = 10
+action_repeat = 10
 # MODE4（HybridSphere）用の静的SDFグリッド解像度[m]
-MODE4_SDF_CELL_SIZE = 0.05
+mode4_sdf_cell_size = 0.05
 # デバッグ表示
-SHOW_TURN_LINES = false
+show_turn_lines = false
 # policy_source ログ制御（大量ログ抑制）
-POLICY_SOURCE_LOG = false
-POLICY_SOURCE_LOG_EACH_RESET = false
-DEBUG_LOG_INTERVAL_STEPS = 200
+policy_source_log = false
+policy_source_log_each_reset = false
+debug_log_interval_steps = 200
 # 報酬・評価系
-USE_CUSTOM_REWARD = true
+use_custom_reward = true
 # 前進飽和抑制（常時前進ボーナスは使わない）
-RW_MOVE_SAT_PENALTY = 0.02
+rw_move_sat_penalty = 0.02
 # 壁張り付き対策（hider）
-RW_HIDE_WALL_STICK_PENALTY = 0.03
-RW_HIDE_WALL_NEAR_THRESHOLD = 0.18
-RW_HIDE_STILL_SPEED_THRESHOLD = 0.05
-RW_HIDE_VISIBLE_FRONT_PENALTY = 0.04
-RW_HIDE_VISIBLE_NEAR_PENALTY = 0.015
-RW_HIDE_SEEKER_GAZE_COS_PENALTY = 0.03
-RW_HIDE_SEEKER_GAZE_COS_DIST_PENALTY = 0.01
-RAMP_CHECK_ENABLED = true
-RAMP_CHECK_VIEWER = false
-RAMP_CHECK_FORCE_UPHILL = true
-RAMP_CHECK_EPISODES = 3
-RAMP_CHECK_STEPS = 220
+rw_hide_wall_stick_penalty = 0.03
+rw_hide_wall_near_threshold = 0.18
+rw_hide_still_speed_threshold = 0.05
+rw_hide_visible_front_penalty = 0.04
+rw_hide_visible_near_penalty = 0.015
+rw_hide_seeker_gaze_cos_penalty = 0.03
+rw_hide_seeker_gaze_cos_dist_penalty = 0.01
+ramp_check_enabled = true
+ramp_check_viewer = false
+ramp_check_force_uphill = true
+ramp_check_episodes = 3
+ramp_check_steps = 220
 # 実行基盤
-WANDB_ENABLED = true
-NUM_ENVS = 10
+wandb_enabled = true
+num_envs = 10
 
 # runtime.debug: 再生/検証向け設定
 [runtime.debug]
-TRAIN_MODE = false
-DEBUG_HIDER_POLICY = "model_if_available"
-DEBUG_SEEKER_POLICY = "model_if_available"
-# True: 平均行動(決定論), False: サンプリング行動(確率論)
-DEBUG_DETERMINISTIC_INFERENCE = false
-# True: 学習対象hiderも含め全hiderを同一モデル推論に強制（通常はfalse推奨）
-DEBUG_SYMMETRIC_HIDER_POLICY = false
-NPC_ONLY_DEBUG = false
-PLAY_EPISODES = 100
-AUTO_TUNE_HPARAMS = false
+train_mode = false
+debug_hider_policy = "model_if_available"
+debug_seeker_policy = "model_if_available"
+debug_deterministic_inference = false
+debug_symmetric_hider_policy = false
+npc_only_debug = false
+play_episodes = 100
+auto_tune_hparams = false
 
 # runtime.train: 学習向け設定
 [runtime.train]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "model_if_available"
-TRAIN_OTHER_SEEKER_POLICY = "model_if_available"
-# TRAIN_OTHER_HIDER_POLICY = "rule"
-# TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-# wall_only方針で固定比較
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 10_000_000
-WANDB_RUN_NAME = "wall_only_confirm_1M"
-RW_MOVE_SAT_PENALTY = 0.0
-
-# runtime.train_wall_only: wall-stick ペナルティのみ有効（移動飽和抑制は無効）
-[runtime.train_wall_only]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 20000
-WANDB_RUN_NAME = "cmp_wall_only"
-RW_MOVE_SAT_PENALTY = 0.0
-
-# runtime.train_no_wall_stick: wall-stick / 移動飽和抑制を両方無効
-[runtime.train_no_wall_stick]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 20000
-WANDB_RUN_NAME = "cmp_no_wall_stick"
-RW_MOVE_SAT_PENALTY = 0.0
-RW_HIDE_WALL_STICK_PENALTY = 0.0
-
-# runtime.train_base_reward: カスタム報酬を使わず環境のベース報酬のみ
-[runtime.train_base_reward]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 20000
-WANDB_RUN_NAME = "cmp_base_reward"
-USE_CUSTOM_REWARD = false
-
-# runtime.train_base_reward_long_s*: ベース報酬のみで長尺比較（同条件リピート）
-[runtime.train_base_reward_long_s1]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 100000
-WANDB_RUN_NAME = "base_reward_long_s1"
-USE_CUSTOM_REWARD = false
-
-[runtime.train_base_reward_long_s2]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 100000
-WANDB_RUN_NAME = "base_reward_long_s2"
-USE_CUSTOM_REWARD = false
-
-[runtime.train_base_reward_long_s3]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 100000
-WANDB_RUN_NAME = "base_reward_long_s3"
-USE_CUSTOM_REWARD = false
-
-# runtime.train_wall_only_long_s*: wall-stick ペナルティのみ（移動飽和抑制なし）長尺3本
-[runtime.train_wall_only_long_s1]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 100000
-WANDB_RUN_NAME = "wall_only_long_s1"
-RW_MOVE_SAT_PENALTY = 0.0
-
-[runtime.train_wall_only_long_s2]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 100000
-WANDB_RUN_NAME = "wall_only_long_s2"
-RW_MOVE_SAT_PENALTY = 0.0
-
-[runtime.train_wall_only_long_s3]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 100000
-WANDB_RUN_NAME = "wall_only_long_s3"
-RW_MOVE_SAT_PENALTY = 0.0
-
-# runtime.train_no_wall_stick_long_s*: wall-stick/移動飽和抑制とも無効 長尺3本
-[runtime.train_no_wall_stick_long_s1]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 100000
-WANDB_RUN_NAME = "no_wall_stick_long_s1"
-RW_MOVE_SAT_PENALTY = 0.0
-RW_HIDE_WALL_STICK_PENALTY = 0.0
-
-[runtime.train_no_wall_stick_long_s2]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 100000
-WANDB_RUN_NAME = "no_wall_stick_long_s2"
-RW_MOVE_SAT_PENALTY = 0.0
-RW_HIDE_WALL_STICK_PENALTY = 0.0
-
-[runtime.train_no_wall_stick_long_s3]
-TRAIN_MODE = true
-USE_VIEWER = false
-TRAINING_TARGET = "hider"
-TRAIN_OTHER_HIDER_POLICY = "rule"
-TRAIN_OTHER_SEEKER_POLICY = "rule"
-NPC_ONLY_DEBUG = false
-AUTO_TUNE_HPARAMS = false
-TOTAL_TIMESTEPS = 100000
-WANDB_RUN_NAME = "no_wall_stick_long_s3"
-RW_MOVE_SAT_PENALTY = 0.0
-RW_HIDE_WALL_STICK_PENALTY = 0.0
+train_mode = true
+use_viewer = false
+training_target = "hider"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10000000
+wandb_run_name = "wall_only_confirm_1M"
+rw_move_sat_penalty = 0.0
 
 # base: PPOの基本ハイパーパラメータ（全ターゲット共通）
 [base]
