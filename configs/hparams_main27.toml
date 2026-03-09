@@ -187,4 +187,4 @@ total_timesteps_min = 700000
 hider_clip_coef_min = 0.20
 hider_ent_coef_min = 2.0e-3
 seeker_clip_coef_max = 0.19
-rw_wall_avoid_penalty = 0.13046256227203412
+rw_wall_avoid_penalty = 0.24852274025182242
