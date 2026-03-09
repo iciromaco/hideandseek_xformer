@@ -1,0 +1,2 @@
+Best params: {'rw_hide_wall_stick_penalty': 0.08079428314195486}
+Best HideRate: 0.88

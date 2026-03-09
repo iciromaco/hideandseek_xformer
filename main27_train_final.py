@@ -614,10 +614,10 @@ RW_TURN_SAT_PENALTY = _cfg("rw_turn_sat_penalty", "0.01", float)
 RW_MOVE_CTRL_COST = _cfg("rw_move_ctrl_cost", "0.001", float)
 RW_HAND_CTRL_COST = _cfg("rw_hand_ctrl_cost", "0.0005", float)
 
-# ✅ 追加する 3 個のパラメータ
 RW_MOVE_INCENTIVE = _cfg("rw_move_incentive", "0.02", float)
 RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float)
 RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.05", float)
+RW_HIDE_WALL_STICK_PENALTY = _cfg("rw_hide_wall_stick_penalty", "0.1", float)
 
 
 def _index_spec_to_array(index_spec):
@@ -1051,8 +1051,25 @@ def run_train(
     print(f"Training updates: {num_updates}, model: {model_path}")
     interrupted = False
     last_ramp_eval = None
+    # --- スケジューリング用パラメータ取得 ---
+    ent_coef_init = float(hp.get("ent_coef", 0.001))
+    ent_coef_final = float(hp.get("ent_coef_final", ent_coef_init * 0.5))
+    ent_coef_schedule = str(hp.get("ent_coef_schedule", "linear"))
+    lr_init = float(hp.get("learning_rate", 3e-4))
+    lr_final = float(hp.get("learning_rate_final", lr_init * 0.5))
+    lr_schedule = str(hp.get("learning_rate_schedule", "linear"))
+
     try:
         for update in range(1, num_updates + 1):
+            # --- ent_coef/learning_rateスケジューリング ---
+            frac = 1.0 - (update - 1) / max(num_updates - 1, 1)
+            if ent_coef_schedule == "linear":
+                hp["ent_coef"] = ent_coef_final + (ent_coef_init - ent_coef_final) * frac
+            # 他のスケジュール方式は必要に応じて追加
+            if lr_schedule == "linear":
+                lr_now = lr_final + (lr_init - lr_final) * frac
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr_now
             lock_evt_sum = 0
             grab_evt_sum = 0
             max_box_speed = 0.0
@@ -1114,32 +1131,34 @@ def run_train(
                 rollout_dones[t] = torch.as_tensor(done_np, device=device)
                 rollout_values[t] = value.view(-1)
 
-                for i in range(num_envs):
-                    lock_evt_sum += int(_info_at(info, "lock_event", i, 0))
-                    grab_evt_sum += int(_info_at(info, "grab_event", i, 0))
-                    max_box_speed = max(
-                        max_box_speed,
-                        float(_info_at(info, "dbg_max_box_speed", i, 0.0)),
-                    )
-                    max_ramp_speed = max(
-                        max_ramp_speed,
-                        float(_info_at(info, "dbg_max_ramp_speed", i, 0.0)),
-                    )
-                    blocked_ramp_sum += int(
-                        _info_at(info, "dbg_blocked_ramp_count", i, 0)
-                    )
-                    if not bool(_info_at(info, "is_detected", i, False)):
-                        hidden_steps += 1
-                    seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
-                    if seen_learnable:
-                        learnable_seen_steps += 1
-                    is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache)
-                    if is_wall_stick:
-                        wall_stick_steps += 1
+                # ウォーミングアップ期間は除外
+                if t >= int(hp.get("warmup_steps", 0)):
+                    for i in range(num_envs):
+                        lock_evt_sum += int(_info_at(info, "lock_event", i, 0))
+                        grab_evt_sum += int(_info_at(info, "grab_event", i, 0))
+                        max_box_speed = max(
+                            max_box_speed,
+                            float(_info_at(info, "dbg_max_box_speed", i, 0.0)),
+                        )
+                        max_ramp_speed = max(
+                            max_ramp_speed,
+                            float(_info_at(info, "dbg_max_ramp_speed", i, 0.0)),
+                        )
+                        blocked_ramp_sum += int(
+                            _info_at(info, "dbg_blocked_ramp_count", i, 0)
+                        )
+                        if not bool(_info_at(info, "is_detected", i, False)):
+                            hidden_steps += 1
+                        seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
                         if seen_learnable:
-                            wall_stick_seen_steps += 1
+                            learnable_seen_steps += 1
+                        is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache)
+                        if is_wall_stick:
+                            wall_stick_steps += 1
+                            if seen_learnable:
+                                wall_stick_seen_steps += 1
 
-                rewards_sum += float(np.sum(reward_np))
+                    rewards_sum += float(np.sum(reward_np))
 
                 history.update(next_obs)
                 for i in range(num_envs):
@@ -1390,11 +1409,28 @@ def run_train_vector(
     interrupted = False
     last_ramp_eval = None
 
+    # --- スケジューリング用パラメータ取得 ---
+    ent_coef_init = float(hp.get("ent_coef", 0.001))
+    ent_coef_final = float(hp.get("ent_coef_final", ent_coef_init * 0.5))
+    ent_coef_schedule = str(hp.get("ent_coef_schedule", "linear"))
+    lr_init = float(hp.get("learning_rate", 3e-4))
+    lr_final = float(hp.get("learning_rate_final", lr_init * 0.5))
+    lr_schedule = str(hp.get("learning_rate_schedule", "linear"))
+
     try:
         # バッファをローカル変数で管理
         wall_distance_buffer = []
         info_buffer = []
         for update in range(1, num_updates + 1):
+            # --- ent_coef/learning_rateスケジューリング ---
+            frac = 1.0 - (update - 1) / max(num_updates - 1, 1)
+            if ent_coef_schedule == "linear":
+                hp["ent_coef"] = ent_coef_final + (ent_coef_init - ent_coef_final) * frac
+            # 他のスケジュール方式は必要に応じて追加
+            if lr_schedule == "linear":
+                lr_now = lr_final + (lr_init - lr_final) * frac
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr_now
             lock_evt_sum = 0
             grab_evt_sum = 0
             max_box_speed = 0.0
