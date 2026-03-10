@@ -438,17 +438,34 @@ def _min_lidar_from_obs(obs, lidar_indices):
 
 # 各エージェントごとに1つだけキャッシュ（idx, reward_idx_cacheのid）
 _wall_stick_state_cache = {}
-def _is_wall_stick_state(obs, idx, reward_idx_cache=None):
-    """壁張り付き状態かチェック（全エージェント共通, エージェントごとキャッシュ)"""
+def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None):
+    """壁張り付き状態かチェック（全エージェント共通, エージェントごとキャッシュ, speed外部渡し可, infoのwall_distance優先)"""
     global _wall_stick_state_cache
     cache_id = id(reward_idx_cache) if reward_idx_cache is not None else id(idx)
     key = (idx, cache_id)
     if key in _wall_stick_state_cache:
         return _wall_stick_state_cache[key]
-    cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
-    speed = math.sqrt(float(obs[cache["self_vel_x"]]) ** 2 + float(obs[cache["self_vel_y"]]) ** 2)
-    lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
-    result = bool((lidar_min < RW_WALL_NEAR_THRESHOLD) and (speed < RW_STILL_SPEED_THRESHOLD))
+    # まずinfo['wall_distance']があればそれを使う
+    wall_near = None
+    if info is not None and 'wall_distance' in info:
+        wall_distance = info['wall_distance']
+        if isinstance(wall_distance, (list, tuple, np.ndarray)):
+            wall_distance = float(np.min(wall_distance))
+        else:
+            wall_distance = float(wall_distance)
+        wall_near = wall_distance < RW_WALL_NEAR_THRESHOLD
+    if wall_near is None:
+        cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
+        lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
+        wall_near = lidar_min < RW_WALL_NEAR_THRESHOLD
+    if not wall_near:
+        _wall_stick_state_cache[key] = False
+        return False
+    # 壁際なら速度判定
+    if speed is None:
+        cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
+        speed = math.sqrt(float(obs[cache["self_vel_x"]]) ** 2 + float(obs[cache["self_vel_y"]]) ** 2)
+    result = speed < RW_STILL_SPEED_THRESHOLD
     _wall_stick_state_cache[key] = result
     return result
 
@@ -570,7 +587,7 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
         bonus -= RW_TURN_SAT_PENALTY
     control_cost = -RW_MOVE_CTRL_COST * (move * move + turn * turn)
     # --- 壁張り付きペナルティ（全エージェント共通） ---
-    if _is_wall_stick_state(obs, idx, reward_idx_cache=reward_idx_cache):
+    if _is_wall_stick_state(obs, idx, reward_idx_cache=reward_idx_cache, speed=speed, info=info):
         bonus -= RW_WALL_STICK_PENALTY
 
     # --- wall_distanceベースの壁ペナルティ（hider/seeker共通） ---
@@ -1088,6 +1105,7 @@ def run_train(
                         if obs1d.shape[0] <= max_idx:
                             is_wall_stick = False
                         else:
+                            # speedは未計算なので従来通り内部計算
                             is_wall_stick = _is_wall_stick_state(obs1d, idx, reward_idx_cache=reward_idx_cache)
                         if is_wall_stick:
                             wall_stick_steps += 1
@@ -1414,6 +1432,7 @@ def run_train_vector(
                     seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
                     if seen_learnable:
                         learnable_seen_steps += 1
+                    # speedは未計算なので従来通り内部計算
                     is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache)
                     if is_wall_stick:
                         wall_stick_steps += 1
