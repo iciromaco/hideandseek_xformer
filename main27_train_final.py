@@ -623,103 +623,68 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
     info: info dict
     reward_idx_cache: インデックスキャッシュ（省略可）
     """
+    # --- 1サンプル分のバッチに変換しNumba版を呼び出す ---
+    import numpy as np
     cache = (
-        # --- 1サンプル分のバッチに変換しNumba版を呼び出す ---
-        import numpy as np
-        cache = (
-            reward_idx_cache
-            if reward_idx_cache is not None
-            else _build_reward_index_cache(idx)
-        )
-        # obs, action, base_reward: 1次元→2次元(1,dim) & float32
-        obs_batch = np.asarray(obs, dtype=np.float32).reshape(1, -1)
-        action_batch = np.asarray(action, dtype=np.float32).reshape(1, -1)
-        base_reward_batch = np.asarray([base_reward], dtype=np.float32)
-        # target_is_hider: bool
-        target_is_hider = (target == "hider")
-        # 各インデックス: int32 or int32配列
-        self_vel_x_idx = int(cache["self_vel_x"])
-        self_vel_y_idx = int(cache["self_vel_y"])
-        lidar_indices = np.asarray(cache["lidar"], dtype=np.int32)
-        enemy_visible_indices = np.asarray(cache["enemy_visible"], dtype=np.int32)
-        enemy_rel_x_indices = np.asarray(cache["enemy_rel_x"], dtype=np.int32)
-        enemy_rel_y_indices = np.asarray(cache["enemy_rel_y"], dtype=np.int32)
-        # wall_distance: shape(1,) float32 (infoから取得、なければnan)
-        if info is not None and "wall_distance" in info:
-            wd = info["wall_distance"]
-            if isinstance(wd, (list, tuple, np.ndarray)):
-                wall_distance_batch = np.asarray([float(wd[0])], dtype=np.float32)
-            else:
-                wall_distance_batch = np.asarray([float(wd)], dtype=np.float32)
+        reward_idx_cache
+        if reward_idx_cache is not None
+        else _build_reward_index_cache(idx)
+    )
+    # obs, action, base_reward: 1次元→2次元(1,dim) & float32
+    obs_batch = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+    action_batch = np.asarray(action, dtype=np.float32).reshape(1, -1)
+    base_reward_batch = np.asarray([base_reward], dtype=np.float32)
+    # target_is_hider: bool
+    target_is_hider = (target == "hider")
+    # 各インデックス: int32 or int32配列
+    self_vel_x_idx = int(cache["self_vel_x"])
+    self_vel_y_idx = int(cache["self_vel_y"])
+    lidar_indices = np.asarray(cache["lidar"], dtype=np.int32)
+    enemy_visible_indices = np.asarray(cache["enemy_visible"], dtype=np.int32)
+    enemy_rel_x_indices = np.asarray(cache["enemy_rel_x"], dtype=np.int32)
+    enemy_rel_y_indices = np.asarray(cache["enemy_rel_y"], dtype=np.int32)
+    # wall_distance: shape(1,) float32 (infoから取得、なければnan)
+    if info is not None and "wall_distance" in info:
+        wd = info["wall_distance"]
+        if isinstance(wd, (list, tuple, np.ndarray)):
+            wall_distance_batch = np.asarray([float(wd[0])], dtype=np.float32)
         else:
-            wall_distance_batch = np.full((1,), np.nan, dtype=np.float32)
-        # Numba版呼び出し
-        reward_arr = _compute_custom_reward_batch_numba(
-            obs_batch,
-            action_batch,
-            base_reward_batch,
-            target_is_hider,
-            self_vel_x_idx,
-            self_vel_y_idx,
-            lidar_indices,
-            enemy_visible_indices,
-            enemy_rel_x_indices,
-            enemy_rel_y_indices,
-            float(RW_MOVE_CTRL_COST),
-            float(RW_MOVE_INCENTIVE),
-            float(RW_IDLE_PENALTY),
-            float(RW_WALL_AVOID_PENALTY),
-            wall_distance_batch,
-            float(IDLE_SPEED_THRESHOLD),
-            float(MOVE_INCENTIVE_SPEED_THRESHOLD),
-            float(MOVE_SAT_THRESHOLD),
-            float(RW_MOVE_SAT_PENALTY),
-            float(TURN_SAT_THRESHOLD),
-            float(RW_TURN_SAT_PENALTY),
-            float(RW_WALL_NEAR_THRESHOLD),
-            float(RW_STILL_SPEED_THRESHOLD),
-            float(RW_WALL_STICK_PENALTY),
-            float(0.4),  # AGENT_RADIUS
-            float(0.4 + 0.5),  # WALL_SAFE
-            float(RW_HIDE_VISIBLE_NEAR_PENALTY),
-            float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
-            float(RW_SEEK_VISIBLE_BONUS),
-        )
-        return float(reward_arr[0])
-        elif wall_distance < WALL_SAFE:
-            bonus -= (
-                RW_WALL_AVOID_PENALTY
-                * (WALL_SAFE - wall_distance)
-                / (WALL_SAFE - WALL_NEAR)
-                / 2.0
-            )
-
-    # --- エージェント固有ロジック ---
-    if target == "hider":
-        # --- Seekerが近い場合のペナルティ ---
-        for j in range(len(cache["enemy_visible"])):
-            if obs[cache["enemy_visible"][j]] > 0.5:
-                dx = float(obs[cache["enemy_rel_x"][j]])
-                dy = float(obs[cache["enemy_rel_y"][j]])
-                dist = math.sqrt(dx * dx + dy * dy)
-                if dist < 2.0:  # 近距離（閾値は適宜調整）
-                    bonus -= RW_HIDE_VISIBLE_NEAR_PENALTY * (2.0 - dist) / 2.0
-                # --- Seekerの視線正面にいる場合のペナルティ ---
-                # Seekerの視線方向（仮定: 0度が正面、obsに格納されている場合）
-                # ここではcosθ=dx/distと仮定（本来はSeekerの向き情報が必要）
-                if dist > 0.1:
-                    cos_theta = dx / dist  # 仮の視線正面判定（本来はSeekerの向きと位置から計算）
-                    frontness = max(float(cos_theta), 0.0)
-                    bonus -= RW_HIDE_SEEKER_GAZE_COS_PENALTY * frontness
+            wall_distance_batch = np.asarray([float(wd)], dtype=np.float32)
     else:
-        for j in range(len(cache["enemy_visible"])):
-            if obs[cache["enemy_visible"][j]] > 0.5:
-                dx = float(obs[cache["enemy_rel_x"][j]])
-                dy = float(obs[cache["enemy_rel_y"][j]])
-                dist = math.sqrt(dx * dx + dy * dy)
-                bonus += RW_SEEK_VISIBLE_BONUS / (dist + 1.0)
-                
-    return float(base_reward) + bonus + control_cost
+        wall_distance_batch = np.full((1,), np.nan, dtype=np.float32)
+    # Numba版呼び出し
+    reward_arr = _compute_custom_reward_batch_numba(
+        obs_batch,
+        action_batch,
+        base_reward_batch,
+        target_is_hider,
+        self_vel_x_idx,
+        self_vel_y_idx,
+        lidar_indices,
+        enemy_visible_indices,
+        enemy_rel_x_indices,
+        enemy_rel_y_indices,
+        float(RW_MOVE_CTRL_COST),
+        float(RW_MOVE_INCENTIVE),
+        float(RW_IDLE_PENALTY),
+        float(RW_WALL_AVOID_PENALTY),
+        wall_distance_batch,
+        float(IDLE_SPEED_THRESHOLD),
+        float(MOVE_INCENTIVE_SPEED_THRESHOLD),
+        float(MOVE_SAT_THRESHOLD),
+        float(RW_MOVE_SAT_PENALTY),
+        float(TURN_SAT_THRESHOLD),
+        float(RW_TURN_SAT_PENALTY),
+        float(RW_WALL_NEAR_THRESHOLD),
+        float(RW_STILL_SPEED_THRESHOLD),
+        float(RW_WALL_STICK_PENALTY),
+        float(0.4),  # AGENT_RADIUS
+        float(0.4 + 0.5),  # WALL_SAFE
+        float(RW_HIDE_VISIBLE_NEAR_PENALTY),
+        float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
+        float(RW_SEEK_VISIBLE_BONUS),
+    )
+    return float(reward_arr[0])
 
 
 # ============================================================================
