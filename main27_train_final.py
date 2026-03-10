@@ -435,15 +435,27 @@ def _min_lidar_from_obs(obs, lidar_indices):
     return lidar_min
 
 
+
+# 各エージェントごとに1つだけキャッシュ（idx, reward_idx_cacheのid）
+_wall_stick_state_cache = {}
 def _is_wall_stick_state(obs, idx, reward_idx_cache=None):
-    """壁張り付き状態かチェック（全エージェント共通）"""
+    """壁張り付き状態かチェック（全エージェント共通, エージェントごとキャッシュ)"""
+    global _wall_stick_state_cache
+    cache_id = id(reward_idx_cache) if reward_idx_cache is not None else id(idx)
+    key = (idx, cache_id)
+    if key in _wall_stick_state_cache:
+        return _wall_stick_state_cache[key]
     cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
     speed = math.sqrt(float(obs[cache["self_vel_x"]]) ** 2 + float(obs[cache["self_vel_y"]]) ** 2)
     lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
-    return bool(
-        (lidar_min < RW_WALL_NEAR_THRESHOLD)
-        and (speed < RW_STILL_SPEED_THRESHOLD)
-    )
+    result = bool((lidar_min < RW_WALL_NEAR_THRESHOLD) and (speed < RW_STILL_SPEED_THRESHOLD))
+    _wall_stick_state_cache[key] = result
+    return result
+
+def _clear_wall_stick_state_cache():
+    """_is_wall_stick_stateのキャッシュをクリア"""
+    global _wall_stick_state_cache
+    _wall_stick_state_cache.clear()
 
 @njit([
     "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32)"
@@ -1001,6 +1013,7 @@ def run_train(
             env_step_sec_sum = 0.0
 
             for t in range(hp["rollout_steps"]):
+                _clear_wall_stick_state_cache()  # 各ステップの先頭でキャッシュクリア
                 if USE_VIEWER and env.viewer and not env.viewer.is_running():
                     print("Viewer closed. Stop training loop.")
                     return
