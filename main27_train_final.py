@@ -478,7 +478,7 @@ def _clear_wall_stick_state_cache():
     _wall_stick_state_cache.clear()
 
 @njit([
-    "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32)"
+    "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32, float32[:])"
 ], cache=True, parallel=True)
 def _compute_custom_reward_batch_numba(
     obs_batch,
@@ -495,6 +495,7 @@ def _compute_custom_reward_batch_numba(
     move_incentive,
     idle_penalty,
     wall_avoid_penalty,
+    wall_distance_batch=None,
 ):
     """バッチ報酬計算（Numba JIT最適化）"""
     n_envs = obs_batch.shape[0]
@@ -534,21 +535,70 @@ def _compute_custom_reward_batch_numba(
 
         control_cost = -move_ctrl_cost * (move * move + turn * turn)
 
-        if target_is_hider:
+        # --- 壁張り付きペナルティ（hider/seeker共通, Python版に忠実に） ---
+        WALL_NEAR_THRESHOLD = 0.18  # 仮: 本来は引数で渡す
+        STILL_SPEED_THRESHOLD = 0.05  # 仮: 本来は引数で渡す
+        WALL_STICK_PENALTY = 0.1  # 仮: 本来は引数で渡す
+        wall_near = None
+        if wall_distance_batch is not None:
+            wall_distance = wall_distance_batch[i]
+            wall_near = wall_distance < WALL_NEAR_THRESHOLD
+        if wall_near is None:
             lidar_min = 1.0
             for j in range(lidar_indices.shape[0]):
                 idx = int(lidar_indices[j])
                 lidar_val = float(obs_batch[i, idx])
                 if lidar_val < lidar_min:
                     lidar_min = lidar_val
-            if lidar_min < 0.3:
-                ratio = lidar_min / 0.3
-                if ratio < 0.0:
-                    ratio = 0.0
-                elif ratio > 1.0:
-                    ratio = 1.0
-                bonus -= wall_avoid_penalty * (1.0 - ratio)
+            wall_near = lidar_min < WALL_NEAR_THRESHOLD
+        if wall_near and speed < STILL_SPEED_THRESHOLD:
+            bonus -= WALL_STICK_PENALTY
+
+        # --- 壁回避ペナルティ（hider/seeker共通, Python版に忠実に） ---
+        AGENT_RADIUS = 0.4  # 仮: 本来は引数で渡す
+        WALL_NEAR = AGENT_RADIUS + 0.2  # 0.6
+        WALL_SAFE = AGENT_RADIUS + 0.5  # 0.9
+        wall_distance = None
+        if wall_distance_batch is not None:
+            wall_distance = wall_distance_batch[i]
         else:
+            wall_distance = lidar_min
+        if wall_distance < WALL_NEAR:
+            # 近距離: 強いペナルティ
+            ratio = wall_distance / WALL_NEAR
+            if ratio < 0.0:
+                ratio = 0.0
+            elif ratio > 1.0:
+                ratio = 1.0
+            bonus -= wall_avoid_penalty * (1.0 - ratio)
+        elif wall_distance < WALL_SAFE:
+            # 中距離: 緩やかなペナルティ
+            bonus -= (
+                wall_avoid_penalty
+                * (WALL_SAFE - wall_distance)
+                / (WALL_SAFE - WALL_NEAR)
+                / 2.0
+            )
+
+        # --- hider固有ペナルティ ---
+        if target_is_hider:
+            for j in range(enemy_visible_indices.shape[0]):
+                idx_vis = int(enemy_visible_indices[j])
+                if obs_batch[i, idx_vis] > 0.5:
+                    idx_x = int(enemy_rel_x_indices[j])
+                    idx_y = int(enemy_rel_y_indices[j])
+                    dx = float(obs_batch[i, idx_x])
+                    dy = float(obs_batch[i, idx_y])
+                    dist = np.sqrt(dx * dx + dy * dy)
+                    if dist < 2.0:
+                        bonus -= 0.025 * (2.0 - dist) / 2.0  # RW_HIDE_VISIBLE_NEAR_PENALTY 仮値
+                    if dist > 0.1:
+                        cos_theta = dx / dist
+                        frontness = cos_theta if cos_theta > 0.0 else 0.0
+                        bonus -= 0.01 * frontness  # RW_HIDE_SEEKER_GAZE_COS_PENALTY 仮値
+
+        # --- seeker固有ボーナス ---
+        if not target_is_hider:
             for j in range(enemy_visible_indices.shape[0]):
                 idx_vis = int(enemy_visible_indices[j])
                 if obs_batch[i, idx_vis] > 0.5:
@@ -1089,6 +1139,8 @@ def run_train(
                 reward_np = np.asarray(base_r, dtype=np.float32).copy()
                 reward_t0 = time.perf_counter()
                 if USE_CUSTOM_REWARD:
+                    # wall_distanceが利用できない場合はnan埋め配列を渡す
+                    wall_distance_batch = np.full((num_envs,), np.nan, dtype=np.float32)
                     reward_np = _compute_custom_reward_batch_numba(
                         np.asarray(obs, dtype=np.float32).reshape(num_envs, -1),
                         np.asarray(action_np, dtype=np.float32).reshape(num_envs, -1),
@@ -1104,6 +1156,7 @@ def run_train(
                         float(RW_MOVE_INCENTIVE),
                         float(RW_IDLE_PENALTY),
                         float(RW_WALL_AVOID_PENALTY),
+                        wall_distance_batch,
                     )
                 reward_compute_sec_sum += time.perf_counter() - reward_t0
 
@@ -1422,6 +1475,7 @@ def run_train_vector(
                 reward_np = np.asarray(base_r, dtype=np.float32).copy()
                 reward_t0 = time.perf_counter()
                 if USE_CUSTOM_REWARD:
+                    wall_distance_batch = np.full((action_np.shape[0],), np.nan, dtype=np.float32)
                     reward_np = _compute_custom_reward_batch_numba(
                         np.asarray(obs, dtype=np.float32).reshape(action_np.shape[0], -1),
                         np.asarray(action_np, dtype=np.float32).reshape(action_np.shape[0], -1),
@@ -1437,6 +1491,7 @@ def run_train_vector(
                         float(RW_MOVE_INCENTIVE),
                         float(RW_IDLE_PENALTY),
                         float(RW_WALL_AVOID_PENALTY),
+                        wall_distance_batch,
                     )
                 reward_compute_sec_sum += time.perf_counter() - reward_t0
 
