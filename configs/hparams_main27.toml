@@ -79,7 +79,7 @@ train_other_hider_policy = "model_if_available"
 train_other_seeker_policy = "model_if_available"
 npc_only_debug = false
 auto_tune_hparams = false
-total_timesteps = 10000
+total_timesteps = 100_000_000
 wandb_run_name = "wall_only_confirm_1M"
 rw_move_sat_penalty = 0.0
 

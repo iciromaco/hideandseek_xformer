@@ -36,14 +36,15 @@ class ObjectSchema:
 class AgentSchema:
     """他エージェント用スキーマ (7次元)"""
     def __init__(self, start: int):
-        self.SLICE: Final = slice(start, start + 7)
+        self.SLICE: Final = slice(start, start + 8)
         self.REL_X: Final = start + 0
         self.REL_Y: Final = start + 1
         self.VEL_X: Final = start + 2
         self.VEL_Y: Final = start + 3
-        self.QUAT: Final = start + 4
-        self.IS_MOVING: Final = start + 5
-        self.VISIBLE: Final = start + 6
+        self.QUAT_0: Final = start + 4  # cos(rot)
+        self.QUAT_1: Final = start + 5  # sin(rot)
+        self.IS_MOVING: Final = start + 6
+        self.VISIBLE: Final = start + 7
 
 
 class ObsIdx:
@@ -76,6 +77,6 @@ class ObsIdx:
         self.OTHERS: List[AgentSchema] = []
         for _ in range(n_others):
             self.OTHERS.append(AgentSchema(cursor))
-            cursor += 7
+            cursor += 8
 
         self.total_dim = cursor

@@ -425,6 +425,7 @@ def _build_reward_index_cache(idx):
         "enemy_visible": np.asarray([int(en.VISIBLE) for en in idx.OTHERS], dtype=np.int32),
         "enemy_rel_x": np.asarray([int(en.REL_X) for en in idx.OTHERS], dtype=np.int32),
         "enemy_rel_y": np.asarray([int(en.REL_Y) for en in idx.OTHERS], dtype=np.int32),
+        "enemy_quat_0": np.asarray([int(en.QUAT_0) for en in idx.OTHERS], dtype=np.int32),
     }
 
 
@@ -478,7 +479,7 @@ def _clear_wall_stick_state_cache():
     _wall_stick_state_cache.clear()
 
 @njit([
-    "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32, float32[:], float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32)"
+    "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32, float32[:], float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32)"
 ], cache=True, parallel=True)
 def _compute_custom_reward_batch_numba(
     obs_batch,
@@ -491,6 +492,7 @@ def _compute_custom_reward_batch_numba(
     enemy_visible_indices,
     enemy_rel_x_indices,
     enemy_rel_y_indices,
+    enemy_quat_0_indices,
     move_ctrl_cost,
     move_incentive,
     idle_penalty,
@@ -592,7 +594,8 @@ def _compute_custom_reward_batch_numba(
                     if dist < 2.0:
                         bonus -= rw_hide_visible_near_penalty * (2.0 - dist) / 2.0
                     if dist > 0.1:
-                        cos_theta = dx / dist
+                        idx_quat_0 = int(enemy_quat_0_indices[j])
+                        cos_theta = float(obs_batch[i, idx_quat_0])
                         frontness = cos_theta if cos_theta > 0.0 else 0.0
                         bonus -= rw_hide_seeker_gaze_cos_penalty * frontness
 
@@ -652,6 +655,7 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
             wall_distance_batch = np.asarray([float(wd)], dtype=np.float32)
     else:
         wall_distance_batch = np.full((1,), np.nan, dtype=np.float32)
+    enemy_quat_0_indices = np.asarray(cache["enemy_quat_0"], dtype=np.int32)
     # Numba版呼び出し
     reward_arr = _compute_custom_reward_batch_numba(
         obs_batch,
@@ -664,6 +668,7 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
         enemy_visible_indices,
         enemy_rel_x_indices,
         enemy_rel_y_indices,
+        enemy_quat_0_indices,
         float(RW_MOVE_CTRL_COST),
         float(RW_MOVE_INCENTIVE),
         float(RW_IDLE_PENALTY),
@@ -1122,6 +1127,7 @@ def run_train(
                 if USE_CUSTOM_REWARD:
                     # wall_distanceが利用できない場合はnan埋め配列を渡す
                     wall_distance_batch = np.full((num_envs,), np.nan, dtype=np.float32)
+                    enemy_quat_0_indices = reward_idx_cache["enemy_quat_0"]
                     reward_np = _compute_custom_reward_batch_numba(
                         np.asarray(obs, dtype=np.float32).reshape(num_envs, -1),
                         np.asarray(action_np, dtype=np.float32).reshape(num_envs, -1),
@@ -1133,6 +1139,7 @@ def run_train(
                         reward_idx_cache["enemy_visible"],
                         reward_idx_cache["enemy_rel_x"],
                         reward_idx_cache["enemy_rel_y"],
+                        enemy_quat_0_indices,
                         float(RW_MOVE_CTRL_COST),
                         float(RW_MOVE_INCENTIVE),
                         float(RW_IDLE_PENALTY),
@@ -1483,6 +1490,7 @@ def run_train_vector(
                         reward_idx_cache["enemy_visible"],
                         reward_idx_cache["enemy_rel_x"],
                         reward_idx_cache["enemy_rel_y"],
+                        reward_idx_cache["enemy_quat_0"],
                         float(RW_MOVE_CTRL_COST),
                         float(RW_MOVE_INCENTIVE),
                         float(RW_IDLE_PENALTY),

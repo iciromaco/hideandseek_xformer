@@ -1201,6 +1201,15 @@ class TeamCosEnv(gym.Env):
             b_speed = math.sqrt(d.qvel[b_vadr] ** 2 + d.qvel[b_vadr + 1] ** 2)
             o[b_idx.IS_MOVING] = 1.0 if b_speed > 0.05 else 0.0
             o[b_idx.IS_LOCKED] = 1.0 if self.object_state[f"b{i+1}"]["mode"] == "locked" else 0.0
+            # 箱の向き情報（自分基準の相対yaw角）を観測にセット
+            box_quat = d.xquat[tid]
+            box_yaw = math.atan2(
+                2.0 * (box_quat[0] * box_quat[3] + box_quat[1] * box_quat[2]),
+                1.0 - 2.0 * (box_quat[2] ** 2 + box_quat[3] ** 2)
+            )
+            rel_box_yaw = box_yaw - rv
+            o[b_idx.QUAT_0] = math.cos(rel_box_yaw)
+            o[b_idx.QUAT_1] = math.sin(rel_box_yaw)
         for i, rid in enumerate(self.ramp_ids):
             r_idx = self.idx.RAMP[i]
             d_w_r = d.xpos[rid][:2] - ps[:2]
@@ -1210,6 +1219,15 @@ class TeamCosEnv(gym.Env):
             r_speed = math.sqrt(d.qvel[r_vadr] ** 2 + d.qvel[r_vadr + 1] ** 2)
             o[r_idx.IS_MOVING] = 1.0 if r_speed > 0.05 else 0.0
             o[r_idx.IS_LOCKED] = 1.0 if self.object_state[f"ramp{i+1}"]["mode"] == "locked" else 0.0
+            # スロープの向き情報（自分基準の相対yaw角）を観測にセット
+            ramp_quat = d.xquat[rid]
+            ramp_yaw = math.atan2(
+                2.0 * (ramp_quat[0] * ramp_quat[3] + ramp_quat[1] * ramp_quat[2]),
+                1.0 - 2.0 * (ramp_quat[2] ** 2 + ramp_quat[3] ** 2)
+            )
+            rel_ramp_yaw = ramp_yaw - rv
+            o[r_idx.QUAT_0] = math.cos(rel_ramp_yaw)
+            o[r_idx.QUAT_1] = math.sin(rel_ramp_yaw)
         ens = [k for k in self.agent_keys if k != ak]
         if ak.startswith("s"):
             ens.sort(key=lambda k: (0 if k.startswith("h") else 1, k))
@@ -1218,8 +1236,20 @@ class TeamCosEnv(gym.Env):
         for i, enm in enumerate(ens[:len(self.idx.OTHERS)]):
             en_idx = self.idx.OTHERS[i]; eid = self.body_ids[enm]
             if self._is_vis(ps[:2], rv, d.xpos[eid][:2], self.body_ids[ak], eid):
-                d_w = d.xpos[eid][:2] - ps[:2]; o[en_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r; o[en_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r; o[en_idx.VISIBLE] = 1.0
-            else: o[en_idx.REL_X], o[en_idx.REL_Y] = 15.0, 15.0; o[en_idx.VISIBLE] = 0.0
+                d_w = d.xpos[eid][:2] - ps[:2]
+                o[en_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r
+                o[en_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r
+                o[en_idx.VISIBLE] = 1.0
+                # 他エージェントの向き情報（自分基準の相対yaw角）をcos,sinで観測にセット
+                agent_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]['rot']]])
+                rel_agent_rot = agent_rot - rv
+                o[en_idx.QUAT_0] = math.cos(rel_agent_rot)
+                o[en_idx.QUAT_1] = math.sin(rel_agent_rot)
+            else:
+                o[en_idx.REL_X], o[en_idx.REL_Y] = 15.0, 15.0
+                o[en_idx.VISIBLE] = 0.0
+                o[en_idx.QUAT_0] = 0.0
+                o[en_idx.QUAT_1] = 0.0
         return o
 
     def render(self):
