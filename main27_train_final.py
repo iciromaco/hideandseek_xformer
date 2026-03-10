@@ -1,4 +1,3 @@
-# main27_train_final.py
 import sys
 import os
 import time
@@ -18,15 +17,11 @@ try:
 except ImportError:
     import toml as tomllib  # pip install toml
 
-
-
-# wandbはtry-import
 try:
     import wandb
 except Exception as exc:
     print(f"Exception in wandb import: {exc}")
     wandb = None
-
 
 # sys.path拡張（src配下の独自モジュール用）
 sys.path.append(
@@ -34,22 +29,29 @@ sys.path.append(
         os.path.join(os.path.dirname(__file__), "src")
     )
 )   
-# --- 必要な独自モジュール ---
+
 from envs.hns_environment import TeamCosEnv
 from models.ppo_transformer_v2 import AgentV2
 from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
 
 
- # --- ポリシーモード定数 ---
+# ============================================================================
+# ポリシーモード定数
+# ============================================================================
 POLICY_MODEL_IF_AVAILABLE = "model_if_available"
 POLICY_RULE = "rule"
 
-
-
 CONFIG_PATH = "configs/hparams_main27.toml"
 
-# CLI_PROFILE_OVERRIDE等の初期化を先に
+WORKER_SHUTDOWN_ERRORS = (EOFError, BrokenPipeError, ConnectionResetError)
+
+
+# ============================================================================
+# CLI/設定読み込み関数
+# ============================================================================
+
 def _cli_profile_override_from_argv(argv=None):
+    """CLIから --profile 引数を解析"""
     args = list(sys.argv[1:] if argv is None else argv)
     for i, token in enumerate(args):
         if token.startswith("--profile="):
@@ -59,12 +61,25 @@ def _cli_profile_override_from_argv(argv=None):
                 return args[i + 1]
     return None
 
-CLI_PROFILE_OVERRIDE = _cli_profile_override_from_argv()
+
+def _cli_compare_profiles_from_argv(argv=None):
+    """CLIから --compare-profiles 引数を解析"""
+    args = list(sys.argv[1:] if argv is None else argv)
+    raw = None
+    for i, token in enumerate(args):
+        if token.startswith("--compare-profiles="):
+            raw = token.split("=", 1)[1]
+            break
+        if token == "--compare-profiles" and i + 1 < len(args):
+            raw = args[i + 1]
+            break
+    if not raw:
+        return []
+    return [p.strip().lower() for p in str(raw).split(",") if p.strip()]
 
 
-
-# AVAILABLE_RUNTIME_PROFILESを先に初期化
 def _get_available_runtime_profiles(path):
+    """TOMLから利用可能なプロファイルを取得"""
     try:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
@@ -81,19 +96,24 @@ def _get_available_runtime_profiles(path):
         print(f"Exception in _get_available_runtime_profiles: {exc}")
         return ["train", "debug"]
 
-AVAILABLE_RUNTIME_PROFILES = _get_available_runtime_profiles("configs/hparams_main27.toml")
 
-def _normalize_profile_name(value):
+def _normalize_profile_name(value, available_profiles):
+    """プロファイル名を正規化"""
     text = str(value).strip().lower()
-    if text in AVAILABLE_RUNTIME_PROFILES:
+    if text in available_profiles:
         return text
     print(
         f"Invalid runtime.active_profile={value}. "
-        f"Fallback to train. available={AVAILABLE_RUNTIME_PROFILES}"
+        f"Fallback to train. available={available_profiles}"
     )
     return "train"
 
-def _load_runtime_config(path, profile_override=None):
+
+def _load_runtime_config(path, profile_override=None, available_profiles=None):
+    """ランタイム設定をロード"""
+    if available_profiles is None:
+        available_profiles = _get_available_runtime_profiles(path)
+    
     try:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
@@ -108,7 +128,7 @@ def _load_runtime_config(path, profile_override=None):
         profile_origin = (
             "cli(--profile)" if profile_override is not None else "toml(runtime.active_profile)"
         )
-        profile = _normalize_profile_name(profile_value)
+        profile = _normalize_profile_name(profile_value, available_profiles)
         common = (
             runtime_cfg.get("common", {}) if isinstance(runtime_cfg, dict) else {}
         )
@@ -128,14 +148,96 @@ def _load_runtime_config(path, profile_override=None):
             "Fix the TOML and retry."
         ) from exc
 
+
+def _parse_cli_args(argv=None):
+    """CLIの引数をパース"""
+    cli_examples = (
+        "実行例:\n"
+        "  1) 学習を実行する（TOMLで train を選択）\n"
+        "     # configs/hparams_main27.toml の runtime.active_profile = 'train'\n"
+        "     uv run mjpython main27_train_final.py\n\n"
+        "  1-b) 実行時オプションで train を選択（TOMLを編集しない）\n"
+        "     uv run mjpython main27_train_final.py --profile train\n\n"
+        "  2) 学習結果を確認する（デバッグ再生）\n"
+        "     # configs/hparams_main27.toml の runtime.active_profile = 'debug'\n"
+        "     uv run mjpython main27_train_final.py\n\n"
+        "  2-b) 実行時オプションで debug を選択（TOMLを編集しない）\n"
+        "     uv run mjpython main27_train_final.py --profile debug\n\n"
+        "  2-c) 複数プロファイルを連続実行（比較）\n"
+        "     uv run mjpython main27_train_final.py --compare-profiles train_wall_only,train_no_wall_stick,train_base_reward\n\n"
+        "  3) ヘルプと実行例を表示\n"
+        "     uv run mjpython main27_train_final.py -h\n"
+    )
+    
+    parser = argparse.ArgumentParser(
+        description="HideAndSeek Transformer v27 runner",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=cli_examples,
+    )
+    parser.add_argument(
+        "-p",
+        "--profile",
+        help="実行時だけ runtime profile を上書き（TOMLは変更しない）",
+    )
+    parser.add_argument(
+        "--compare-profiles",
+        help=(
+            "カンマ区切りで複数 profile を順次実行（例: "
+            "train_wall_only,train_no_wall_stick,train_base_reward）"
+        ),
+    )
+    parser.add_argument(
+        "--examples",
+        action="store_true",
+        help="実行例のみ表示して終了",
+    )
+    args, _ = parser.parse_known_args(argv)
+    if args.examples:
+        print(cli_examples)
+        raise SystemExit(0)
+
+
+def _to_bool(value):
+    """文字列をboolに変換"""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cfg(name, default, cast=None, overrides=None):
+    """設定値を取得（オーバーライドを優先）"""
+    if overrides is None:
+        overrides = {}
+    if name in overrides:
+        raw = overrides[name]
+    else:
+        raw = default
+    if cast is None:
+        return raw
+    return cast(raw)
+
+
+# ============================================================================
+# グローバル設定の初期化（一度だけ）
+# ============================================================================
+
+# CLI設定の取得
+CLI_PROFILE_OVERRIDE = _cli_profile_override_from_argv()
+CLI_COMPARE_PROFILES = _cli_compare_profiles_from_argv()
+
+# 利用可能なプロファイルの取得
+AVAILABLE_RUNTIME_PROFILES = _get_available_runtime_profiles(CONFIG_PATH)
+
+# ランタイム設定のロード
+RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(
+    CONFIG_PATH, CLI_PROFILE_OVERRIDE, AVAILABLE_RUNTIME_PROFILES
+)
+
+# TOMLの読み込み
 with open(CONFIG_PATH, "rb") as f:
     config = tomllib.load(f)
 
-RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(
-    CONFIG_PATH, CLI_PROFILE_OVERRIDE
-)
-
-# ここでhpを構築
+# ハイパーパラメータの構築
 hp = dict(config.get("base", {}))
 runtime_common = config.get("runtime", {}).get("common", {})
 if runtime_common:
@@ -146,28 +248,95 @@ if runtime_profile:
 if RUNTIME_OVERRIDES:
     hp.update(RUNTIME_OVERRIDES)
 
+# フラグの初期化
+TRAIN_MODE = _cfg("train_mode", "0", _to_bool, RUNTIME_OVERRIDES)
+USE_VIEWER = _cfg("use_viewer", "1", _to_bool, RUNTIME_OVERRIDES)
+NPC_ONLY_DEBUG = _cfg("npc_only_debug", "1", _to_bool, RUNTIME_OVERRIDES)
+SHOW_TURN_LINES = _cfg("show_turn_lines", "0", _to_bool, RUNTIME_OVERRIDES)
+USE_CUSTOM_REWARD = _cfg("use_custom_reward", "1", _to_bool, RUNTIME_OVERRIDES)
+AUTO_TUNE_HPARAMS = _cfg("auto_tune_hparams", "1", _to_bool, RUNTIME_OVERRIDES)
+DEBUG_HIDER_POLICY = _cfg("debug_hider_policy", "rule", str, RUNTIME_OVERRIDES)
+DEBUG_SEEKER_POLICY = _cfg("debug_seeker_policy", "rule", str, RUNTIME_OVERRIDES)
+DEBUG_DETERMINISTIC_INFERENCE = _cfg("debug_deterministic_inference", "0", _to_bool, RUNTIME_OVERRIDES)
+DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("debug_symmetric_hider_policy", "0", _to_bool, RUNTIME_OVERRIDES)
+TRAIN_OTHER_HIDER_POLICY = _cfg("train_other_hider_policy", "rule", str, RUNTIME_OVERRIDES)
+TRAIN_OTHER_SEEKER_POLICY = _cfg("train_other_seeker_policy", "rule", str, RUNTIME_OVERRIDES)
 
-CONFIG_PATH = "configs/hparams_main27.toml"
+if not TRAIN_MODE:
+    USE_VIEWER = True
+    AUTO_TUNE_HPARAMS = False
 
+MODE = _cfg("mode", "refinement", str, RUNTIME_OVERRIDES)
+TRAINING_TARGET = _cfg("training_target", "seeker", str, RUNTIME_OVERRIDES)
 
-CLI_EXAMPLES = (
-    "実行例:\n"
-    "  1) 学習を実行する（TOMLで train を選択）\n"
-    "     # configs/hparams_main27.toml の runtime.active_profile = 'train'\n"
-    "     uv run mjpython main27_train_final.py\n\n"
-    "  1-b) 実行時オプションで train を選択（TOMLを編集しない）\n"
-    "     uv run mjpython main27_train_final.py --profile train\n\n"
-    "  2) 学習結果を確認する（デバッグ再生）\n"
-    "     # configs/hparams_main27.toml の runtime.active_profile = 'debug'\n"
-    "     uv run mjpython main27_train_final.py\n\n"
-    "  2-b) 実行時オプションで debug を選択（TOMLを編集しない）\n"
-    "     uv run mjpython main27_train_final.py --profile debug\n\n"
-    "  2-c) 複数プロファイルを連続実行（比較）\n"
-    "     uv run mjpython main27_train_final.py --compare-profiles train_wall_only,train_no_wall_stick,train_base_reward\n\n"
-    "  3) ヘルプと実行例を表示\n"
-    "     uv run mjpython main27_train_final.py -h\n"
-)
+ENV_CONFIG = {
+    "n_seekers": _cfg("n_seekers", "1", int, RUNTIME_OVERRIDES),
+    "n_hiders": _cfg("n_hiders", "2", int, RUNTIME_OVERRIDES),
+    "n_boxes": _cfg("n_boxes", "2", int, RUNTIME_OVERRIDES),
+    "n_ramps": _cfg("n_ramps", "1", int, RUNTIME_OVERRIDES),
+    "mode4_sdf_cell_size": _cfg("mode4_sdf_cell_size", "0.05", float, RUNTIME_OVERRIDES),
+    "show_turn_lines": SHOW_TURN_LINES,
+    "policy_source_log": _cfg("policy_source_log", "0", _to_bool, RUNTIME_OVERRIDES),
+    "policy_source_log_each_reset": _cfg("policy_source_log_each_reset", "0", _to_bool, RUNTIME_OVERRIDES),
+    "debug_log_interval_steps": _cfg("debug_log_interval_steps", "200", int, RUNTIME_OVERRIDES),
+    "action_repeat": _cfg("action_repeat", "16", int, RUNTIME_OVERRIDES),
+}
 
+SEQ_LEN = _cfg("seq_len", "16", int, RUNTIME_OVERRIDES)
+HIDDEN_DIM = _cfg("hidden_dim", "256", int, RUNTIME_OVERRIDES)
+NUM_ENVS = _cfg("num_envs", "8", int, RUNTIME_OVERRIDES)
+ACTION_REPEAT = _cfg("action_repeat", "10", int, RUNTIME_OVERRIDES)
+
+RAMP_CHECK_ENABLED = _cfg("ramp_check_enabled", "1", _to_bool, RUNTIME_OVERRIDES)
+RAMP_CHECK_INTERVAL = _cfg("ramp_check_interval", str(hp.get("save_interval", 50)), int, RUNTIME_OVERRIDES)
+RAMP_CHECK_EPISODES = _cfg("ramp_check_episodes", "3", int, RUNTIME_OVERRIDES)
+RAMP_CHECK_STEPS = _cfg("ramp_check_steps", "220", int, RUNTIME_OVERRIDES)
+RAMP_CHECK_VIEWER = _cfg("ramp_check_viewer", "0", _to_bool, RUNTIME_OVERRIDES)
+RAMP_CHECK_FORCE_UPHILL = _cfg("ramp_check_force_uphill", "1", _to_bool, RUNTIME_OVERRIDES)
+RAMP_SUCCESS_PROG = _cfg("ramp_success_prog", "0.90", float, RUNTIME_OVERRIDES)
+RAMP_SUCCESS_TOP = _cfg("ramp_success_top", "0.05", float, RUNTIME_OVERRIDES)
+RAMP_SUCCESS_LAT = _cfg("ramp_success_lat", "0.75", float, RUNTIME_OVERRIDES)
+RAMP_SUCCESS_Z_RISE = _cfg("ramp_success_z_rise", "0.18", float, RUNTIME_OVERRIDES)
+
+WANDB_ENABLED = _cfg("wandb_enabled", "1", _to_bool, RUNTIME_OVERRIDES)
+WANDB_PROJECT = _cfg("wandb_project", "hideandseek-xformer", str, RUNTIME_OVERRIDES)
+WANDB_ENTITY = _cfg("wandb_entity", "", str, RUNTIME_OVERRIDES)
+WANDB_MODE = _cfg("wandb_mode", "online", str, RUNTIME_OVERRIDES)
+WANDB_RUN_NAME = _cfg("wandb_run_name", "", str, RUNTIME_OVERRIDES)
+WANDB_LOG_CODE = _cfg("wandb_log_code", "1", _to_bool, RUNTIME_OVERRIDES)
+WANDB_CODE_ROOT = _cfg("wandb_code_root", os.path.dirname(__file__), str, RUNTIME_OVERRIDES)
+
+RESUME_TRAINING = _cfg("resume_training", "0", _to_bool, RUNTIME_OVERRIDES)
+RESET_MODEL_ON_TRAIN = _cfg("reset_model_on_train", "0", _to_bool, RUNTIME_OVERRIDES)
+HPARAMS_CONFIG_PATH = CONFIG_PATH
+
+# 報酬形成係数
+RW_SEEK_VISIBLE_BONUS = _cfg("rw_seek_visible_bonus", "0.03", float, RUNTIME_OVERRIDES)
+RW_SEEK_DIST_GAIN = _cfg("rw_seek_dist_gain", "0.03", float, RUNTIME_OVERRIDES)
+RW_SEEK_IDLE_PENALTY = _cfg("rw_seek_idle_penalty", "0.01", float, RUNTIME_OVERRIDES)
+RW_WALL_NEAR_THRESHOLD = _cfg("rw_wall_near_threshold", "0.18", float, RUNTIME_OVERRIDES)  # 壁近判定閾値（全エージェント共通）
+RW_STILL_SPEED_THRESHOLD = _cfg("rw_still_speed_threshold", "0.05", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値（全エージェント共通）
+
+RW_MOVE_SAT_PENALTY = _cfg("rw_move_sat_penalty", "0.02", float, RUNTIME_OVERRIDES)
+RW_TURN_SAT_PENALTY = _cfg("rw_turn_sat_penalty", "0.01", float, RUNTIME_OVERRIDES)
+RW_MOVE_CTRL_COST = _cfg("rw_move_ctrl_cost", "0.001", float, RUNTIME_OVERRIDES)
+RW_HAND_CTRL_COST = _cfg("rw_hand_ctrl_cost", "0.0005", float, RUNTIME_OVERRIDES)
+
+RW_MOVE_INCENTIVE = _cfg("rw_move_incentive", "0.02", float, RUNTIME_OVERRIDES)
+RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float, RUNTIME_OVERRIDES)
+RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.05", float, RUNTIME_OVERRIDES)
+# --- 壁張り付きペナルティ（全エージェント共通） ---
+RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.1", float, RUNTIME_OVERRIDES)
+
+# --- 速度・回転の閾値（TOMLで設定可） ---
+IDLE_SPEED_THRESHOLD = _cfg("idle_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値
+MOVE_INCENTIVE_SPEED_THRESHOLD = _cfg("move_incentive_speed_threshold", "0.3", float, RUNTIME_OVERRIDES)  # インセンティブ速度閾値
+MOVE_SAT_THRESHOLD = _cfg("move_sat_threshold", "1.0", float, RUNTIME_OVERRIDES)  # 行動飽和の閾値（速度）
+TURN_SAT_THRESHOLD = _cfg("turn_sat_threshold", "1.0", float, RUNTIME_OVERRIDES)  # 行動飽和の閾値（回転）
+
+# ============================================================================
+# 観測履歴・ユーティリティクラス
+# ============================================================================
 
 class ObsHistory:
     def __init__(self, num_envs, seq_len, obs_dim, device):
@@ -229,462 +398,13 @@ class ObsHistory:
         end = self.ptr + self.seq_len
         return self.buffer[:, start:end]
 
-# --- 未定義関数・変数のダミー実装（必要に応じて本実装に差し替えてください） ---
-def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_idx_cache=None):
-    """
-    カスタム報酬関数（ユーザー定義版）。
-    obs: 観測（1次元np.array）
-    action: 行動（1次元np.array）
-    base_reward: 環境からの基本報酬
-    idx: env.idx
-    target: "hider" or "seeker"
-    info: info dict
-    reward_idx_cache: インデックスキャッシュ（省略可）
-    """
-    cache = (
-        reward_idx_cache
-        if reward_idx_cache is not None
-        else _build_reward_index_cache(idx)
-    )
-    move = float(action[0]) if len(action) > 0 else 0.0
-    turn = float(action[1]) if len(action) > 1 else 0.0
-    vel_x = float(obs[cache["self_vel_x"]])
-    vel_y = float(obs[cache["self_vel_y"]])
-    speed = math.sqrt(vel_x * vel_x + vel_y * vel_y)
-    bonus = 0.0
-    AGENT_RADIUS = 0.4
-    WALL_NEAR = AGENT_RADIUS + 0.2  # 0.6
-    WALL_SAFE = AGENT_RADIUS + 0.5  # 0.9
 
-    # --- 速度・移動に関する報酬・ペナルティ（共通） ---
-    MOVE_SAT_THRESHOLD = _cfg("move_sat_threshold", "1.0", float)
-    TURN_SAT_THRESHOLD = _cfg("turn_sat_threshold", "1.0", float)
-    RW_IDLE_SPEED_THRESHOLD = _cfg("idle_speed_threshold", "0.1", float)
-    RW_MOVE_INCENTIVE_SPEED_THRESHOLD = _cfg("move_incentive_speed_threshold", "0.3", float)
-    if speed > MOVE_SAT_THRESHOLD:
-        bonus -= RW_MOVE_SAT_PENALTY
-    elif speed < RW_IDLE_SPEED_THRESHOLD:
-        bonus -= RW_IDLE_PENALTY
-    elif speed > RW_MOVE_INCENTIVE_SPEED_THRESHOLD:
-        bonus += RW_MOVE_INCENTIVE
-    if abs(turn) > TURN_SAT_THRESHOLD:
-        bonus -= RW_TURN_SAT_PENALTY
-    # 4. コントロールコスト
-    control_cost = -RW_MOVE_CTRL_COST * (move * move + turn * turn)
-    # 5. 壁張り付きペナルティ
-    if _is_wall_stick_state(obs, idx, reward_idx_cache=reward_idx_cache):
-        bonus -= RW_HIDE_WALL_STICK_PENALTY
-
-    # --- エージェント固有ロジック ---
-    if target == "hider":
-        # hider固有の追加ロジックがあればここに
-        pass
-    else:
-        for j in range(len(cache["enemy_visible"])):
-            if obs[cache["enemy_visible"][j]] > 0.5:
-                dx = float(obs[cache["enemy_rel_x"][j]])
-                dy = float(obs[cache["enemy_rel_y"][j]])
-                dist = math.sqrt(dx * dx + dy * dy)
-                bonus += RW_SEEK_VISIBLE_BONUS / (dist + 1.0)
-    """
-    カスタム報酬関数（ユーザー定義版）。
-    obs: 観測（1次元np.array）
-    action: 行動（1次元np.array）
-    base_reward: 環境からの基本報酬
-    idx: env.idx
-    target: "hider" or "seeker"
-    info: info dict
-    reward_idx_cache: インデックスキャッシュ（省略可）
-    """
-    cache = (
-        reward_idx_cache
-        if reward_idx_cache is not None
-        else _build_reward_index_cache(idx)
-    )
-    move = float(action[0]) if len(action) > 0 else 0.0
-    turn = float(action[1]) if len(action) > 1 else 0.0
-    vel_x = float(obs[cache["self_vel_x"]])
-    vel_y = float(obs[cache["self_vel_y"]])
-    speed = math.sqrt(vel_x * vel_x + vel_y * vel_y)
-    bonus = 0.0
-    AGENT_RADIUS = 0.4
-    WALL_NEAR = AGENT_RADIUS + 0.2  # 0.6
-    WALL_SAFE = AGENT_RADIUS + 0.5  # 0.9
-
-    # --- 速度・移動に関する報酬・ペナルティ（共通） ---
-    # 1. 停滞ペナルティ
-    if speed < 0.1:
-        bonus -= RW_IDLE_PENALTY
-    # 2. 速度インセンティブ
-    if speed > 0.3:
-        bonus += RW_MOVE_INCENTIVE
-    # 3. 速度飽和ペナルティ
-    MOVE_SAT_THRESHOLD = 1.0
-    TURN_SAT_THRESHOLD = 1.0
-    if abs(vel_x) > MOVE_SAT_THRESHOLD or abs(vel_y) > MOVE_SAT_THRESHOLD:
-        bonus -= RW_MOVE_SAT_PENALTY
-    if abs(turn) > TURN_SAT_THRESHOLD:
-        bonus -= RW_TURN_SAT_PENALTY
-    # 4. コントロールコスト
-    control_cost = -RW_MOVE_CTRL_COST * (move * move + turn * turn)
-    # 5. 壁張り付きペナルティ
-    if _is_wall_stick_state(obs, idx, reward_idx_cache=reward_idx_cache):
-        bonus -= RW_HIDE_WALL_STICK_PENALTY
-
-    # --- エージェント固有ロジック ---
-    if target == "hider":
-        # hider固有の追加ロジックがあればここに
-        pass
-    else:
-        for j in range(len(cache["enemy_visible"])):
-            if obs[cache["enemy_visible"][j]] > 0.5:
-                dx = float(obs[cache["enemy_rel_x"][j]])
-                dy = float(obs[cache["enemy_rel_y"][j]])
-                dist = math.sqrt(dx * dx + dy * dy)
-                bonus += RW_SEEK_VISIBLE_BONUS / (dist + 1.0)
-
-    # --- wall_distanceベースの壁ペナルティ（hider/seeker共通） ---
-    if info is not None and 'wall_distance' in info:
-        wall_distance = info['wall_distance']
-        if isinstance(wall_distance, (list, tuple, np.ndarray)):
-            wall_distance = float(np.min(wall_distance))
-        else:
-            wall_distance = float(wall_distance)
-        if wall_distance < WALL_NEAR:
-            bonus -= RW_WALL_AVOID_PENALTY * (
-                1.0 - np.clip(wall_distance / WALL_NEAR, 0, 1)
-            )
-        elif wall_distance < WALL_SAFE:
-            bonus -= (
-                RW_WALL_AVOID_PENALTY
-                * (WALL_SAFE - wall_distance)
-                / (WALL_SAFE - WALL_NEAR)
-                / 2.0
-            )
-    return float(base_reward) + bonus + control_cost
-
-def evaluate_fixed_ramp_climb(mode, target, agent, device, episodes=3, max_steps=220):
-    """
-    固定ランプ登坂評価（ユーザー定義版）。
-    mode: 環境モード
-    target: "hider" or "seeker"
-    agent: 学習済みエージェント
-    device: torchデバイス
-    episodes: 評価エピソード数
-    max_steps: 1エピソードの最大ステップ数
-    """
-    from collections import deque
-    env = build_env(mode, target, ENV_CONFIG, render_mode=None)
-    idx = env.idx
-    obs_dim = env.observation_space.shape[0]
-    history = ObsHistory(1, SEQ_LEN, obs_dim, device)
-    success_count = 0
-    peak_heights = []
-    peak_progress = []
-    for ep in range(episodes):
-        obs, _ = env.reset()
-        history.prime_single(obs)
-        done = False
-        max_height = -float('inf')
-        max_progress = -float('inf')
-        for step in range(max_steps):
-            with torch.no_grad():
-                seq = history.get()
-                out = agent.get_action_and_value(seq)
-                action = out[0].cpu().numpy().reshape(-1)
-            next_obs, _, term, trun, info = env.step(action)
-            history.update(next_obs)
-            obs = next_obs
-            if 'dbg_ramp_height' in info:
-                h = float(info['dbg_ramp_height'])
-                if h > max_height:
-                    max_height = h
-            if 'dbg_ramp_progress' in info:
-                p = float(info['dbg_ramp_progress'])
-                if p > max_progress:
-                    max_progress = p
-            done = bool(term or trun)
-            if done:
-                break
-        peak_heights.append(max_height)
-        peak_progress.append(max_progress)
-        # 成功判定: 進捗0.9以上 or 高さ0.18以上
-        if (
-            max_progress >= RAMP_SUCCESS_PROG
-            or max_height >= RAMP_SUCCESS_Z_RISE
-        ):
-            success_count += 1
-    env.close()
-    return {
-        "success_rate": success_count / max(episodes, 1),
-        "peak_height_mean": (
-            float(np.mean(peak_heights)) if peak_heights else 0.0
-        ),
-        "peak_progress_mean": (
-            float(np.mean(peak_progress)) if peak_progress else 0.0
-        ),
-    }
-
-def run_ramp_check_viewer(mode, target, agent, device, episodes=1, max_steps=220):
-    """
-    ランプ登坂デバッグビューワ（ユーザー定義版）。
-    mode: 環境モード
-    target: "hider" or "seeker"
-    agent: 学習済みエージェント
-    device: torchデバイス
-    episodes: 評価エピソード数
-    max_steps: 1エピソードの最大ステップ数
-    """
-    env = build_env(mode, target, ENV_CONFIG, render_mode="human")
-    idx = env.idx
-    obs_dim = env.observation_space.shape[0]
-    history = ObsHistory(1, SEQ_LEN, obs_dim, device)
-    for ep in range(episodes):
-        obs, _ = env.reset()
-        history.prime_single(obs)
-        done = False
-        for step in range(max_steps):
-            with torch.no_grad():
-                seq = history.get()
-                out = agent.get_action_and_value(seq)
-                action = out[0].cpu().numpy().reshape(-1)
-            next_obs, _, term, trun, info = env.step(action)
-            history.update(next_obs)
-            obs = next_obs
-            env.render()
-            time.sleep(0.025)
-            done = bool(term or trun)
-            if done:
-                break
-    env.close()
-
-
-def _cli_profile_override_from_argv(argv=None):
-    args = list(sys.argv[1:] if argv is None else argv)
-    for i, token in enumerate(args):
-        if token.startswith("--profile="):
-            return token.split("=", 1)[1]
-        if token in {"--profile", "-p"}:
-            if i + 1 < len(args):
-                return args[i + 1]
-    return None
-
-
-def _cli_compare_profiles_from_argv(argv=None):
-    args = list(sys.argv[1:] if argv is None else argv)
-    raw = None
-    for i, token in enumerate(args):
-        if token.startswith("--compare-profiles="):
-            raw = token.split("=", 1)[1]
-            break
-        if token == "--compare-profiles" and i + 1 < len(args):
-            raw = args[i + 1]
-            break
-    if not raw:
-        return []
-    return [p.strip().lower() for p in str(raw).split(",") if p.strip()]
-
-
-CLI_PROFILE_OVERRIDE = _cli_profile_override_from_argv()
-CLI_COMPARE_PROFILES = _cli_compare_profiles_from_argv()
-
-
-def _get_available_runtime_profiles(path):
-    try:
-        with open(path, "rb") as f:
-            raw = tomllib.load(f)
-        runtime_cfg = raw.get("runtime", {}) if isinstance(raw, dict) else {}
-        names = {"train", "debug"}
-        if isinstance(runtime_cfg, dict):
-            for key, value in runtime_cfg.items():
-                if key in {"active_profile", "common"}:
-                    continue
-                if isinstance(value, dict):
-                    names.add(str(key).strip().lower())
-        return sorted(names)
-    except Exception as exc:
-        print(f"Exception in _get_available_runtime_profiles: {exc}")
-        return ["train", "debug"]
-
-
-AVAILABLE_RUNTIME_PROFILES = _get_available_runtime_profiles(CONFIG_PATH)
-
-
-def _parse_cli_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description="HideAndSeek Transformer v27 runner",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog=CLI_EXAMPLES,
-    )
-    parser.add_argument(
-        "-p",
-        "--profile",
-        help="実行時だけ runtime profile を上書き（TOMLは変更しない）",
-    )
-    parser.add_argument(
-        "--compare-profiles",
-        help=(
-            "カンマ区切りで複数 profile を順次実行（例: "
-            "train_wall_only,train_no_wall_stick,train_base_reward）"
-        ),
-    )
-    parser.add_argument(
-        "--examples",
-        action="store_true",
-        help="実行例のみ表示して終了",
-    )
-    args, _ = parser.parse_known_args(argv)
-    if args.examples:
-        print(CLI_EXAMPLES)
-        raise SystemExit(0)
-
-
-def _normalize_profile_name(value):
-    text = str(value).strip().lower()
-    if text in AVAILABLE_RUNTIME_PROFILES:
-        return text
-    print(
-        f"Invalid runtime.active_profile={value}. "
-        f"Fallback to train. available={AVAILABLE_RUNTIME_PROFILES}"
-    )
-    return "train"
-
-
-def _load_runtime_config(path, profile_override=None):
-    try:
-        with open(path, "rb") as f:
-            raw = tomllib.load(f)
-        runtime_cfg = raw.get("runtime", {}) if isinstance(raw, dict) else {}
-        if not isinstance(runtime_cfg, dict):
-            runtime_cfg = {}
-        profile_value = (
-            profile_override
-            if profile_override is not None
-            else runtime_cfg.get("active_profile", "train")
-        )
-        profile_origin = (
-            "cli(--profile)" if profile_override is not None else "toml(runtime.active_profile)"
-        )
-        profile = _normalize_profile_name(profile_value)
-        common = (
-            runtime_cfg.get("common", {}) if isinstance(runtime_cfg, dict) else {}
-        )
-        profile_cfg = (
-            runtime_cfg.get(profile, {}) if isinstance(runtime_cfg, dict) else {}
-        )
-        if not isinstance(common, dict):
-            common = {}
-        if not isinstance(profile_cfg, dict):
-            profile_cfg = {}
-        merged = dict(common)
-        merged.update(profile_cfg)
-        return merged, profile, profile_origin
-    except Exception as exc:
-        raise SystemExit(
-            f"runtime config load failed: {path} ({exc}). "
-            "Fix the TOML and retry."
-        ) from exc
-
-
-
-def _to_bool(value):
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _cfg(name, default, cast=None):
-    if name in RUNTIME_OVERRIDES:
-        raw = RUNTIME_OVERRIDES[name]
-    else:
-        raw = default
-    if cast is None:
-        return raw
-    return cast(raw)
-
-TRAIN_MODE = _cfg("train_mode", "0", _to_bool)
-USE_VIEWER = _cfg("use_viewer", "1", _to_bool)
-NPC_ONLY_DEBUG = _cfg("npc_only_debug", "1", _to_bool)
-SHOW_TURN_LINES = _cfg("show_turn_lines", "0", _to_bool)
-USE_CUSTOM_REWARD = _cfg("use_custom_reward", "1", _to_bool)
-AUTO_TUNE_HPARAMS = _cfg("auto_tune_hparams", "1", _to_bool)
-DEBUG_HIDER_POLICY = _cfg("debug_hider_policy", "rule", str)
-DEBUG_SEEKER_POLICY = _cfg("debug_seeker_policy", "rule", str)
-DEBUG_DETERMINISTIC_INFERENCE = _cfg("debug_deterministic_inference", "0", _to_bool)
-DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("debug_symmetric_hider_policy", "0", _to_bool)
-TRAIN_OTHER_HIDER_POLICY = _cfg("train_other_hider_policy", "rule", str)
-TRAIN_OTHER_SEEKER_POLICY = _cfg("train_other_seeker_policy", "rule", str)
-
-if not TRAIN_MODE:
-    USE_VIEWER = True
-    AUTO_TUNE_HPARAMS = False
-
-MODE = _cfg("mode", "refinement", str)
-TRAINING_TARGET = _cfg("training_target", "seeker", str)
-
-ENV_CONFIG = {
-    "n_seekers": _cfg("n_seekers", "1", int),
-    "n_hiders": _cfg("n_hiders", "2", int),
-    "n_boxes": _cfg("n_boxes", "2", int),
-    "n_ramps": _cfg("n_ramps", "1", int),
-    "mode4_sdf_cell_size": _cfg("mode4_sdf_cell_size", "0.05", float),
-    "show_turn_lines": SHOW_TURN_LINES,
-    "policy_source_log": _cfg("policy_source_log", "0", _to_bool),
-    "policy_source_log_each_reset": _cfg("policy_source_log_each_reset", "0", _to_bool),
-    "debug_log_interval_steps": _cfg("debug_log_interval_steps", "200", int),
-    "action_repeat": _cfg("action_repeat", "16", int),
-}
-
-SEQ_LEN = _cfg("seq_len", "16", int)
-HIDDEN_DIM = _cfg("hidden_dim", "256", int)
-NUM_ENVS = _cfg("num_envs", "8", int)
-ACTION_REPEAT = _cfg("action_repeat", "10", int)
-
-WORKER_SHUTDOWN_ERRORS = (EOFError, BrokenPipeError, ConnectionResetError)
-
-RAMP_CHECK_ENABLED = _cfg("ramp_check_enabled", "1", _to_bool)
-RAMP_CHECK_INTERVAL = _cfg("ramp_check_interval", str(hp["save_interval"]) if "save_interval" in hp else "50", int)
-RAMP_CHECK_EPISODES = _cfg("ramp_check_episodes", "3", int)
-RAMP_CHECK_STEPS = _cfg("ramp_check_steps", "220", int)
-RAMP_CHECK_VIEWER = _cfg("ramp_check_viewer", "0", _to_bool)
-RAMP_CHECK_FORCE_UPHILL = _cfg("ramp_check_force_uphill", "1", _to_bool)
-RAMP_SUCCESS_PROG = _cfg("ramp_success_prog", "0.90", float)
-RAMP_SUCCESS_TOP = _cfg("ramp_success_top", "0.05", float)
-RAMP_SUCCESS_LAT = _cfg("ramp_success_lat", "0.75", float)
-RAMP_SUCCESS_Z_RISE = _cfg("ramp_success_z_rise", "0.18", float)
-
-WANDB_ENABLED = _cfg("wandb_enabled", "1", _to_bool)
-WANDB_PROJECT = _cfg("wandb_project", "hideandseek-xformer", str)
-WANDB_ENTITY = _cfg("wandb_entity", "", str)
-WANDB_MODE = _cfg("wandb_mode", "online", str)
-WANDB_RUN_NAME = _cfg("wandb_run_name", "", str)
-WANDB_LOG_CODE = _cfg("wandb_log_code", "1", _to_bool)
-WANDB_CODE_ROOT = _cfg("wandb_code_root", os.path.dirname(__file__), str)
-
-# Checkpoint handling
-RESUME_TRAINING = _cfg("resume_training", "0", _to_bool)
-RESET_MODEL_ON_TRAIN = _cfg("reset_model_on_train", "0", _to_bool)
-HPARAMS_CONFIG_PATH = CONFIG_PATH
-
-# Reward shaping coefficients
-RW_SEEK_VISIBLE_BONUS = _cfg("rw_seek_visible_bonus", "0.03", float)
-RW_SEEK_DIST_GAIN = _cfg("rw_seek_dist_gain", "0.03", float)
-RW_SEEK_IDLE_PENALTY = _cfg("rw_seek_idle_penalty", "0.01", float)
-RW_HIDE_WALL_NEAR_THRESHOLD = _cfg("rw_hide_wall_near_threshold", "0.18", float)
-RW_HIDE_STILL_SPEED_THRESHOLD = _cfg("rw_hide_still_speed_threshold", "0.05", float)
-
-RW_MOVE_SAT_PENALTY = _cfg("rw_move_sat_penalty", "0.02", float)
-RW_TURN_SAT_PENALTY = _cfg("rw_turn_sat_penalty", "0.01", float)
-RW_MOVE_CTRL_COST = _cfg("rw_move_ctrl_cost", "0.001", float)
-RW_HAND_CTRL_COST = _cfg("rw_hand_ctrl_cost", "0.0005", float)
-
-RW_MOVE_INCENTIVE = _cfg("rw_move_incentive", "0.02", float)
-RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float)
-RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.05", float)
-RW_HIDE_WALL_STICK_PENALTY = _cfg("rw_hide_wall_stick_penalty", "0.1", float)
-
+# ============================================================================
+# 報酬計算関数（インデックス・バッチ処理）
+# ============================================================================
 
 def _index_spec_to_array(index_spec):
+    """インデックス仕様を配列に変換"""
     if isinstance(index_spec, slice):
         start = 0 if index_spec.start is None else int(index_spec.start)
         stop = int(index_spec.stop)
@@ -694,6 +414,7 @@ def _index_spec_to_array(index_spec):
 
 
 def _build_reward_index_cache(idx):
+    """報酬計算用のインデックスキャッシュを構築"""
     return {
         "self_vel_x": int(idx.SELF.VEL_X),
         "self_vel_y": int(idx.SELF.VEL_Y),
@@ -705,6 +426,7 @@ def _build_reward_index_cache(idx):
 
 
 def _min_lidar_from_obs(obs, lidar_indices):
+    """観測からLiDAー最小値を取得"""
     lidar_min = 1.0
     for lidar_idx in lidar_indices:
         value = float(obs[int(lidar_idx)])
@@ -712,6 +434,16 @@ def _min_lidar_from_obs(obs, lidar_indices):
             lidar_min = value
     return lidar_min
 
+
+def _is_wall_stick_state(obs, idx, reward_idx_cache=None):
+    """壁張り付き状態かチェック（全エージェント共通）"""
+    cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
+    speed = math.sqrt(float(obs[cache["self_vel_x"]]) ** 2 + float(obs[cache["self_vel_y"]]) ** 2)
+    lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
+    return bool(
+        (lidar_min < RW_WALL_NEAR_THRESHOLD)
+        and (speed < RW_STILL_SPEED_THRESHOLD)
+    )
 
 @njit([
     "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32)"
@@ -732,6 +464,7 @@ def _compute_custom_reward_batch_numba(
     idle_penalty,
     wall_avoid_penalty,
 ):
+    """バッチ報酬計算（Numba JIT最適化）"""
     n_envs = obs_batch.shape[0]
     rewards = np.empty(n_envs, dtype=np.float32)
     for i in prange(n_envs):
@@ -781,20 +514,92 @@ def _compute_custom_reward_batch_numba(
     return rewards
 
 
-def _is_wall_stick_state(obs, idx, reward_idx_cache=None):
-    cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
-    speed = math.sqrt(float(obs[cache["self_vel_x"]]) ** 2 + float(obs[cache["self_vel_y"]]) ** 2)
-    lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
-    return bool(
-        (lidar_min < RW_HIDE_WALL_NEAR_THRESHOLD)
-        and (speed < RW_HIDE_STILL_SPEED_THRESHOLD)
+def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_idx_cache=None):
+    """
+    カスタム報酬関数（単一ステップ）。
+    obs: 観測（1次元np.array）
+    action: 行動（1次元np.array）
+    base_reward: 環境からの基本報酬
+    idx: env.idx
+    target: "hider" or "seeker"
+    info: info dict
+    reward_idx_cache: インデックスキャッシュ（省略可）
+    """
+    cache = (
+        reward_idx_cache
+        if reward_idx_cache is not None
+        else _build_reward_index_cache(idx)
     )
+    move = float(action[0]) if len(action) > 0 else 0.0
+    turn = float(action[1]) if len(action) > 1 else 0.0
+    vel_x = float(obs[cache["self_vel_x"]])
+    vel_y = float(obs[cache["self_vel_y"]])
+    speed = math.sqrt(vel_x * vel_x + vel_y * vel_y)
+    bonus = 0.0
+    AGENT_RADIUS = 0.4
+    WALL_NEAR = AGENT_RADIUS + 0.2  # 0.6
+    WALL_SAFE = AGENT_RADIUS + 0.5  # 0.9
 
+    # --- 速度・移動に関する報酬・ペナルティ（共通） ---
+    if speed < IDLE_SPEED_THRESHOLD:
+        # 閾値未満の分だけ比例してペナルティを加算
+        bonus -= RW_IDLE_PENALTY * (IDLE_SPEED_THRESHOLD - speed)
+    elif speed < MOVE_INCENTIVE_SPEED_THRESHOLD:
+        # IDLE_SPEED_THRESHOLD～MOVE_INCENTIVE_SPEED_THRESHOLDで線形にインセンティブ
+        bonus += RW_MOVE_INCENTIVE * ((speed - IDLE_SPEED_THRESHOLD) / (MOVE_INCENTIVE_SPEED_THRESHOLD - IDLE_SPEED_THRESHOLD))
+    elif speed <= MOVE_SAT_THRESHOLD:
+        bonus += RW_MOVE_INCENTIVE
+    else:
+        bonus += RW_MOVE_INCENTIVE
+        # 超過分に比例してペナルティを加算
+        bonus -= RW_MOVE_SAT_PENALTY * (speed - MOVE_SAT_THRESHOLD)
+
+    if abs(turn) > TURN_SAT_THRESHOLD:
+        bonus -= RW_TURN_SAT_PENALTY
+    control_cost = -RW_MOVE_CTRL_COST * (move * move + turn * turn)
+    # --- 壁張り付きペナルティ（全エージェント共通） ---
+    if _is_wall_stick_state(obs, idx, reward_idx_cache=reward_idx_cache):
+        bonus -= RW_WALL_STICK_PENALTY
+
+    # --- wall_distanceベースの壁ペナルティ（hider/seeker共通） ---
+    if info is not None and 'wall_distance' in info:
+        wall_distance = info['wall_distance']
+        if isinstance(wall_distance, (list, tuple, np.ndarray)):
+            wall_distance = float(np.min(wall_distance))
+        else:
+            wall_distance = float(wall_distance)
+        if wall_distance < WALL_NEAR:
+            bonus -= RW_WALL_AVOID_PENALTY * (
+                1.0 - np.clip(wall_distance / WALL_NEAR, 0, 1)
+            )
+        elif wall_distance < WALL_SAFE:
+            bonus -= (
+                RW_WALL_AVOID_PENALTY
+                * (WALL_SAFE - wall_distance)
+                / (WALL_SAFE - WALL_NEAR)
+                / 2.0
+            )
+
+    # --- エージェント固有ロジック ---
+    if target == "hider":
+        pass
+    else:
+        for j in range(len(cache["enemy_visible"])):
+            if obs[cache["enemy_visible"][j]] > 0.5:
+                dx = float(obs[cache["enemy_rel_x"][j]])
+                dy = float(obs[cache["enemy_rel_y"][j]])
+                dist = math.sqrt(dx * dx + dy * dy)
+                bonus += RW_SEEK_VISIBLE_BONUS / (dist + 1.0)
+                
+    return float(base_reward) + bonus + control_cost
+
+
+# ============================================================================
+# 環境構築・ユーティリティ関数
+# ============================================================================
 
 def env_signature(config):
-    """
-    環境設定のシグネチャ文字列を生成（wandb名やログ用）
-    """
+    """環境設定のシグネチャ文字列を生成（wandb名やログ用）"""
     keys = [
         "n_seekers",
         "n_hiders",
@@ -804,15 +609,15 @@ def env_signature(config):
     ]
     return ",".join(f"{k}={config.get(k)}" for k in keys if k in config)
 
+
 def model_path_for_config(target, config):
-    """
-    モデルの保存・読み込み用パスを一意に決定する
-    """
+    """モデルの保存・読み込み用パスを一意に決定する"""
     fname = f"HNS_V27_{target}_s{config.get('n_seekers', 1)}_h{config.get('n_hiders', 2)}_b{config.get('n_boxes', 2)}_r{config.get('n_ramps', 1)}.pt"
     return os.path.join("checkpoints", fname)
 
 
 def build_env(mode, target, config, render_mode=None):
+    """環境を構築"""
     config = dict(config)  # 破壊的変更を避ける
     config.pop('num_envs', None)
     return TeamCosEnv(
@@ -823,25 +628,35 @@ def build_env(mode, target, config, render_mode=None):
     )
 
 
+# ============================================================================
+# モデル・状態管理関数
+# ============================================================================
+
 def _snapshot_state_dict_cpu(agent):
+    """エージェントの状態をCPUにコピー"""
     return {
         key: value.detach().cpu().clone()
         for key, value in agent.state_dict().items()
     }
 
+
 def _normalize_policy_mode(value):
+    """ポリシーモードを正規化"""
     text = str(value).strip().lower()
     if text in {"model", "model_if_available", "inference"}:
         return POLICY_MODEL_IF_AVAILABLE
     return POLICY_RULE
 
+
 def _resolve_runtime_target():
+    """ランタイムターゲットを決定"""
     if TRAIN_MODE:
         return TRAINING_TARGET
     return "hider"
 
 
 def _maybe_load_model_state(target):
+    """モデル状態をロード（存在しない場合はNone）"""
     path = model_path_for_config(target, ENV_CONFIG)
     if not os.path.exists(path):
         return None, path
@@ -853,6 +668,7 @@ def _maybe_load_model_state(target):
 
 
 def _apply_policy_state(env, vec_envs, agent_keys, state_dict, label):
+    """ポリシー状態を適用"""
     if not agent_keys or state_dict is None:
         return False
     if vec_envs is not None:
@@ -879,6 +695,7 @@ def _apply_policy_state(env, vec_envs, agent_keys, state_dict, label):
 
 
 def _set_override_learnable_policy(env, vec_envs, enabled):
+    """学習可能ポリシーのオーバーライドを設定"""
     if vec_envs is not None:
         try:
             vec_envs.call("set_override_learnable_policy", bool(enabled))
@@ -896,6 +713,7 @@ def _set_override_learnable_policy(env, vec_envs, enabled):
 
 
 def _set_model_policy_deterministic(env, vec_envs, enabled):
+    """モデルポリシーを決定論的に設定"""
     if vec_envs is not None:
         try:
             vec_envs.call("set_model_policy_deterministic", bool(enabled))
@@ -913,6 +731,7 @@ def _set_model_policy_deterministic(env, vec_envs, enabled):
 
 
 def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_state_dict):
+    """チームポリシーのモードを設定"""
     if ref_env is None:
         return
 
@@ -936,18 +755,6 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
         hider_state, hider_path = _maybe_load_model_state("hider")
         if hider_state is None:
             print(f"Hider policy: fallback to rule (missing model: {hider_path})")
-            # 明示的に全Hiderをruleベースにする
-            if hasattr(ref_env, "inference_policies"):
-                for k in ref_env.hider_keys:
-                    if k in ref_env.inference_policies:
-                        del ref_env.inference_policies[k]
-            if hasattr(ref_env, "shared_team_policy"):
-                ref_env.shared_team_policy = False
-            if hasattr(ref_env, "shared_policy_model"):
-                ref_env.shared_policy_model = None
-            if hasattr(ref_env, "_init_agent_intelligence"):
-                ref_env._init_agent_intelligence()
-            # 全HiderをRuleBasedにし、学習エージェントもruleで動かす
             if hasattr(ref_env, "set_override_learnable_policy"):
                 ref_env.set_override_learnable_policy(True)
 
@@ -969,7 +776,6 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
         and (hider_state is not None)
     )
     override_enabled = False
-    # symmetric_hider_debug時のoverride_learnable_policy設定は不要（rule強制時のみTrue）
     if symmetric_hider_debug:
         all_hider_keys = list(ref_env.hider_keys)
         ok = _apply_policy_state(
@@ -982,8 +788,6 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
         override_enabled = bool(ok)
         if ok:
             print("Debug mode: all hiders use same model inference path")
-    else:
-        override_enabled = False
 
     print(
         "Policy wiring: "
@@ -995,106 +799,129 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
     )
 
 
-def run_debug_or_playback(env, agent, device, model_loaded):
+def safe_close_vector_env(vec_envs):
+    """ベクター環境を安全にクローズ"""
+    if vec_envs is None:
+        return
+    try:
+        vec_envs.close(terminate=True)
+    except WORKER_SHUTDOWN_ERRORS as exc:
+        print(f"VectorEnv close skipped ({exc.__class__.__name__})")
+    except Exception as exc:
+        print(f"VectorEnv close suppressed ({exc.__class__.__name__}: {exc})")
+
+
+# ============================================================================
+# 評価・ビューワー関数
+# ============================================================================
+
+def evaluate_fixed_ramp_climb(mode, target, agent, device, episodes=3, max_steps=220):
+    """
+    固定ランプ登坂評価（ユーザー定義版）。
+    mode: 環境モード
+    target: "hider" or "seeker"
+    agent: 学習済みエージェント
+    device: torchデバイス
+    episodes: 評価エピソード数
+    max_steps: 1エピソードの最大ステップ数
+    """
+    from collections import deque
+    env = build_env(mode, target, ENV_CONFIG, render_mode=None)
     idx = env.idx
-    reward_idx_cache = _build_reward_index_cache(idx)
     obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
     history = ObsHistory(1, SEQ_LEN, obs_dim, device)
-
-    target_npc = None
-    if NPC_ONLY_DEBUG:
-        target_npc = RuleBasedSeeker() if env.target == "seeker" else RuleBasedHider()
-
-    print("--- Start Simulation ---")
-    print(f"Physics Step: {env.model.opt.timestep * 5}s")
-
-    # --- trainと同じlog_interval統計出力に統一 ---
-    log_interval = hp["log_interval"]
-    wall_dist_interval = 1000
-    num_episodes = hp["play_episodes"]
-    episode_rewards = []
-    hide_rates = []
-    wall_distance_buffer = []
-    lock_events_list = []
-    wall_stick_list = []
-    info_buffer = []
-    global_step = 0
-    debug_start_time = time.time()
-    steps_per_episode = None
-    num_updates = max(1, num_episodes // log_interval)
-    for episode in range(num_episodes):
+    success_count = 0
+    peak_heights = []
+    peak_progress = []
+    for ep in range(episodes):
         obs, _ = env.reset()
         history.prime_single(obs)
         done = False
-        ep_reward = 0.0
-        step_count = 0
-        lock_events = 0
-        wall_stick = 0.0
-        wall_dist = []
-        while not done:
-            if USE_VIEWER and env.viewer and not env.viewer.is_running():
-                return
-            if NPC_ONLY_DEBUG and target_npc is not None:
-                action = target_npc.get_action(obs, idx)
-            elif model_loaded:
-                with torch.no_grad():
-                    seq = history.get()
-                    if DEBUG_DETERMINISTIC_INFERENCE and hasattr(agent, "get_deterministic_action_and_value"):
-                        out = agent.get_deterministic_action_and_value(seq)
-                    else:
-                        out = agent.get_action_and_value(seq)
-                    action = out[0].cpu().numpy().reshape(-1)
-            else:
-                # 全Hiderをruleで動かす場合はH1にもRuleBasedHiderアクションを送る
-                if env.target == "hider" and getattr(env, "override_learnable_policy", False):
-                    action = env.npcs[env.learnable_agent_key].get_action(obs, idx)
-                else:
-                    action = np.zeros(env.action_space.shape, dtype=np.float32)
-            next_obs, base_r, term, trun, info = env.step(action)
-            reward = (
-                compute_custom_reward(obs, action, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
-                if USE_CUSTOM_REWARD else base_r
-            )
+        max_height = -float('inf')
+        max_progress = -float('inf')
+        for step in range(max_steps):
+            with torch.no_grad():
+                seq = history.get()
+                out = agent.get_action_and_value(seq)
+                action = out[0].cpu().numpy().reshape(-1)
+            next_obs, _, term, trun, info = env.step(action)
             history.update(next_obs)
-            ep_reward += reward
-            step_count += 1
-            lock_events += int(info.get("lock_event", 0))
-            wall_stick += float(info.get("wall_stick", 0.0))
-            if "wall_distance" in info:
-                wd = info["wall_distance"]
-                if isinstance(wd, (list, tuple, np.ndarray)):
-                    wall_dist.extend([float(v) for v in wd])
-                else:
-                    wall_dist.append(float(wd))
-            info_buffer.append(info)
-            if USE_VIEWER:
-                env.render()
-                time.sleep(0.025)
             obs = next_obs
+            if 'dbg_ramp_height' in info:
+                h = float(info['dbg_ramp_height'])
+                if h > max_height:
+                    max_height = h
+            if 'dbg_ramp_progress' in info:
+                p = float(info['dbg_ramp_progress'])
+                if p > max_progress:
+                    max_progress = p
             done = bool(term or trun)
-        episode_rewards.append(ep_reward)
-        hide_rates.append(float(info.get("hide_rate", 0.0)))
-        lock_events_list.append(lock_events)
-        wall_stick_list.append(wall_stick / max(step_count, 1))
-        wall_distance_buffer.extend(wall_dist)
-        global_step += step_count
-        if steps_per_episode is None:
-            steps_per_episode = step_count
-        # log_intervalごとに統計出力
-        if (episode + 1) % log_interval == 0:
-            elapsed = time.time() - debug_start_time
-            sps = int(global_step / elapsed) if elapsed > 0 else 0
-            avg_reward = np.mean(episode_rewards[-log_interval:])
-            avg_hide = np.mean(hide_rates[-log_interval:])
-            avg_wall_stick = np.mean(wall_stick_list[-log_interval:])
-            print(f"Upd {(episode + 1) // log_interval}/{num_updates} Step={global_step} SPS={sps} HideRate={avg_hide:.2f} WallStick={avg_wall_stick:.2f} AvgR={avg_reward:.3f}")
-        # wall_distance統計出力
-        if global_step % wall_dist_interval == 0 and wall_distance_buffer:
-            arr = np.array(wall_distance_buffer, dtype=np.float32)
-            print(f"[WallDist] step={global_step} mean={np.mean(arr):.3f} min={np.min(arr):.3f} max={np.max(arr):.3f}")
-            wall_distance_buffer.clear()
+            if done:
+                break
+        peak_heights.append(max_height)
+        peak_progress.append(max_progress)
+        if (
+            max_progress >= RAMP_SUCCESS_PROG
+            or max_height >= RAMP_SUCCESS_Z_RISE
+        ):
+            success_count += 1
+    env.close()
+    return {
+        "success_rate": success_count / max(episodes, 1),
+        "peak_height_mean": (
+            float(np.mean(peak_heights)) if peak_heights else 0.0
+        ),
+        "peak_progress_mean": (
+            float(np.mean(peak_progress)) if peak_progress else 0.0
+        ),
+    }
 
+
+def run_ramp_check_viewer(mode, target, agent, device, episodes=1, max_steps=220):
+    """ランプ登坂デバッグビューワ"""
+    env = build_env(mode, target, ENV_CONFIG, render_mode="human")
+    idx = env.idx
+    obs_dim = env.observation_space.shape[0]
+    history = ObsHistory(1, SEQ_LEN, obs_dim, device)
+    for ep in range(episodes):
+        obs, _ = env.reset()
+        history.prime_single(obs)
+        done = False
+        for step in range(max_steps):
+            with torch.no_grad():
+                seq = history.get()
+                out = agent.get_action_and_value(seq)
+                action = out[0].cpu().numpy().reshape(-1)
+            next_obs, _, term, trun, info = env.step(action)
+            history.update(next_obs)
+            obs = next_obs
+            env.render()
+            time.sleep(0.025)
+            done = bool(term or trun)
+            if done:
+                break
+    env.close()
+
+
+# ============================================================================
+# info dict アクセスユーティリティ
+# ============================================================================
+
+def _info_at(info, key, env_idx, default=0):
+    """info dictから環境別の値を取得"""
+    if key not in info:
+        return default
+    value = info[key]
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) <= env_idx:
+            return default
+        return value[env_idx]
+    return value
+
+
+# ============================================================================
+# 訓練関数（単一環境）
+# ============================================================================
 
 def run_train(
     env,
@@ -1107,6 +934,7 @@ def run_train(
     training_target,
     wandb_run=None,
 ):
+    """単一環境での訓練"""
     def _atomic_save(path):
         tmp_path = f"{path}.tmp"
         torch.save(agent.state_dict(), tmp_path)
@@ -1136,6 +964,7 @@ def run_train(
     print(f"Training updates: {num_updates}, model: {model_path}")
     interrupted = False
     last_ramp_eval = None
+
     # --- スケジューリング用パラメータ取得 ---
     ent_coef_init = float(hp.get("ent_coef", 0.001))
     ent_coef_final = float(hp.get("ent_coef_final", ent_coef_init * 0.5))
@@ -1150,11 +979,11 @@ def run_train(
             frac = 1.0 - (update - 1) / max(num_updates - 1, 1)
             if ent_coef_schedule == "linear":
                 hp["ent_coef"] = ent_coef_final + (ent_coef_init - ent_coef_final) * frac
-            # 他のスケジュール方式は必要に応じて追加
             if lr_schedule == "linear":
                 lr_now = lr_final + (lr_init - lr_final) * frac
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr_now
+
             lock_evt_sum = 0
             grab_evt_sum = 0
             max_box_speed = 0.0
@@ -1171,7 +1000,6 @@ def run_train(
             reward_compute_sec_sum = 0.0
             env_step_sec_sum = 0.0
 
-
             for t in range(hp["rollout_steps"]):
                 if USE_VIEWER and env.viewer and not env.viewer.is_running():
                     print("Viewer closed. Stop training loop.")
@@ -1183,14 +1011,11 @@ def run_train(
                     action, logp, _, value = agent.get_action_and_value(seq)
 
                 action_np = action.cpu().numpy()
-                # アクションをaction_spaceでクリップ
                 action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
                 num_envs = action_np.shape[0]
                 step_t0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = env.step(action_np)
-                # Viewerの明示的更新
                 env.render()
-                # 観測ベクトルの一部をprint
                 if next_obs.ndim == 1:
                     next_obs = np.expand_dims(next_obs, axis=0)
                 env_step_sec_sum += time.perf_counter() - step_t0
@@ -1225,7 +1050,6 @@ def run_train(
                 rollout_dones[t] = torch.as_tensor(done_np, device=device)
                 rollout_values[t] = value.view(-1)
 
-                # ウォーミングアップ期間は除外
                 if t >= int(hp.get("warmup_steps", 0)):
                     for i in range(num_envs):
                         lock_evt_sum += int(_info_at(info, "lock_event", i, 0))
@@ -1247,7 +1071,6 @@ def run_train(
                         if seen_learnable:
                             learnable_seen_steps += 1
                         obs1d = np.asarray(next_obs[i]).flatten()
-                        # 必要なインデックスが存在しない場合はスキップ
                         max_idx = max(reward_idx_cache["self_vel_x"], reward_idx_cache["self_vel_y"])
                         if obs1d.shape[0] <= max_idx:
                             is_wall_stick = False
@@ -1269,7 +1092,6 @@ def run_train(
                         else:
                             print(f"[warn] next_obs[{i}] size {obs1d.size} != obs_dim {history.obs_dim}, skip reset")
                 obs = next_obs
-
 
             with torch.no_grad():
                 next_value = agent.get_value(history.get()).view(num_envs)
@@ -1352,6 +1174,7 @@ def run_train(
             reward_compute_ms_per_step = 1000.0 * reward_compute_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
             env_step_ms_per_step = 1000.0 * env_step_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
             reward_time_ratio = reward_compute_sec_sum / max(env_step_sec_sum, 1e-9)
+
             ramp_eval = None
             if (
                 RAMP_CHECK_ENABLED
@@ -1367,6 +1190,7 @@ def run_train(
                     max_steps=RAMP_CHECK_STEPS,
                 )
                 last_ramp_eval = ramp_eval
+
             if wandb_run is not None:
                 payload = {
                     "global_step": global_step,
@@ -1397,34 +1221,13 @@ def run_train(
                         }
                     )
                 wandb_run.log(payload, step=global_step)
+
             if update % hp["log_interval"] == 0:
                 print(f"Upd {update}/{num_updates} Step={global_step} SPS={sps} HideRate={hide_rate:.2f} WallStick={wall_stick_ratio:.2f} AvgR={avg_reward:.3f}")
-            # wall_distance統計バッファ
-            if not hasattr(run_train_vector, '_wall_distance_buffer'):
-                run_train_vector._wall_distance_buffer = []
-            if not hasattr(run_train_vector, '_info_buffer'):
-                run_train_vector._info_buffer = []
-            # 1000ステップごとにinfoからwall_distance統計を集計・出力
-            if global_step % 1000 == 0:
-                wall_dist_list = []
-                for t in range(len(run_train_vector._info_buffer)):
-                    info = run_train_vector._info_buffer[t]
-                    if isinstance(info, (list, tuple)):
-                        for i in range(num_envs):
-                            info_i = info[i] if len(info) > i else None
-                            if info_i and 'wall_distance' in info_i:
-                                wall_dist_list.append(float(info_i['wall_distance']))
-                    elif isinstance(info, dict):
-                        if 'wall_distance' in info:
-                            wall_dist_list.append(float(info['wall_distance']))
-                if wall_dist_list:
-                    arr = np.array(wall_dist_list, dtype=np.float32)
-                    print(f"[WallDist] step={global_step} mean={np.mean(arr):.3f} min={np.min(arr):.3f} max={np.max(arr):.3f}")
-            # infoバッファをクリア
-            run_train_vector._info_buffer.clear()
 
             if update % hp["save_interval"] == 0:
                 _atomic_save(model_path)
+
     except KeyboardInterrupt:
         interrupted = True
         print("\nTraining interrupted. Saving checkpoint...")
@@ -1443,27 +1246,9 @@ def run_train(
             print(f"Saved model: {model_path}")
 
 
-def safe_close_vector_env(vec_envs):
-    if vec_envs is None:
-        return
-    try:
-        vec_envs.close(terminate=True)
-    except WORKER_SHUTDOWN_ERRORS as exc:
-        print(f"VectorEnv close skipped ({exc.__class__.__name__})")
-    except Exception as exc:
-        print(f"VectorEnv close suppressed ({exc.__class__.__name__}: {exc})")
-
-
-def _info_at(info, key, env_idx, default=0):
-    if key not in info:
-        return default
-    value = info[key]
-    if isinstance(value, (list, tuple, np.ndarray)):
-        if len(value) <= env_idx:
-            return default
-        return value[env_idx]
-    return value
-
+# ============================================================================
+# 訓練関数（ベクター環境）
+# ============================================================================
 
 def run_train_vector(
     envs,
@@ -1477,6 +1262,7 @@ def run_train_vector(
     num_envs,
     wandb_run=None,
 ):
+    """ベクター環境での訓練"""
     def _atomic_save(path):
         tmp_path = f"{path}.tmp"
         torch.save(agent.state_dict(), tmp_path)
@@ -1523,7 +1309,6 @@ def run_train_vector(
     lr_schedule = str(hp.get("learning_rate_schedule", "linear"))
 
     try:
-        # バッファをローカル変数で管理
         wall_distance_buffer = []
         info_buffer = []
         for update in range(1, num_updates + 1):
@@ -1531,11 +1316,11 @@ def run_train_vector(
             frac = 1.0 - (update - 1) / max(num_updates - 1, 1)
             if ent_coef_schedule == "linear":
                 hp["ent_coef"] = ent_coef_final + (ent_coef_init - ent_coef_final) * frac
-            # 他のスケジュール方式は必要に応じて追加
             if lr_schedule == "linear":
                 lr_now = lr_final + (lr_init - lr_final) * frac
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr_now
+
             lock_evt_sum = 0
             grab_evt_sum = 0
             max_box_speed = 0.0
@@ -1564,7 +1349,6 @@ def run_train_vector(
                 action_np = action.cpu().numpy()
                 step_t0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = envs.step(action_np)
-                # infoをバッファに追加
                 info_buffer.append(info)
                 env_step_sec_sum += time.perf_counter() - step_t0
                 done_np = np.logical_or(term, trun).astype(np.float32)
@@ -1712,6 +1496,7 @@ def run_train_vector(
             reward_compute_ms_per_step = 1000.0 * reward_compute_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
             env_step_ms_per_step = 1000.0 * env_step_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
             reward_time_ratio = reward_compute_sec_sum / max(env_step_sec_sum, 1e-9)
+
             ramp_eval = None
             if (
                 RAMP_CHECK_ENABLED
@@ -1727,6 +1512,7 @@ def run_train_vector(
                     max_steps=RAMP_CHECK_STEPS,
                 )
                 last_ramp_eval = ramp_eval
+
             if wandb_run is not None:
                 payload = {
                     "global_step": global_step,
@@ -1757,6 +1543,7 @@ def run_train_vector(
                         }
                     )
                 wandb_run.log(payload, step=global_step)
+
             if update % hp["log_interval"] == 0:
                 print(f"Upd {update}/{num_updates} Step={global_step} SPS={sps} HideRate={hide_rate:.2f} WallStick={wall_stick_ratio:.2f} AvgR={avg_reward:.3f}")
 
@@ -1780,15 +1567,15 @@ def run_train_vector(
                                 wall_distance_buffer.append(float(v))
                         else:
                             wall_distance_buffer.append(float(wd))
+
             if update % hp["log_interval"] == 0 and wall_distance_buffer:
                 arr = np.array(wall_distance_buffer, dtype=np.float32)
                 print(f"[WallDist] step={global_step} mean={np.mean(arr):.3f} min={np.min(arr):.3f} max={np.max(arr):.3f}")
                 wall_distance_buffer.clear()
-            if update % hp["log_interval"] == 0:
-                info_buffer.clear()
 
             if update % hp["save_interval"] == 0:
                 _atomic_save(model_path)
+
     except KeyboardInterrupt:
         interrupted = True
         print("\nTraining interrupted. Saving checkpoint...")
@@ -1801,30 +1588,179 @@ def run_train_vector(
             print(f"Saved model: {model_path}")
 
 
-def run():
-    
-    # --- wandb初期化関数 ---
-    def init_wandb_run(hp, model_path, runtime_target):
-        if wandb is None or not WANDB_ENABLED:
-            return None
-        import socket
-        run_name = WANDB_RUN_NAME or f"{runtime_target}_{os.path.basename(model_path)}_{socket.gethostname()}"
-        config_dict = dict(hp)
-        try:
-            run = wandb.init(
-                project=WANDB_PROJECT,
-                entity=WANDB_ENTITY or None,
-                name=run_name,
-                config=config_dict,
-                mode=WANDB_MODE,
-                dir=WANDB_CODE_ROOT,
-                save_code=WANDB_LOG_CODE,
-                reinit=True,
+# ============================================================================
+# デバッグ・再生機能
+# ============================================================================
+
+def run_debug_or_playback(env, agent, device, model_loaded):
+    """デバッグモード・再生モード"""
+    idx = env.idx
+    reward_idx_cache = _build_reward_index_cache(idx)
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    history = ObsHistory(1, SEQ_LEN, obs_dim, device)
+
+    target_npc = None
+    if NPC_ONLY_DEBUG:
+        target_npc = RuleBasedSeeker() if env.target == "seeker" else RuleBasedHider()
+
+    print("--- Start Simulation ---")
+    print(f"Physics Step: {env.model.opt.timestep * 5}s")
+
+    log_interval = hp["log_interval"]
+    wall_dist_interval = 1000
+    num_episodes = hp["play_episodes"]
+    episode_rewards = []
+    hide_rates = []
+    wall_distance_buffer = []
+    lock_events_list = []
+    wall_stick_list = []
+    info_buffer = []
+    global_step = 0
+    debug_start_time = time.time()
+    steps_per_episode = None
+    num_updates = max(1, num_episodes // log_interval)
+
+    for episode in range(num_episodes):
+        obs, _ = env.reset()
+        history.prime_single(obs)
+        done = False
+        ep_reward = 0.0
+        step_count = 0
+        lock_events = 0
+        wall_stick = 0.0
+        wall_dist = []
+
+        while not done:
+            if USE_VIEWER and env.viewer and not env.viewer.is_running():
+                return
+            if NPC_ONLY_DEBUG and target_npc is not None:
+                action = target_npc.get_action(obs, idx)
+            elif model_loaded:
+                with torch.no_grad():
+                    seq = history.get()
+                    if DEBUG_DETERMINISTIC_INFERENCE and hasattr(agent, "get_deterministic_action_and_value"):
+                        out = agent.get_deterministic_action_and_value(seq)
+                    else:
+                        out = agent.get_action_and_value(seq)
+                    action = out[0].cpu().numpy().reshape(-1)
+            else:
+                if env.target == "hider" and getattr(env, "override_learnable_policy", False):
+                    action = env.npcs[env.learnable_agent_key].get_action(obs, idx)
+                else:
+                    action = np.zeros(env.action_space.shape, dtype=np.float32)
+
+            next_obs, base_r, term, trun, info = env.step(action)
+            reward = (
+                compute_custom_reward(obs, action, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
+                if USE_CUSTOM_REWARD else base_r
             )
-            return run
-        except Exception as exc:
-            print(f"wandb.init failed: {exc}")
-            return None
+            history.update(next_obs)
+            ep_reward += reward
+            step_count += 1
+            lock_events += int(info.get("lock_event", 0))
+            wall_stick += float(info.get("wall_stick", 0.0))
+            if "wall_distance" in info:
+                wd = info["wall_distance"]
+                if isinstance(wd, (list, tuple, np.ndarray)):
+                    wall_dist.extend([float(v) for v in wd])
+                else:
+                    wall_dist.append(float(wd))
+            info_buffer.append(info)
+
+            if USE_VIEWER:
+                env.render()
+                time.sleep(0.025)
+            obs = next_obs
+            done = bool(term or trun)
+
+        episode_rewards.append(ep_reward)
+        hide_rates.append(float(info.get("hide_rate", 0.0)))
+        lock_events_list.append(lock_events)
+        wall_stick_list.append(wall_stick / max(step_count, 1))
+        wall_distance_buffer.extend(wall_dist)
+        global_step += step_count
+
+        if steps_per_episode is None:
+            steps_per_episode = step_count
+
+        if (episode + 1) % log_interval == 0:
+            elapsed = time.time() - debug_start_time
+            sps = int(global_step / elapsed) if elapsed > 0 else 0
+            avg_reward = np.mean(episode_rewards[-log_interval:])
+            avg_hide = np.mean(hide_rates[-log_interval:])
+            avg_wall_stick = np.mean(wall_stick_list[-log_interval:])
+            print(f"Upd {(episode + 1) // log_interval}/{num_updates} Step={global_step} SPS={sps} HideRate={avg_hide:.2f} WallStick={avg_wall_stick:.2f} AvgR={avg_reward:.3f}")
+
+        if global_step % wall_dist_interval == 0 and wall_distance_buffer:
+            arr = np.array(wall_distance_buffer, dtype=np.float32)
+            print(f"[WallDist] step={global_step} mean={np.mean(arr):.3f} min={np.min(arr):.3f} max={np.max(arr):.3f}")
+            wall_distance_buffer.clear()
+
+
+# ============================================================================
+# wandb 初期化
+# ============================================================================
+
+def init_wandb_run(hp, model_path, runtime_target):
+    """wandbを初期化"""
+    if wandb is None or not WANDB_ENABLED:
+        return None
+    import socket
+    run_name = WANDB_RUN_NAME or f"{runtime_target}_{os.path.basename(model_path)}_{socket.gethostname()}"
+    config_dict = dict(hp)
+    try:
+        run = wandb.init(
+            project=WANDB_PROJECT,
+            entity=WANDB_ENTITY or None,
+            name=run_name,
+            config=config_dict,
+            mode=WANDB_MODE,
+            dir=WANDB_CODE_ROOT,
+            save_code=WANDB_LOG_CODE,
+            reinit=True,
+        )
+        return run
+    except Exception as exc:
+        print(f"wandb.init failed: {exc}")
+        return None
+
+
+# ============================================================================
+# プロファイル比較
+# ============================================================================
+
+def run_profile_comparison(profiles):
+    """複数プロファイルを連続実行"""
+    import subprocess
+    names = [str(p).strip().lower() for p in profiles if str(p).strip()]
+    if not names:
+        print("No profiles specified for comparison.")
+        return 2
+    invalid = [p for p in names if p not in AVAILABLE_RUNTIME_PROFILES]
+    if invalid:
+        print(f"Invalid profiles: {invalid}")
+        print(f"Available profiles: {AVAILABLE_RUNTIME_PROFILES}")
+        return 2
+
+    script_path = os.path.abspath(__file__)
+    for i, profile in enumerate(names, start=1):
+        print(f"[Compare {i}/{len(names)}] profile={profile}")
+        cmd = ["uv", "run", "mjpython", script_path, "--profile", profile]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(f"Profile '{profile}' failed with code {result.returncode}")
+            return result.returncode
+    print("Comparison run completed.")
+    return 0
+
+
+# ============================================================================
+# メイン実行関数
+# ============================================================================
+
+def run():
+    """メイン実行関数"""
     _parse_cli_args()
     runtime_target = _resolve_runtime_target()
     print("Initializing Environment...")
@@ -1851,8 +1787,6 @@ def run():
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-    # use_viewer時は単一環境に強制
     if USE_VIEWER:
         ENV_CONFIG["num_envs"] = 1
 
@@ -1897,17 +1831,18 @@ def run():
     print(f"obs_dim={obs_dim}, act_dim={act_dim}, seq_len={SEQ_LEN}")
 
     model_path = model_path_for_config(runtime_target, ENV_CONFIG)
-    # hpはTOMLから一元的にロード済み
     print(
         f"HP[{runtime_target}]: T={hp['total_timesteps']} R={hp['rollout_steps']} "
         f"MB={hp['minibatch_size']} LR={hp['learning_rate']:.2e} "
         f"ENT={hp['ent_coef']:.2e} CLIP={hp['clip_coef']:.2f} "
         f"EPOCHS={hp['update_epochs']}"
     )
+
     agent = AgentV2(obs_dim, act_dim, HIDDEN_DIM, SEQ_LEN).to(device)
     wandb_run = init_wandb_run(hp, model_path, runtime_target) if TRAIN_MODE else None
     model_loaded = False
     should_load_model = True
+
     if TRAIN_MODE:
         should_load_model = bool(RESUME_TRAINING)
         if RESET_MODEL_ON_TRAIN and os.path.exists(model_path):
@@ -1999,31 +1934,7 @@ def run():
             wandb_run.finish()
 
 
-def run_profile_comparison(profiles):
-    names = [str(p).strip().lower() for p in profiles if str(p).strip()]
-    if not names:
-        print("No profiles specified for comparison.")
-        return 2
-    invalid = [p for p in names if p not in AVAILABLE_RUNTIME_PROFILES]
-    if invalid:
-        print(f"Invalid profiles: {invalid}")
-        print(f"Available profiles: {AVAILABLE_RUNTIME_PROFILES}")
-        return 2
-
-    script_path = os.path.abspath(__file__)
-    for i, profile in enumerate(names, start=1):
-        print(f"[Compare {i}/{len(names)}] profile={profile}")
-        cmd = ["uv", "run", "mjpython", script_path, "--profile", profile]
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
-            print(f"Profile '{profile}' failed with code {result.returncode}")
-            return result.returncode
-    print("Comparison run completed.")
-    return 0
-
-
 if __name__ == "__main__":
     if CLI_COMPARE_PROFILES:
         raise SystemExit(run_profile_comparison(CLI_COMPARE_PROFILES))
     run()
-    

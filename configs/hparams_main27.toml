@@ -24,10 +24,11 @@ debug_log_interval_steps = 200
 use_custom_reward = true
 # 前進飽和抑制（常時前進ボーナスは使わない）
 rw_move_sat_penalty = 0.02
-# 壁張り付き対策（hider）
-rw_hide_wall_stick_penalty = 0.15
-rw_hide_wall_near_threshold = 0.18
-rw_hide_still_speed_threshold = 0.05
+ # 壁張り付き対策（全エージェント共通）
+rw_wall_stick_penalty = 0.15
+
+rw_wall_near_threshold = 0.18  # 壁近判定閾値（全エージェント共通）
+rw_still_speed_threshold = 0.05  # 静止判定速度閾値（全エージェント共通）
 rw_hide_visible_front_penalty = 0.04
 rw_hide_visible_near_penalty = 0.025
 rw_hide_seeker_gaze_cos_penalty = 0.03
