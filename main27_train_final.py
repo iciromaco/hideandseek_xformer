@@ -1029,6 +1029,7 @@ def run_train(
 ):
     """単一環境での訓練"""
     def _atomic_save(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp_path = f"{path}.tmp"
         torch.save(agent.state_dict(), tmp_path)
         os.replace(tmp_path, path)
@@ -1376,6 +1377,7 @@ def run_train_vector(
 ):
     """ベクター環境での訓練"""
     def _atomic_save(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp_path = f"{path}.tmp"
         torch.save(agent.state_dict(), tmp_path)
         os.replace(tmp_path, path)
