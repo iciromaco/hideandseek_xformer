@@ -611,7 +611,21 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
 
     # --- エージェント固有ロジック ---
     if target == "hider":
-        pass
+        # --- Seekerが近い場合のペナルティ ---
+        for j in range(len(cache["enemy_visible"])):
+            if obs[cache["enemy_visible"][j]] > 0.5:
+                dx = float(obs[cache["enemy_rel_x"][j]])
+                dy = float(obs[cache["enemy_rel_y"][j]])
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist < 2.0:  # 近距離（閾値は適宜調整）
+                    bonus -= RW_HIDE_VISIBLE_NEAR_PENALTY * (2.0 - dist) / 2.0
+                # --- Seekerの視線正面にいる場合のペナルティ ---
+                # Seekerの視線方向（仮定: 0度が正面、obsに格納されている場合）
+                # ここではcosθ=dx/distと仮定（本来はSeekerの向き情報が必要）
+                if dist > 0.1:
+                    cos_theta = dx / dist  # 仮の視線正面判定（本来はSeekerの向きと位置から計算）
+                    frontness = max(float(cos_theta), 0.0)
+                    bonus -= RW_HIDE_SEEKER_GAZE_COS_PENALTY * frontness
     else:
         for j in range(len(cache["enemy_visible"])):
             if obs[cache["enemy_visible"][j]] > 0.5:
