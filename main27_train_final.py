@@ -329,7 +329,9 @@ RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.1", float, RUNTIME_OVER
 RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("rw_hide_visible_near_penalty", "0.025", float, RUNTIME_OVERRIDES)
 
 # --- HiderがSeekerの視線方向にいる場合のペナルティ ---
-RW_HIDE_SEEKER_GAZE_COS_PENALTY = _cfg("rw_hide_seeker_gaze_cos_penalty", "0.01", float, RUNTIME_OVERRIDES)
+RW_HIDE_SEEKER_GAZE_COS_PENALTY = _cfg("rw_hide_seeker_gaze_cos_penalty", "0.03", float, RUNTIME_OVERRIDES)
+# --- HiderがSeekerの視線方向にいる場合のsin報酬 ---
+RW_HIDE_SEEKER_GAZE_SIN_REWARD = _cfg("rw_hide_seeker_gaze_sin_reward", "0.03", float, RUNTIME_OVERRIDES)
 
 # --- 速度・回転の閾値（TOMLで設定可） ---
 IDLE_SPEED_THRESHOLD = _cfg("idle_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値
@@ -426,8 +428,8 @@ def _build_reward_index_cache(idx):
         "enemy_rel_x": np.asarray([int(en.REL_X) for en in idx.OTHERS], dtype=np.int32),
         "enemy_rel_y": np.asarray([int(en.REL_Y) for en in idx.OTHERS], dtype=np.int32),
         "enemy_quat_0": np.asarray([int(en.QUAT_0) for en in idx.OTHERS], dtype=np.int32),
+        "enemy_quat_1": np.asarray([int(en.QUAT_1) for en in idx.OTHERS], dtype=np.int32),
     }
-
 
 def _min_lidar_from_obs(obs, lidar_indices):
     """観測からLiDAー最小値を取得"""
@@ -479,7 +481,7 @@ def _clear_wall_stick_state_cache():
     _wall_stick_state_cache.clear()
 
 @njit([
-    "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32, float32[:], float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32)"
+    "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32, float32[:], float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32)"
 ], cache=True, parallel=True)
 def _compute_custom_reward_batch_numba(
     obs_batch,
@@ -493,6 +495,7 @@ def _compute_custom_reward_batch_numba(
     enemy_rel_x_indices,
     enemy_rel_y_indices,
     enemy_quat_0_indices,
+    enemy_quat_1_indices,
     move_ctrl_cost,
     move_incentive,
     idle_penalty,
@@ -511,6 +514,7 @@ def _compute_custom_reward_batch_numba(
     wall_safe,
     rw_hide_visible_near_penalty,
     rw_hide_seeker_gaze_cos_penalty,
+    rw_hide_seeker_gaze_sin_reward,
     rw_seek_visible_bonus
 ):
     """バッチ報酬計算（Numba JIT最適化）"""
@@ -595,9 +599,12 @@ def _compute_custom_reward_batch_numba(
                         bonus -= rw_hide_visible_near_penalty * (2.0 - dist) / 2.0
                     if dist > 0.1:
                         idx_quat_0 = int(enemy_quat_0_indices[j])
+                        idx_quat_1 = int(enemy_quat_1_indices[j])
                         cos_theta = float(obs_batch[i, idx_quat_0])
-                        frontness = cos_theta if cos_theta > 0.0 else 0.0
-                        bonus -= rw_hide_seeker_gaze_cos_penalty * frontness
+                        sin_theta = float(obs_batch[i, idx_quat_1])
+                        bonus -= rw_hide_seeker_gaze_cos_penalty * cos_theta
+                        # 横方向は常に報酬
+                        bonus += rw_hide_seeker_gaze_sin_reward * abs(sin_theta)
 
         # --- seeker固有ボーナス ---
         if not target_is_hider:
@@ -656,6 +663,7 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
     else:
         wall_distance_batch = np.full((1,), np.nan, dtype=np.float32)
     enemy_quat_0_indices = np.asarray(cache["enemy_quat_0"], dtype=np.int32)
+    enemy_quat_1_indices = np.asarray(cache["enemy_quat_1"], dtype=np.int32)
     # Numba版呼び出し
     reward_arr = _compute_custom_reward_batch_numba(
         obs_batch,
@@ -669,6 +677,7 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
         enemy_rel_x_indices,
         enemy_rel_y_indices,
         enemy_quat_0_indices,
+        enemy_quat_1_indices,
         float(RW_MOVE_CTRL_COST),
         float(RW_MOVE_INCENTIVE),
         float(RW_IDLE_PENALTY),
@@ -687,6 +696,7 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
         float(0.4 + 0.5),  # WALL_SAFE
         float(RW_HIDE_VISIBLE_NEAR_PENALTY),
         float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
+        float(RW_HIDE_SEEKER_GAZE_SIN_REWARD),
         float(RW_SEEK_VISIBLE_BONUS),
     )
     return float(reward_arr[0])
@@ -1128,6 +1138,7 @@ def run_train(
                     # wall_distanceが利用できない場合はnan埋め配列を渡す
                     wall_distance_batch = np.full((num_envs,), np.nan, dtype=np.float32)
                     enemy_quat_0_indices = reward_idx_cache["enemy_quat_0"]
+                    enemy_quat_1_indices = reward_idx_cache["enemy_quat_1"]
                     reward_np = _compute_custom_reward_batch_numba(
                         np.asarray(obs, dtype=np.float32).reshape(num_envs, -1),
                         np.asarray(action_np, dtype=np.float32).reshape(num_envs, -1),
@@ -1140,6 +1151,7 @@ def run_train(
                         reward_idx_cache["enemy_rel_x"],
                         reward_idx_cache["enemy_rel_y"],
                         enemy_quat_0_indices,
+                        enemy_quat_1_indices,
                         float(RW_MOVE_CTRL_COST),
                         float(RW_MOVE_INCENTIVE),
                         float(RW_IDLE_PENALTY),
@@ -1158,6 +1170,7 @@ def run_train(
                         float(0.4 + 0.5),  # WALL_SAFE
                         float(RW_HIDE_VISIBLE_NEAR_PENALTY),
                         float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
+                        float(RW_HIDE_SEEKER_GAZE_SIN_REWARD),
                         float(RW_SEEK_VISIBLE_BONUS),
                     )
                 reward_compute_sec_sum += time.perf_counter() - reward_t0
@@ -1491,6 +1504,7 @@ def run_train_vector(
                         reward_idx_cache["enemy_rel_x"],
                         reward_idx_cache["enemy_rel_y"],
                         reward_idx_cache["enemy_quat_0"],
+                        reward_idx_cache["enemy_quat_1"],
                         float(RW_MOVE_CTRL_COST),
                         float(RW_MOVE_INCENTIVE),
                         float(RW_IDLE_PENALTY),
@@ -1509,6 +1523,7 @@ def run_train_vector(
                         float(0.4 + 0.5),  # WALL_SAFE
                         float(RW_HIDE_VISIBLE_NEAR_PENALTY),
                         float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
+                        float(RW_HIDE_SEEKER_GAZE_SIN_REWARD),
                         float(RW_SEEK_VISIBLE_BONUS),
                     )
                 reward_compute_sec_sum += time.perf_counter() - reward_t0

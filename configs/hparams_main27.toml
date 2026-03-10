@@ -31,6 +31,7 @@ rw_wall_near_threshold = 0.18  # 壁近判定閾値（全エージェント共�
 rw_still_speed_threshold = 0.05  # 静止判定速度閾値（全エージェント共通）
 rw_hide_visible_near_penalty = 0.025
 rw_hide_seeker_gaze_cos_penalty = 0.03
+rw_hide_seeker_gaze_sin_reward = 0.03
 rw_wall_avoid_penalty = 0.15
 ramp_check_enabled = true
 ramp_check_viewer = false
