@@ -312,21 +312,24 @@ HPARAMS_CONFIG_PATH = CONFIG_PATH
 
 # 報酬形成係数
 RW_SEEK_VISIBLE_BONUS = _cfg("rw_seek_visible_bonus", "0.03", float, RUNTIME_OVERRIDES)
-RW_SEEK_DIST_GAIN = _cfg("rw_seek_dist_gain", "0.03", float, RUNTIME_OVERRIDES)
-RW_SEEK_IDLE_PENALTY = _cfg("rw_seek_idle_penalty", "0.01", float, RUNTIME_OVERRIDES)
 RW_WALL_NEAR_THRESHOLD = _cfg("rw_wall_near_threshold", "0.18", float, RUNTIME_OVERRIDES)  # 壁近判定閾値（全エージェント共通）
 RW_STILL_SPEED_THRESHOLD = _cfg("rw_still_speed_threshold", "0.05", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値（全エージェント共通）
 
 RW_MOVE_SAT_PENALTY = _cfg("rw_move_sat_penalty", "0.02", float, RUNTIME_OVERRIDES)
 RW_TURN_SAT_PENALTY = _cfg("rw_turn_sat_penalty", "0.01", float, RUNTIME_OVERRIDES)
 RW_MOVE_CTRL_COST = _cfg("rw_move_ctrl_cost", "0.001", float, RUNTIME_OVERRIDES)
-RW_HAND_CTRL_COST = _cfg("rw_hand_ctrl_cost", "0.0005", float, RUNTIME_OVERRIDES)
 
 RW_MOVE_INCENTIVE = _cfg("rw_move_incentive", "0.02", float, RUNTIME_OVERRIDES)
 RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float, RUNTIME_OVERRIDES)
 RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.05", float, RUNTIME_OVERRIDES)
+
 # --- 壁張り付きペナルティ（全エージェント共通） ---
 RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.1", float, RUNTIME_OVERRIDES)
+# --- HiderがSeekerに近い場合のペナルティ ---
+RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("rw_hide_visible_near_penalty", "0.025", float, RUNTIME_OVERRIDES)
+
+# --- HiderがSeekerの視線方向にいる場合のペナルティ ---
+RW_HIDE_SEEKER_GAZE_COS_PENALTY = _cfg("rw_hide_seeker_gaze_cos_penalty", "0.01", float, RUNTIME_OVERRIDES)
 
 # --- 速度・回転の閾値（TOMLで設定可） ---
 IDLE_SPEED_THRESHOLD = _cfg("idle_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値
@@ -503,15 +506,35 @@ def _compute_custom_reward_batch_numba(
         vel_y = float(obs_batch[i, self_vel_y_idx])
         speed = np.sqrt(vel_x * vel_x + vel_y * vel_y)
 
-        control_cost = -move_ctrl_cost * (move * move + turn * turn)
+        # --- 速度・移動インセンティブ/ペナルティ（Python版に忠実に） ---
+        # 定数はPython版と合わせて引数化・定義済みと仮定
         bonus = 0.0
+        # 速度閾値
+        IDLE_SPEED_THRESHOLD = 0.1  # 仮: 本来は引数で渡す
+        MOVE_INCENTIVE_SPEED_THRESHOLD = 0.3  # 仮: 本来は引数で渡す
+        MOVE_SAT_THRESHOLD = 1.0  # 仮: 本来は引数で渡す
+        MOVE_SAT_PENALTY = 0.02  # 仮: 本来は引数で渡す
+
+        if speed < IDLE_SPEED_THRESHOLD:
+            bonus -= idle_penalty * (IDLE_SPEED_THRESHOLD - speed)
+        elif speed < MOVE_INCENTIVE_SPEED_THRESHOLD:
+            bonus += move_incentive * ((speed - IDLE_SPEED_THRESHOLD) / (MOVE_INCENTIVE_SPEED_THRESHOLD - IDLE_SPEED_THRESHOLD))
+        elif speed <= MOVE_SAT_THRESHOLD:
+            bonus += move_incentive
+        else:
+            bonus += move_incentive
+            bonus -= MOVE_SAT_PENALTY * (speed - MOVE_SAT_THRESHOLD)
+
+
+        # --- 回転ペナルティ（Python版に忠実に） ---
+        TURN_SAT_THRESHOLD = 1.0  # 仮: 本来は引数で渡す
+        TURN_SAT_PENALTY = 0.01   # 仮: 本来は引数で渡す
+        if abs(turn) > TURN_SAT_THRESHOLD:
+            bonus -= TURN_SAT_PENALTY
+
+        control_cost = -move_ctrl_cost * (move * move + turn * turn)
 
         if target_is_hider:
-            if speed < 0.1:
-                bonus -= idle_penalty
-            elif speed > 0.3:
-                bonus += move_incentive
-
             lidar_min = 1.0
             for j in range(lidar_indices.shape[0]):
                 idx = int(lidar_indices[j])
@@ -526,9 +549,6 @@ def _compute_custom_reward_batch_numba(
                     ratio = 1.0
                 bonus -= wall_avoid_penalty * (1.0 - ratio)
         else:
-            if speed < 0.1:
-                bonus -= idle_penalty
-
             for j in range(enemy_visible_indices.shape[0]):
                 idx_vis = int(enemy_visible_indices[j])
                 if obs_batch[i, idx_vis] > 0.5:

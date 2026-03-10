@@ -73,7 +73,7 @@ auto_tune_hparams = false
 # runtime.train: 学習向け設定
 [runtime.train]
 train_mode = true
-use_viewer = true
+use_viewer = false
 training_target = "hider"
 train_other_hider_policy = "model_if_available"
 train_other_seeker_policy = "model_if_available"
