@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 import gymnasium as gym
 from functools import partial
-from numba import njit, prange
+from numba import njit, prange, float32, int32, boolean
 
 try:
     import tomllib  # Python 3.11+
@@ -251,29 +251,97 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
     vel_x = float(obs[cache["self_vel_x"]])
     vel_y = float(obs[cache["self_vel_y"]])
     speed = math.sqrt(vel_x * vel_x + vel_y * vel_y)
-    control_cost = -RW_MOVE_CTRL_COST * (move * move + turn * turn)
     bonus = 0.0
     AGENT_RADIUS = 0.4
     WALL_NEAR = AGENT_RADIUS + 0.2  # 0.6
     WALL_SAFE = AGENT_RADIUS + 0.5  # 0.9
 
+    # --- 速度・移動に関する報酬・ペナルティ（共通） ---
+    MOVE_SAT_THRESHOLD = _cfg("move_sat_threshold", "1.0", float)
+    TURN_SAT_THRESHOLD = _cfg("turn_sat_threshold", "1.0", float)
+    RW_IDLE_SPEED_THRESHOLD = _cfg("idle_speed_threshold", "0.1", float)
+    RW_MOVE_INCENTIVE_SPEED_THRESHOLD = _cfg("move_incentive_speed_threshold", "0.3", float)
+    if speed > MOVE_SAT_THRESHOLD:
+        bonus -= RW_MOVE_SAT_PENALTY
+    elif speed < RW_IDLE_SPEED_THRESHOLD:
+        bonus -= RW_IDLE_PENALTY
+    elif speed > RW_MOVE_INCENTIVE_SPEED_THRESHOLD:
+        bonus += RW_MOVE_INCENTIVE
+    if abs(turn) > TURN_SAT_THRESHOLD:
+        bonus -= RW_TURN_SAT_PENALTY
+    # 4. コントロールコスト
+    control_cost = -RW_MOVE_CTRL_COST * (move * move + turn * turn)
+    # 5. 壁張り付きペナルティ
+    if _is_wall_stick_state(obs, idx, reward_idx_cache=reward_idx_cache):
+        bonus -= RW_HIDE_WALL_STICK_PENALTY
+
+    # --- エージェント固有ロジック ---
     if target == "hider":
-        if speed < 0.1:
-            bonus -= RW_IDLE_PENALTY
-        elif speed > 0.3:
-            bonus += RW_MOVE_INCENTIVE
-        # --- 壁張り付き状態なら明示的にペナルティ加算 ---
-        if _is_wall_stick_state(obs, idx, reward_idx_cache=reward_idx_cache):
-            bonus -= RW_HIDE_WALL_STICK_PENALTY
+        # hider固有の追加ロジックがあればここに
+        pass
     else:
-        if speed < 0.1:
-            bonus -= RW_IDLE_PENALTY
         for j in range(len(cache["enemy_visible"])):
             if obs[cache["enemy_visible"][j]] > 0.5:
                 dx = float(obs[cache["enemy_rel_x"][j]])
                 dy = float(obs[cache["enemy_rel_y"][j]])
                 dist = math.sqrt(dx * dx + dy * dy)
-                bonus += 0.05 / (dist + 1.0)
+                bonus += RW_SEEK_VISIBLE_BONUS / (dist + 1.0)
+    """
+    カスタム報酬関数（ユーザー定義版）。
+    obs: 観測（1次元np.array）
+    action: 行動（1次元np.array）
+    base_reward: 環境からの基本報酬
+    idx: env.idx
+    target: "hider" or "seeker"
+    info: info dict
+    reward_idx_cache: インデックスキャッシュ（省略可）
+    """
+    cache = (
+        reward_idx_cache
+        if reward_idx_cache is not None
+        else _build_reward_index_cache(idx)
+    )
+    move = float(action[0]) if len(action) > 0 else 0.0
+    turn = float(action[1]) if len(action) > 1 else 0.0
+    vel_x = float(obs[cache["self_vel_x"]])
+    vel_y = float(obs[cache["self_vel_y"]])
+    speed = math.sqrt(vel_x * vel_x + vel_y * vel_y)
+    bonus = 0.0
+    AGENT_RADIUS = 0.4
+    WALL_NEAR = AGENT_RADIUS + 0.2  # 0.6
+    WALL_SAFE = AGENT_RADIUS + 0.5  # 0.9
+
+    # --- 速度・移動に関する報酬・ペナルティ（共通） ---
+    # 1. 停滞ペナルティ
+    if speed < 0.1:
+        bonus -= RW_IDLE_PENALTY
+    # 2. 速度インセンティブ
+    if speed > 0.3:
+        bonus += RW_MOVE_INCENTIVE
+    # 3. 速度飽和ペナルティ
+    MOVE_SAT_THRESHOLD = 1.0
+    TURN_SAT_THRESHOLD = 1.0
+    if abs(vel_x) > MOVE_SAT_THRESHOLD or abs(vel_y) > MOVE_SAT_THRESHOLD:
+        bonus -= RW_MOVE_SAT_PENALTY
+    if abs(turn) > TURN_SAT_THRESHOLD:
+        bonus -= RW_TURN_SAT_PENALTY
+    # 4. コントロールコスト
+    control_cost = -RW_MOVE_CTRL_COST * (move * move + turn * turn)
+    # 5. 壁張り付きペナルティ
+    if _is_wall_stick_state(obs, idx, reward_idx_cache=reward_idx_cache):
+        bonus -= RW_HIDE_WALL_STICK_PENALTY
+
+    # --- エージェント固有ロジック ---
+    if target == "hider":
+        # hider固有の追加ロジックがあればここに
+        pass
+    else:
+        for j in range(len(cache["enemy_visible"])):
+            if obs[cache["enemy_visible"][j]] > 0.5:
+                dx = float(obs[cache["enemy_rel_x"][j]])
+                dy = float(obs[cache["enemy_rel_y"][j]])
+                dist = math.sqrt(dx * dx + dy * dy)
+                bonus += RW_SEEK_VISIBLE_BONUS / (dist + 1.0)
 
     # --- wall_distanceベースの壁ペナルティ（hider/seeker共通） ---
     if info is not None and 'wall_distance' in info:
@@ -519,8 +587,6 @@ def _load_runtime_config(path, profile_override=None):
 
 
 
-
-
 def _to_bool(value):
     if isinstance(value, bool):
         return value
@@ -535,8 +601,6 @@ def _cfg(name, default, cast=None):
     if cast is None:
         return raw
     return cast(raw)
-
-
 
 TRAIN_MODE = _cfg("train_mode", "0", _to_bool)
 USE_VIEWER = _cfg("use_viewer", "1", _to_bool)
@@ -649,14 +713,16 @@ def _min_lidar_from_obs(obs, lidar_indices):
     return lidar_min
 
 
-@njit(cache=True, parallel=True)
+@njit([
+    "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32)"
+], cache=True, parallel=True)
 def _compute_custom_reward_batch_numba(
     obs_batch,
     action_batch,
     base_reward_batch,
     target_is_hider,
-    self_vel_x_idx,
-    self_vel_y_idx,
+    self_vel_x_idx: int,
+    self_vel_y_idx: int,
     lidar_indices,
     enemy_visible_indices,
     enemy_rel_x_indices,
@@ -671,8 +737,8 @@ def _compute_custom_reward_batch_numba(
     for i in prange(n_envs):
         move = float(action_batch[i, 0])
         turn = float(action_batch[i, 1])
-        vel_x = float(obs_batch[i, int(self_vel_x_idx)])
-        vel_y = float(obs_batch[i, int(self_vel_y_idx)])
+        vel_x = float(obs_batch[i, self_vel_x_idx])
+        vel_y = float(obs_batch[i, self_vel_y_idx])
         speed = np.sqrt(vel_x * vel_x + vel_y * vel_y)
 
         control_cost = -move_ctrl_cost * (move * move + turn * turn)
@@ -709,7 +775,7 @@ def _compute_custom_reward_batch_numba(
                     dx = float(obs_batch[i, idx_x])
                     dy = float(obs_batch[i, idx_y])
                     dist = np.sqrt(dx * dx + dy * dy)
-                    bonus += 0.05 / (dist + 1.0)
+                    bonus += RW_SEEK_VISIBLE_BONUS / (dist + 1.0)
 
         rewards[i] = float(base_reward_batch[i]) + bonus + control_cost
     return rewards
@@ -747,6 +813,8 @@ def model_path_for_config(target, config):
 
 
 def build_env(mode, target, config, render_mode=None):
+    config = dict(config)  # 破壊的変更を避ける
+    config.pop('num_envs', None)
     return TeamCosEnv(
         mode=mode,
         target=target,
@@ -868,6 +936,20 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
         hider_state, hider_path = _maybe_load_model_state("hider")
         if hider_state is None:
             print(f"Hider policy: fallback to rule (missing model: {hider_path})")
+            # 明示的に全Hiderをruleベースにする
+            if hasattr(ref_env, "inference_policies"):
+                for k in ref_env.hider_keys:
+                    if k in ref_env.inference_policies:
+                        del ref_env.inference_policies[k]
+            if hasattr(ref_env, "shared_team_policy"):
+                ref_env.shared_team_policy = False
+            if hasattr(ref_env, "shared_policy_model"):
+                ref_env.shared_policy_model = None
+            if hasattr(ref_env, "_init_agent_intelligence"):
+                ref_env._init_agent_intelligence()
+            # 全HiderをRuleBasedにし、学習エージェントもruleで動かす
+            if hasattr(ref_env, "set_override_learnable_policy"):
+                ref_env.set_override_learnable_policy(True)
 
     if seeker_mode == POLICY_MODEL_IF_AVAILABLE and seeker_state is None:
         seeker_state, seeker_path = _maybe_load_model_state("seeker")
@@ -887,6 +969,7 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
         and (hider_state is not None)
     )
     override_enabled = False
+    # symmetric_hider_debug時のoverride_learnable_policy設定は不要（rule強制時のみTrue）
     if symmetric_hider_debug:
         all_hider_keys = list(ref_env.hider_keys)
         ok = _apply_policy_state(
@@ -896,12 +979,10 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
             hider_state,
             "Debug symmetric hider policy",
         )
-        _set_override_learnable_policy(env, vec_envs, ok)
         override_enabled = bool(ok)
         if ok:
             print("Debug mode: all hiders use same model inference path")
     else:
-        _set_override_learnable_policy(env, vec_envs, False)
         override_enabled = False
 
     print(
@@ -965,7 +1046,11 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                         out = agent.get_action_and_value(seq)
                     action = out[0].cpu().numpy().reshape(-1)
             else:
-                action = np.zeros(env.action_space.shape, dtype=np.float32)
+                # 全Hiderをruleで動かす場合はH1にもRuleBasedHiderアクションを送る
+                if env.target == "hider" and getattr(env, "override_learnable_policy", False):
+                    action = env.npcs[env.learnable_agent_key].get_action(obs, idx)
+                else:
+                    action = np.zeros(env.action_space.shape, dtype=np.float32)
             next_obs, base_r, term, trun, info = env.step(action)
             reward = (
                 compute_custom_reward(obs, action, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
@@ -1086,6 +1171,7 @@ def run_train(
             reward_compute_sec_sum = 0.0
             env_step_sec_sum = 0.0
 
+
             for t in range(hp["rollout_steps"]):
                 if USE_VIEWER and env.viewer and not env.viewer.is_running():
                     print("Viewer closed. Stop training loop.")
@@ -1097,22 +1183,30 @@ def run_train(
                     action, logp, _, value = agent.get_action_and_value(seq)
 
                 action_np = action.cpu().numpy()
+                # アクションをaction_spaceでクリップ
+                action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
+                num_envs = action_np.shape[0]
                 step_t0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = env.step(action_np)
+                # Viewerの明示的更新
+                env.render()
+                # 観測ベクトルの一部をprint
+                if next_obs.ndim == 1:
+                    next_obs = np.expand_dims(next_obs, axis=0)
                 env_step_sec_sum += time.perf_counter() - step_t0
-                done_np = np.logical_or(term, trun).astype(np.float32)
+                done_np = np.atleast_1d(np.logical_or(term, trun).astype(np.float32))
                 done_last = done_np
 
                 reward_np = np.asarray(base_r, dtype=np.float32).copy()
                 reward_t0 = time.perf_counter()
                 if USE_CUSTOM_REWARD:
                     reward_np = _compute_custom_reward_batch_numba(
-                        np.asarray(obs, dtype=np.float32),
-                        np.asarray(action_np, dtype=np.float32),
-                        np.asarray(reward_np, dtype=np.float32),
+                        np.asarray(obs, dtype=np.float32).reshape(num_envs, -1),
+                        np.asarray(action_np, dtype=np.float32).reshape(num_envs, -1),
+                        np.asarray(reward_np, dtype=np.float32).reshape(num_envs),
                         bool(ref_env.target == "hider"),
-                        reward_idx_cache["self_vel_x"],
-                        reward_idx_cache["self_vel_y"],
+                        int(reward_idx_cache["self_vel_x"]),
+                        int(reward_idx_cache["self_vel_y"]),
                         reward_idx_cache["lidar"],
                         reward_idx_cache["enemy_visible"],
                         reward_idx_cache["enemy_rel_x"],
@@ -1152,7 +1246,13 @@ def run_train(
                         seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
                         if seen_learnable:
                             learnable_seen_steps += 1
-                        is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache)
+                        obs1d = np.asarray(next_obs[i]).flatten()
+                        # 必要なインデックスが存在しない場合はスキップ
+                        max_idx = max(reward_idx_cache["self_vel_x"], reward_idx_cache["self_vel_y"])
+                        if obs1d.shape[0] <= max_idx:
+                            is_wall_stick = False
+                        else:
+                            is_wall_stick = _is_wall_stick_state(obs1d, idx, reward_idx_cache=reward_idx_cache)
                         if is_wall_stick:
                             wall_stick_steps += 1
                             if seen_learnable:
@@ -1163,8 +1263,13 @@ def run_train(
                 history.update(next_obs)
                 for i in range(num_envs):
                     if done_np[i] > 0.5:
-                        history.reset_env(i, next_obs[i])
+                        obs1d = np.asarray(next_obs[i]).flatten()
+                        if obs1d.size == history.obs_dim:
+                            history.reset_env(i, obs1d)
+                        else:
+                            print(f"[warn] next_obs[{i}] size {obs1d.size} != obs_dim {history.obs_dim}, skip reset")
                 obs = next_obs
+
 
             with torch.no_grad():
                 next_value = agent.get_value(history.get()).view(num_envs)
@@ -1469,12 +1574,12 @@ def run_train_vector(
                 reward_t0 = time.perf_counter()
                 if USE_CUSTOM_REWARD:
                     reward_np = _compute_custom_reward_batch_numba(
-                        np.asarray(obs, dtype=np.float32),
-                        np.asarray(action_np, dtype=np.float32),
-                        np.asarray(reward_np, dtype=np.float32),
+                        np.asarray(obs, dtype=np.float32).reshape(action_np.shape[0], -1),
+                        np.asarray(action_np, dtype=np.float32).reshape(action_np.shape[0], -1),
+                        np.asarray(reward_np, dtype=np.float32).reshape(action_np.shape[0]),
                         bool(ref_env.target == "hider"),
-                        reward_idx_cache["self_vel_x"],
-                        reward_idx_cache["self_vel_y"],
+                        int(reward_idx_cache["self_vel_x"]),
+                        int(reward_idx_cache["self_vel_y"]),
                         reward_idx_cache["lidar"],
                         reward_idx_cache["enemy_visible"],
                         reward_idx_cache["enemy_rel_x"],
@@ -1746,6 +1851,11 @@ def run():
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+    # use_viewer時は単一環境に強制
+    if USE_VIEWER:
+        ENV_CONFIG["num_envs"] = 1
+
     def make_env(render_mode=None):
         return build_env(MODE, runtime_target, ENV_CONFIG, render_mode)
 
@@ -1916,3 +2026,4 @@ if __name__ == "__main__":
     if CLI_COMPARE_PROFILES:
         raise SystemExit(run_profile_comparison(CLI_COMPARE_PROFILES))
     run()
+    
