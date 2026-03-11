@@ -287,12 +287,12 @@ HIDDEN_DIM = _cfg("hidden_dim", "256", int, RUNTIME_OVERRIDES)
 NUM_ENVS = _cfg("num_envs", "8", int, RUNTIME_OVERRIDES)
 ACTION_REPEAT = _cfg("action_repeat", "10", int, RUNTIME_OVERRIDES)
 
-RAMP_CHECK_ENABLED = _cfg("ramp_check_enabled", "1", _to_bool, RUNTIME_OVERRIDES)
+RAMP_CHECK_ENABLED = _cfg("ramp_check_enabled", "0", _to_bool, RUNTIME_OVERRIDES)
 RAMP_CHECK_INTERVAL = _cfg("ramp_check_interval", str(hp.get("save_interval", 50)), int, RUNTIME_OVERRIDES)
 RAMP_CHECK_EPISODES = _cfg("ramp_check_episodes", "3", int, RUNTIME_OVERRIDES)
 RAMP_CHECK_STEPS = _cfg("ramp_check_steps", "220", int, RUNTIME_OVERRIDES)
 RAMP_CHECK_VIEWER = _cfg("ramp_check_viewer", "0", _to_bool, RUNTIME_OVERRIDES)
-RAMP_CHECK_FORCE_UPHILL = _cfg("ramp_check_force_uphill", "1", _to_bool, RUNTIME_OVERRIDES)
+RAMP_CHECK_FORCE_UPHILL = _cfg("ramp_check_force_uphill", "0", _to_bool, RUNTIME_OVERRIDES)
 RAMP_SUCCESS_PROG = _cfg("ramp_success_prog", "0.90", float, RUNTIME_OVERRIDES)
 RAMP_SUCCESS_TOP = _cfg("ramp_success_top", "0.05", float, RUNTIME_OVERRIDES)
 RAMP_SUCCESS_LAT = _cfg("ramp_success_lat", "0.75", float, RUNTIME_OVERRIDES)
@@ -444,12 +444,13 @@ def _min_lidar_from_obs(obs, lidar_indices):
 
 # 各エージェントごとに1つだけキャッシュ（idx, reward_idx_cacheのid）
 _wall_stick_state_cache = {}
-def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None):
+def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None, agent_idx=None):
     """壁張り付き状態かチェック（全エージェント共通, エージェントごとキャッシュ, speed外部渡し可, infoのwall_distance優先)"""
     global _wall_stick_state_cache
     cache_id = id(reward_idx_cache) if reward_idx_cache is not None else id(idx)
-    key = (idx, cache_id)
+    key = (idx, cache_id, agent_idx if agent_idx is not None else 0)
     if key in _wall_stick_state_cache:
+        # print(f"[DEBUG] wall_stick_state_cache hit: {key} -> {_wall_stick_state_cache[key]}")
         return _wall_stick_state_cache[key]
     # まずinfo['wall_distance']があればそれを使う
     wall_near = None
@@ -465,6 +466,7 @@ def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None)
         lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
         wall_near = lidar_min < RW_WALL_NEAR_THRESHOLD
     if not wall_near:
+        # print(f"[DEBUG] wall_stick: wall_near=False (lidar_min={lidar_min:.3f}, threshold={RW_WALL_NEAR_THRESHOLD})")
         _wall_stick_state_cache[key] = False
         return False
     # 壁際なら速度判定
@@ -472,6 +474,7 @@ def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None)
         cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
         speed = math.sqrt(float(obs[cache["self_vel_x"]]) ** 2 + float(obs[cache["self_vel_y"]]) ** 2)
     result = speed < RW_STILL_SPEED_THRESHOLD
+    # print(f"[DEBUG] wall_stick: wall_near={wall_near}, speed={speed:.4f}, threshold={RW_STILL_SPEED_THRESHOLD}, result={result}, obs_vel=({obs[cache['self_vel_x']]:.4f},{obs[cache['self_vel_y']]:.4f})")
     _wall_stick_state_cache[key] = result
     return result
 
@@ -1111,9 +1114,6 @@ def run_train(
 
             for t in range(hp["rollout_steps"]):
                 _clear_wall_stick_state_cache()  # 各ステップの先頭でキャッシュクリア
-                if USE_VIEWER and env.viewer and not env.viewer.is_running():
-                    print("Viewer closed. Stop training loop.")
-                    return
                 seq = history.get()
                 rollout_obs[t] = seq
 
@@ -1202,13 +1202,8 @@ def run_train(
                         seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
                         if seen_learnable:
                             learnable_seen_steps += 1
-                        obs1d = np.asarray(next_obs[i]).flatten()
-                        max_idx = max(reward_idx_cache["self_vel_x"], reward_idx_cache["self_vel_y"])
-                        if obs1d.shape[0] <= max_idx:
-                            is_wall_stick = False
-                        else:
-                            # speedは未計算なので従来通り内部計算
-                            is_wall_stick = _is_wall_stick_state(obs1d, idx, reward_idx_cache=reward_idx_cache)
+                        # speedは未計算なので従来通り内部計算
+                        is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache, agent_idx=i)
                         if is_wall_stick:
                             wall_stick_steps += 1
                             if seen_learnable:
@@ -1221,7 +1216,9 @@ def run_train(
                     if done_np[i] > 0.5:
                         obs1d = np.asarray(next_obs[i]).flatten()
                         if obs1d.size == history.obs_dim:
-                            history.reset_env(i, obs1d)
+                            # エピソード終了時に環境をリセット
+                            next_obs[i], _ = env.reset()
+                            history.reset_env(i, next_obs[i])
                         else:
                             print(f"[warn] next_obs[{i}] size {obs1d.size} != obs_dim {history.obs_dim}, skip reset")
                 obs = next_obs
@@ -1474,6 +1471,7 @@ def run_train_vector(
 
             info_buffer.clear()
             for t in range(hp["rollout_steps"]):
+                _clear_wall_stick_state_cache()  # 各ステップの先頭でキャッシュクリア
                 seq = history.get()
                 rollout_obs[t] = seq
 
@@ -1535,38 +1533,64 @@ def run_train_vector(
                 rollout_dones[t] = torch.as_tensor(done_np, device=device)
                 rollout_values[t] = value.view(-1)
 
+
+                # --- 詳細な統計情報の加算 ---
+                # infoはlist/tupleまたはdict
                 for i in range(num_envs):
-                    lock_evt_sum += int(_info_at(info, "lock_event", i, 0))
-                    grab_evt_sum += int(_info_at(info, "grab_event", i, 0))
-                    max_box_speed = max(
-                        max_box_speed,
-                        float(_info_at(info, "dbg_max_box_speed", i, 0.0)),
-                    )
-                    max_ramp_speed = max(
-                        max_ramp_speed,
-                        float(_info_at(info, "dbg_max_ramp_speed", i, 0.0)),
-                    )
-                    blocked_ramp_sum += int(
-                        _info_at(info, "dbg_blocked_ramp_count", i, 0)
-                    )
-                    if not bool(_info_at(info, "is_detected", i, False)):
+                    # info_iの取得
+                    if isinstance(info, (list, tuple)):
+                        info_i = info[i] if len(info) > i else None
+                    elif isinstance(info, dict):
+                        info_i = info
+                    else:
+                        info_i = None
+                    if info_i is None:
+                        continue
+                    # lock/grabイベント
+                    def _scalar_from_info(val, idx, default=0):
+                        # valが配列/リストならidx番目、スカラーならそのまま
+                        if isinstance(val, (list, tuple, np.ndarray)):
+                            if len(val) > idx:
+                                return val[idx]
+                            else:
+                                return default
+                        return val
+
+                    lock_evt_sum += int(_scalar_from_info(info_i.get("lock_event", 0), i, 0))
+                    grab_evt_sum += int(_scalar_from_info(info_i.get("grab_event", 0), i, 0))
+                    max_box_speed = max(max_box_speed, float(_scalar_from_info(info_i.get("dbg_max_box_speed", 0.0), i, 0.0)))
+                    max_ramp_speed = max(max_ramp_speed, float(_scalar_from_info(info_i.get("dbg_max_ramp_speed", 0.0), i, 0.0)))
+                    blocked_ramp_sum += int(_scalar_from_info(info_i.get("dbg_blocked_ramp_count", 0), i, 0))
+                    is_detected = bool(_scalar_from_info(info_i.get("is_detected", False), i, False))
+                    if not is_detected:
                         hidden_steps += 1
-                    seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
+                    seen_learnable = bool(_scalar_from_info(info_i.get("dbg_learnable_hider_seen", is_detected), i, is_detected))
                     if seen_learnable:
                         learnable_seen_steps += 1
-                    # speedは未計算なので従来通り内部計算
-                    is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache)
+                    is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache, agent_idx=i)
                     if is_wall_stick:
                         wall_stick_steps += 1
                         if seen_learnable:
                             wall_stick_seen_steps += 1
+                    rewards_sum += float(reward_np[i])
 
-                rewards_sum += float(np.sum(reward_np))
-
-                history.update(next_obs)
                 for i in range(num_envs):
                     if done_np[i] > 0.5:
-                        history.reset_env(i, next_obs[i])
+                        obs1d = np.asarray(next_obs[i]).flatten()
+                        if obs1d.size == history.obs_dim:
+                            # 個別reset: サブ環境iだけresetし、その観測だけをnext_obs[i]に代入
+                            if hasattr(envs, 'reset_at'):
+                                next_obs_i, _ = envs.reset_at(i)
+                            else:
+                                # reset_maskで個別リセット
+                                mask = np.zeros(num_envs, dtype=bool)
+                                mask[i] = True
+                                next_obses, _ = envs.reset(options={"reset_mask": mask})
+                                next_obs_i = next_obses[i]
+                            next_obs[i] = next_obs_i
+                            history.reset_env(i, next_obs[i])
+                        else:
+                            print(f"[warn] next_obs[{i}] size {obs1d.size} != obs_dim {history.obs_dim}, skip reset")
                 obs = next_obs
 
             with torch.no_grad():

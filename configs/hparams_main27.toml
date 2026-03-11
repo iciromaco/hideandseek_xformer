@@ -33,9 +33,9 @@ rw_hide_visible_near_penalty = 0.025
 rw_hide_seeker_gaze_cos_penalty = 0.03
 rw_hide_seeker_gaze_sin_reward = 0.03
 rw_wall_avoid_penalty = 0.15
-ramp_check_enabled = true
+ramp_check_enabled = false
 ramp_check_viewer = false
-ramp_check_force_uphill = true
+ramp_check_force_uphill = false
 ramp_check_episodes = 3
 ramp_check_steps = 220
 # 実行基盤
@@ -83,6 +83,20 @@ auto_tune_hparams = false
 total_timesteps = 100_000_000
 wandb_run_name = "wall_only_confirm_1M"
 rw_move_sat_penalty = 0.0
+
+# runtime.train1: Viewer 表示ありの学習環境
+[runtime.train1]
+train_mode = true
+use_viewer = true
+training_target = "hider"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 100_000_000
+wandb_run_name = "train1"
+rw_move_sat_penalty = 0.0
+num_envs = 1
 
 # base: PPOの基本ハイパーパラメータ（全ターゲット共通）
 [base]

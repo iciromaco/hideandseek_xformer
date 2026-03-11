@@ -910,7 +910,11 @@ class TeamCosEnv(gym.Env):
                 if self._is_spawn_position_valid(p, rad, placed, margin=0.2):
                     adr = self.model.jnt_qposadr[self.model.body_jntadr[bid]]
                     self.data.qpos[adr:adr+7] = [p[0], p[1], z, 1, 0, 0, 0]
-                    placed.append((p, rad)); break
+                    placed.append((p, rad))
+                    # ランプのみx, y出力とqpos値も出力
+                    # if (bid, rad, z) in ramp_specs:
+                    #    print(f"[reset] ramp placed: x={p[0]:.3f}, y={p[1]:.3f}, qpos={self.data.qpos[adr]:.3f},{self.data.qpos[adr+1]:.3f}")
+                    # break
         for ak in self.agent_keys:
             for _ in range(500):
                 p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2); rot = np.random.uniform(-np.pi, np.pi)
@@ -945,7 +949,7 @@ class TeamCosEnv(gym.Env):
                 self._prime_policy_history(ak, self.shared_policy_seq_len, norm_obs)
 
         idx_to_obs = self.learnable_agent_index
-        
+
         # wall_distance を計算
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
         learnable_agent_pos = self.data.xpos[learnable_agent_body_id]
@@ -1298,4 +1302,3 @@ class TeamCosEnv(gym.Env):
     def close(self):
         if self.viewer: self.viewer.close()
 
-    
