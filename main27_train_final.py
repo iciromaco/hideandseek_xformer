@@ -484,10 +484,11 @@ def _clear_wall_stick_state_cache():
     _wall_stick_state_cache.clear()
 
 @njit([
-    "float32[:](float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32, float32[:], float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32)"
+    "float32[:](float32[:,:], float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32, float32[:], float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32)"
 ], cache=True, parallel=True)
 def _compute_custom_reward_batch_numba(
     obs_batch,
+    next_obs_batch,
     action_batch,
     base_reward_batch,
     target_is_hider,
@@ -526,24 +527,20 @@ def _compute_custom_reward_batch_numba(
     for i in prange(n_envs):
         move = float(action_batch[i, 0])
         turn = float(action_batch[i, 1])
-        vel_x = float(obs_batch[i, self_vel_x_idx])
-        vel_y = float(obs_batch[i, self_vel_y_idx])
-        speed = np.sqrt(vel_x * vel_x + vel_y * vel_y)
+        next_vel_x = float(next_obs_batch[i, self_vel_x_idx])
+        next_vel_y = float(next_obs_batch[i, self_vel_y_idx])
+        next_speed = np.sqrt(next_vel_x * next_vel_x + next_vel_y * next_vel_y)
 
-        # --- 速度・移動インセンティブ/ペナルティ（Python版に忠実に） ---
-        # 定数はPython版と合わせて引数化・定義済みと仮定
         bonus = 0.0
-        # 速度閾値
-
-        if speed < idle_speed_threshold:
-            bonus -= idle_penalty * (idle_speed_threshold - speed)
-        elif speed < move_incentive_speed_threshold:
-            bonus += move_incentive * ((speed - idle_speed_threshold) / (move_incentive_speed_threshold - idle_speed_threshold))
-        elif speed <= move_sat_threshold:
+        if next_speed < idle_speed_threshold:
+            bonus -= idle_penalty * (idle_speed_threshold - next_speed)
+        elif next_speed < move_incentive_speed_threshold:
+            bonus += move_incentive * ((next_speed - idle_speed_threshold) / (move_incentive_speed_threshold - idle_speed_threshold))
+        elif next_speed <= move_sat_threshold:
             bonus += move_incentive
         else:
             bonus += move_incentive
-            bonus -= move_sat_penalty * (speed - move_sat_threshold)
+            bonus -= move_sat_penalty * (next_speed - move_sat_threshold)
 
         if abs(turn) > turn_sat_threshold:
             bonus -= turn_sat_penalty
@@ -563,15 +560,11 @@ def _compute_custom_reward_batch_numba(
                 if lidar_val < lidar_min:
                     lidar_min = lidar_val
             wall_near = lidar_min < wall_near_threshold
-        if wall_near and speed < still_speed_threshold:
+        if wall_near and next_speed < still_speed_threshold:
             bonus -= wall_stick_penalty
 
-        # --- 壁回避ペナルティ（hider/seeker共通, Python版に忠実に） ---
-        wall_distance = None
-        if wall_distance_batch is not None:
-            wall_distance = wall_distance_batch[i]
-        else:
-            wall_distance = lidar_min
+        # --- 壁回避ペナルティ（hider/seeker共通, next_obsのwall_distance_batchに基づく） ---
+        wall_distance = wall_distance_batch[i]
         if wall_distance < agent_radius + 0.2:
             wall_near_val = agent_radius + 0.2
             ratio = wall_distance / wall_near_val
@@ -592,19 +585,19 @@ def _compute_custom_reward_batch_numba(
         if target_is_hider:
             for j in range(enemy_visible_indices.shape[0]):
                 idx_vis = int(enemy_visible_indices[j])
-                if obs_batch[i, idx_vis] > 0.5:
-                    idx_x = int(enemy_rel_x_indices[j])
+                if obs_batch[i, idx_vis] > 0.5: # 敵が見えている場合　ここはnext_obs_batchにしてはいけない（見えているかは行動前の状態に基づくべき）  
+                    idx_x = int(enemy_rel_x_indices[j]) 
                     idx_y = int(enemy_rel_y_indices[j])
-                    dx = float(obs_batch[i, idx_x])
-                    dy = float(obs_batch[i, idx_y])
+                    dx = float(next_obs_batch[i, idx_x])
+                    dy = float(next_obs_batch[i, idx_y])
                     dist = np.sqrt(dx * dx + dy * dy)
                     if dist < 2.0:
                         bonus -= rw_hide_visible_near_penalty * (2.0 - dist) / 2.0
                     if dist > 0.1:
                         idx_quat_0 = int(enemy_quat_0_indices[j])
                         idx_quat_1 = int(enemy_quat_1_indices[j])
-                        cos_theta = float(obs_batch[i, idx_quat_0])
-                        sin_theta = float(obs_batch[i, idx_quat_1])
+                        cos_theta = float(next_obs_batch[i, idx_quat_0])
+                        sin_theta = float(next_obs_batch[i, idx_quat_1])
                         bonus -= rw_hide_seeker_gaze_cos_penalty * cos_theta
                         # 横方向は常に報酬
                         bonus += rw_hide_seeker_gaze_sin_reward * abs(sin_theta)
@@ -613,11 +606,11 @@ def _compute_custom_reward_batch_numba(
         if not target_is_hider:
             for j in range(enemy_visible_indices.shape[0]):
                 idx_vis = int(enemy_visible_indices[j])
-                if obs_batch[i, idx_vis] > 0.5:
+                if obs_batch[i, idx_vis] > 0.5: # 敵が見えている場合　ここはnext_obs_batchにしてはいけない（見えているかは行動前の状態に基づくべき）  
                     idx_x = int(enemy_rel_x_indices[j])
                     idx_y = int(enemy_rel_y_indices[j])
-                    dx = float(obs_batch[i, idx_x])
-                    dy = float(obs_batch[i, idx_y])
+                    dx = float(next_obs_batch[i, idx_x])
+                    dy = float(next_obs_batch[i, idx_y])
                     dist = np.sqrt(dx * dx + dy * dy)
                     bonus += rw_seek_visible_bonus / (dist + 1.0)
 
@@ -625,10 +618,11 @@ def _compute_custom_reward_batch_numba(
     return rewards
 
 
-def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_idx_cache=None):
+def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info, reward_idx_cache=None):
     """
     カスタム報酬関数（単一ステップ）。
-    obs: 観測（1次元np.array）
+    obs: step前の観測（1次元np.array）
+    next_obs: step後の観測（1次元np.array）
     action: 行動（1次元np.array）
     base_reward: 環境からの基本報酬
     idx: env.idx
@@ -645,6 +639,7 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
     )
     # obs, action, base_reward: 1次元→2次元(1,dim) & float32
     obs_batch = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+    next_obs_batch = np.asarray(next_obs, dtype=np.float32).reshape(1, -1)
     action_batch = np.asarray(action, dtype=np.float32).reshape(1, -1)
     base_reward_batch = np.asarray([base_reward], dtype=np.float32)
     # target_is_hider: bool
@@ -670,6 +665,7 @@ def compute_custom_reward(obs, action, base_reward, idx, target, info, reward_id
     # Numba版呼び出し
     reward_arr = _compute_custom_reward_batch_numba(
         obs_batch,
+        next_obs_batch,
         action_batch,
         base_reward_batch,
         target_is_hider,
@@ -1135,12 +1131,20 @@ def run_train(
                 reward_np = np.asarray(base_r, dtype=np.float32).copy()
                 reward_t0 = time.perf_counter()
                 if USE_CUSTOM_REWARD:
-                    # wall_distanceが利用できない場合はnan埋め配列を渡す
-                    wall_distance_batch = np.full((num_envs,), np.nan, dtype=np.float32)
+                    # infoからwall_distanceを抽出
+                    if "wall_distance" in info:
+                        wd = info["wall_distance"]
+                        if isinstance(wd, (list, tuple, np.ndarray)):
+                            wall_distance_batch = np.asarray([float(wd[0])], dtype=np.float32)
+                        else:
+                            wall_distance_batch = np.asarray([float(wd)], dtype=np.float32)
+                    else:
+                        wall_distance_batch = np.full((num_envs,), np.nan, dtype=np.float32)
                     enemy_quat_0_indices = reward_idx_cache["enemy_quat_0"]
                     enemy_quat_1_indices = reward_idx_cache["enemy_quat_1"]
                     reward_np = _compute_custom_reward_batch_numba(
                         np.asarray(obs, dtype=np.float32).reshape(num_envs, -1),
+                        np.asarray(next_obs, dtype=np.float32).reshape(num_envs, -1),
                         np.asarray(action_np, dtype=np.float32).reshape(num_envs, -1),
                         np.asarray(reward_np, dtype=np.float32).reshape(num_envs),
                         bool(ref_env.target == "hider"),
@@ -1489,9 +1493,26 @@ def run_train_vector(
                 reward_np = np.asarray(base_r, dtype=np.float32).copy()
                 reward_t0 = time.perf_counter()
                 if USE_CUSTOM_REWARD:
+                    # infoがリストの場合は各環境ごとにwall_distanceを抽出
                     wall_distance_batch = np.full((action_np.shape[0],), np.nan, dtype=np.float32)
+                    if isinstance(info, (list, tuple)):
+                        for i in range(action_np.shape[0]):
+                            info_i = info[i] if len(info) > i else None
+                            if info_i is not None and "wall_distance" in info_i:
+                                wd = info_i["wall_distance"]
+                                if isinstance(wd, (list, tuple, np.ndarray)):
+                                    wall_distance_batch[i] = float(wd[0])
+                                else:
+                                    wall_distance_batch[i] = float(wd)
+                    elif isinstance(info, dict) and "wall_distance" in info:
+                        wd = info["wall_distance"]
+                        if isinstance(wd, (list, tuple, np.ndarray)):
+                            wall_distance_batch[0] = float(wd[0])
+                        else:
+                            wall_distance_batch[0] = float(wd)
                     reward_np = _compute_custom_reward_batch_numba(
                         np.asarray(obs, dtype=np.float32).reshape(action_np.shape[0], -1),
+                        np.asarray(next_obs, dtype=np.float32).reshape(action_np.shape[0], -1),
                         np.asarray(action_np, dtype=np.float32).reshape(action_np.shape[0], -1),
                         np.asarray(reward_np, dtype=np.float32).reshape(action_np.shape[0]),
                         bool(ref_env.target == "hider"),
@@ -1830,7 +1851,7 @@ def run_debug_or_playback(env, agent, device, model_loaded):
 
             next_obs, base_r, term, trun, info = env.step(action)
             reward = (
-                compute_custom_reward(obs, action, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
+                compute_custom_reward(obs, next_obs, action, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
                 if USE_CUSTOM_REWARD else base_r
             )
             history.update(next_obs)
