@@ -335,12 +335,21 @@ RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("rw_hide_visible_near_penalty", "0.025", flo
 RW_HIDE_SEEKER_GAZE_COS_PENALTY = _cfg("rw_hide_seeker_gaze_cos_penalty", "0.03", float, RUNTIME_OVERRIDES)
 # --- HiderがSeekerの視線方向にいる場合のsin報酬 ---
 RW_HIDE_SEEKER_GAZE_SIN_REWARD = _cfg("rw_hide_seeker_gaze_sin_reward", "0.03", float, RUNTIME_OVERRIDES)
+RW_HIDE_SEEKER_GAZE_SIN_REWARD = _cfg("rw_hide_seeker_gaze_sin_reward", "0.03", float, RUNTIME_OVERRIDES)
 
 # --- 速度・回転の閾値（TOMLで設定可） ---
 IDLE_SPEED_THRESHOLD = _cfg("idle_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値
 MOVE_INCENTIVE_SPEED_THRESHOLD = _cfg("move_incentive_speed_threshold", "0.3", float, RUNTIME_OVERRIDES)  # インセンティブ速度閾値
 MOVE_SAT_THRESHOLD = _cfg("move_sat_threshold", "1.0", float, RUNTIME_OVERRIDES)  # 行動飽和の閾値（速度）
 TURN_SAT_THRESHOLD = _cfg("turn_sat_threshold", "1.0", float, RUNTIME_OVERRIDES)  # 行動飽和の閾値（回転）
+
+# (removed local lowercase aliases; pass float(RW_*) inline at call sites)
+WALL_SAFE = _cfg("wall_safe", "1.0", float, RUNTIME_OVERRIDES)
+
+# エージェント半径を設定ファイルから取得（デフォルト 0.4）
+AGENT_RADIUS = _cfg("agentl_radius", "0.4", float, RUNTIME_OVERRIDES)
+# 壁近マージン（エージェント表面からの近接閾値; デフォルト 0.2）
+WALL_NEAR_MARGIN = _cfg("wall_near_margin", "0.2", float, RUNTIME_OVERRIDES)
 
 # ============================================================================
 # 観測履歴・ユーティリティクラス
@@ -436,8 +445,16 @@ def _build_reward_index_cache(idx):
 
 def _min_lidar_from_obs(obs, lidar_indices):
     """観測からLiDAー最小値を取得"""
+    # 前方3方向のみ（中央＋左右1つずつ）
+    n = len(lidar_indices)
+    if n < 3:
+        # fallback: 全方向
+        indices = lidar_indices
+    else:
+        center = n // 2
+        indices = [lidar_indices[center - 1], lidar_indices[center], lidar_indices[center + 1]]
     lidar_min = 1.0
-    for lidar_idx in lidar_indices:
+    for lidar_idx in indices:
         value = float(obs[int(lidar_idx)])
         if value < lidar_min:
             lidar_min = value
@@ -463,11 +480,18 @@ def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None,
             wall_distance = float(np.min(wall_distance))
         else:
             wall_distance = float(wall_distance)
-        wall_near = wall_distance < RW_WALL_NEAR_THRESHOLD
+        wall_near = (wall_distance - AGENT_RADIUS) < RW_WALL_NEAR_THRESHOLD
     if wall_near is None:
         cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
-        lidar_min = _min_lidar_from_obs(obs, cache["lidar"])
-        wall_near = lidar_min < RW_WALL_NEAR_THRESHOLD
+        lidar_indices = cache["lidar"]
+        # idx.LIDAR_FRONT_IDXをそのまま使う（範囲チェック不要）
+        front_indices = np.array(idx.LIDAR_FRONT_IDX, dtype=np.int32)
+        lidar_min = 1.0
+        for lidar_idx in front_indices:
+            value = float(obs[int(lidar_idx)])
+            if value < lidar_min:
+                lidar_min = value
+        wall_near = (lidar_min - AGENT_RADIUS) < RW_WALL_NEAR_THRESHOLD
     if not wall_near:
         # print(f"[DEBUG] wall_stick: wall_near=False (lidar_min={lidar_min:.3f}, threshold={RW_WALL_NEAR_THRESHOLD})")
         _wall_stick_state_cache[key] = False
@@ -486,18 +510,18 @@ def _clear_wall_stick_state_cache():
     global _wall_stick_state_cache
     _wall_stick_state_cache.clear()
 
-@njit([
-    "float32[:](float32[:,:], float32[:,:], float32[:,:], float32[:], boolean, int32, int32, int32[:], int32[:], int32[:], int32[:], int32[:], int32[:], float32, float32, float32, float32, float32[:], float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32, float32)"
-], cache=True, parallel=True)
+# デバッグ: Numbaコンパイル前に到達するか確認
+# debug: removed compilation print
+
+@njit(cache=True, parallel=True)
 def _compute_custom_reward_batch_numba(
     obs_batch,
     next_obs_batch,
     action_batch,
     base_reward_batch,
     target_is_hider,
-    self_vel_x_idx: int,
-    self_vel_y_idx: int,
-    lidar_indices,
+    self_vel_x_idx,
+    self_vel_y_idx,
     enemy_visible_indices,
     enemy_rel_x_indices,
     enemy_rel_y_indices,
@@ -519,22 +543,25 @@ def _compute_custom_reward_batch_numba(
     wall_stick_penalty,
     agent_radius,
     wall_safe,
+    wall_near_margin,
     rw_hide_visible_near_penalty,
     rw_hide_seeker_gaze_cos_penalty,
     rw_hide_seeker_gaze_sin_reward,
-    rw_seek_visible_bonus
+    rw_seek_visible_bonus,
+    front_lidar_indices,
+    agent_vz_batch
 ):
     """バッチ報酬計算（Numba JIT最適化）"""
     n_envs = obs_batch.shape[0]
     rewards = np.empty(n_envs, dtype=np.float32)
     for i in prange(n_envs):
-        move = float(action_batch[i, 0])
-        turn = float(action_batch[i, 1])
-        next_vel_x = float(next_obs_batch[i, self_vel_x_idx])
-        next_vel_y = float(next_obs_batch[i, self_vel_y_idx])
-        next_speed = np.sqrt(next_vel_x * next_vel_x + next_vel_y * next_vel_y)
+        move = np.float32(action_batch[i, 0])
+        turn = np.float32(action_batch[i, 1])
+        next_vel_x = np.float32(next_obs_batch[i, self_vel_x_idx])
+        next_vel_y = np.float32(next_obs_batch[i, self_vel_y_idx])
+        next_speed = np.float32(np.sqrt(next_vel_x * next_vel_x + next_vel_y * next_vel_y))
 
-        bonus = 0.0
+        bonus = np.float32(0.0)
         if next_speed < idle_speed_threshold:
             bonus -= idle_penalty * (idle_speed_threshold - next_speed)
         elif next_speed < move_incentive_speed_threshold:
@@ -545,51 +572,45 @@ def _compute_custom_reward_batch_numba(
             bonus += move_incentive
             bonus -= move_sat_penalty * (next_speed - move_sat_threshold)
 
-        if abs(turn) > turn_sat_threshold:
+        if np.abs(turn) > turn_sat_threshold:
             bonus -= turn_sat_penalty
 
         control_cost = -move_ctrl_cost * (move * move + turn * turn)
 
         # --- 壁張り付きペナルティ（hider/seeker共通, Python版に忠実に） ---
-        wall_near = None
-        if wall_distance_batch is not None:
-            wall_distance = wall_distance_batch[i]
-            wall_near = wall_distance < wall_near_threshold
-        if wall_near is None:
-            lidar_min = 1.0
-            for j in range(lidar_indices.shape[0]):
-                idx = int(lidar_indices[j])
-                lidar_val = float(obs_batch[i, idx])
-                if lidar_val < lidar_min:
-                    lidar_min = lidar_val
-            wall_near = lidar_min < wall_near_threshold
-        if wall_near and next_speed < still_speed_threshold:
-            bonus -= wall_stick_penalty
+        # 前方LiDAR最小値
+        lidar_min = 1.0
+        for idx_ in front_lidar_indices:
+            lidar_val = float(next_obs_batch[i, idx_])
+            if lidar_val < lidar_min:
+                lidar_min = lidar_val
+        # infoからz速度を取得し、正のz速度なら壁ペナルティをスキップ
+        skip_wall_penalty = False
+        if agent_vz_batch[i] > 0.02:
+            skip_wall_penalty = True
 
-        # --- 壁回避ペナルティ（hider/seeker共通, next_obsのwall_distance_batchに基づく） ---
-        wall_distance = wall_distance_batch[i]
-        # next_obsから座標取得（x:0, y:1, z:2想定）
-        x = float(next_obs_batch[i, 0])
-        y = float(next_obs_batch[i, 1])
-        z = float(next_obs_batch[i, 2])
-        wall_avoid_penalty_effective = wall_avoid_penalty
-        if z > 0.5 and (abs(x) < 5.0 and abs(y) < 5.0):
-            wall_avoid_penalty_effective = 0.0
-        if wall_distance < agent_radius + 0.2:
-            wall_near_val = agent_radius + 0.2
-            ratio = wall_distance / wall_near_val
-            if ratio < 0.0:
-                ratio = 0.0
-            elif ratio > 1.0:
-                ratio = 1.0
-            bonus -= wall_avoid_penalty_effective * (1.0 - ratio)
-        elif wall_distance < wall_safe:
-            bonus -= (
-                wall_avoid_penalty_effective
-                * (wall_safe - wall_distance)
-                / (wall_safe - (agent_radius + 0.2))
-                / 2.0
-            )
+        if not skip_wall_penalty:
+            # LiDAR値はセンサー先端までの距離なので、エージェント半径を引いて判定する
+            front_wall_near = ((lidar_min - agent_radius) < wall_near_threshold)
+            if front_wall_near and next_speed < still_speed_threshold:
+                bonus -= wall_stick_penalty
+
+            # --- 壁回避ペナルティ（hider/seeker共通, next_obsのwall_distance_batchに基づく） ---
+            wall_distance = wall_distance_batch[i]
+            if wall_distance - agent_radius < wall_near_margin:
+                ratio = wall_distance / wall_near_margin
+                if ratio < 0.0:
+                    ratio = 0.0
+                elif ratio > 1.0:
+                    ratio = 1.0
+                bonus -= wall_avoid_penalty * (1.0 - ratio)
+            elif wall_distance < wall_safe:
+                bonus -= (
+                    wall_avoid_penalty
+                    * (wall_safe - wall_distance)
+                    / (wall_safe - (agent_radius + wall_near_margin))
+                    / 2.0
+                )
 
         # --- hider固有ペナルティ ---
         if target_is_hider:
@@ -638,39 +659,44 @@ def _compute_custom_reward_batch_numba(
 
 
 def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info, reward_idx_cache=None):
-    """
-    カスタム報酬関数（単一ステップ）。
-    obs: step前の観測（1次元np.array）
-    next_obs: step後の観測（1次元np.array）
-    action: 行動（1次元np.array）
-    base_reward: 環境からの基本報酬
-    idx: env.idx
-    target: "hider" or "seeker"
-    info: info dict
-    reward_idx_cache: インデックスキャッシュ（省略可）
-    """
-    # --- 1サンプル分のバッチに変換しNumba版を呼び出す ---
-    import numpy as np
-    cache = (
-        reward_idx_cache
-        if reward_idx_cache is not None
-        else _build_reward_index_cache(idx)
-    )
-    # obs, action, base_reward: 1次元→2次元(1,dim) & float32
-    obs_batch = np.asarray(obs, dtype=np.float32).reshape(1, -1)
-    next_obs_batch = np.asarray(next_obs, dtype=np.float32).reshape(1, -1)
-    action_batch = np.asarray(action, dtype=np.float32).reshape(1, -1)
-    base_reward_batch = np.asarray([base_reward], dtype=np.float32)
-    # target_is_hider: bool
-    target_is_hider = (target == "hider")
-    # 各インデックス: int32 or int32配列
-    self_vel_x_idx = int(cache["self_vel_x"])
-    self_vel_y_idx = int(cache["self_vel_y"])
-    lidar_indices = np.asarray(cache["lidar"], dtype=np.int32)
-    enemy_visible_indices = np.asarray(cache["enemy_visible"], dtype=np.int32)
-    enemy_rel_x_indices = np.asarray(cache["enemy_rel_x"], dtype=np.int32)
-    enemy_rel_y_indices = np.asarray(cache["enemy_rel_y"], dtype=np.int32)
-    # wall_distance: shape(1,) float32 (infoから取得、なければnan)
+    # obs, next_obs, action, base_reward はバッチまたは単一観測で渡される可能性がある。
+    # NumPy配列に変換し、単一観測なら先頭にバッチ次元を追加して常にバッチ形状にする。
+    obs_arr = np.asarray(obs, dtype=np.float32)
+    if obs_arr.ndim == 1:
+        obs_batch = obs_arr.reshape(1, -1)
+    else:
+        obs_batch = obs_arr
+
+    next_obs_arr = np.asarray(next_obs, dtype=np.float32)
+    if next_obs_arr.ndim == 1:
+        next_obs_batch = next_obs_arr.reshape(1, -1)
+    else:
+        next_obs_batch = next_obs_arr
+
+    action_arr = np.asarray(action, dtype=np.float32)
+    if action_arr.ndim == 1:
+        action_batch = action_arr.reshape(1, -1)
+    else:
+        action_batch = action_arr
+
+    base_reward_arr = np.asarray(base_reward, dtype=np.float32)
+    if base_reward_arr.ndim == 0:
+        base_reward_batch = base_reward_arr.reshape(1)
+    elif base_reward_arr.ndim == 1:
+        base_reward_batch = base_reward_arr
+    else:
+        base_reward_batch = base_reward_arr
+    target_is_hider = target
+    # インデックスキャッシュ
+    cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
+    self_vel_x_idx = int(idx.SELF.VEL_X)
+    self_vel_y_idx = int(idx.SELF.VEL_Y)
+    enemy_visible_indices = cache["enemy_visible"]
+    enemy_rel_x_indices = cache["enemy_rel_x"]
+    enemy_rel_y_indices = cache["enemy_rel_y"]
+    enemy_quat_0_indices = cache["enemy_quat_0"]
+    enemy_quat_1_indices = cache["enemy_quat_1"]
+    # wall_distance_batchの生成（infoから取得、なければnan）
     if info is not None and "wall_distance" in info:
         wd = info["wall_distance"]
         if isinstance(wd, (list, tuple, np.ndarray)):
@@ -678,10 +704,21 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
         else:
             wall_distance_batch = np.asarray([float(wd)], dtype=np.float32)
     else:
-        wall_distance_batch = np.full((1,), np.nan, dtype=np.float32)
-    enemy_quat_0_indices = np.asarray(cache["enemy_quat_0"], dtype=np.int32)
-    enemy_quat_1_indices = np.asarray(cache["enemy_quat_1"], dtype=np.int32)
+        wall_distance_batch = np.full((obs_batch.shape[0],), np.nan, dtype=np.float32)
+    # front_lidar_indices
+    front_lidar_indices = np.array(idx.LIDAR_FRONT_IDX, dtype=np.int32)
+    # agent_vz_batchの生成（infoから取得、なければ0.0）
+    if info is not None and "agent_vz" in info:
+        vz = info["agent_vz"]
+        if isinstance(vz, (list, tuple, np.ndarray)):
+            agent_vz_batch = np.asarray(vz, dtype=np.float32)
+        else:
+            agent_vz_batch = np.full((obs_batch.shape[0],), float(vz), dtype=np.float32)
+    else:
+        agent_vz_batch = np.zeros((obs_batch.shape[0],), dtype=np.float32)
+    # debug prints removed
     # Numba版呼び出し
+    front_lidar_indices = np.array(idx.LIDAR_FRONT_IDX, dtype=np.int32)
     reward_arr = _compute_custom_reward_batch_numba(
         obs_batch,
         next_obs_batch,
@@ -690,7 +727,6 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
         target_is_hider,
         self_vel_x_idx,
         self_vel_y_idx,
-        lidar_indices,
         enemy_visible_indices,
         enemy_rel_x_indices,
         enemy_rel_y_indices,
@@ -710,12 +746,15 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
         float(RW_WALL_NEAR_THRESHOLD),
         float(RW_STILL_SPEED_THRESHOLD),
         float(RW_WALL_STICK_PENALTY),
-        float(0.4),  # AGENT_RADIUS
-        float(0.4 + 0.5),  # WALL_SAFE
+        float(AGENT_RADIUS),  # AGENT_RADIUS
+        float(WALL_SAFE),  # WALL_SAFE
+        float(WALL_NEAR_MARGIN),
         float(RW_HIDE_VISIBLE_NEAR_PENALTY),
         float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
         float(RW_HIDE_SEEKER_GAZE_SIN_REWARD),
         float(RW_SEEK_VISIBLE_BONUS),
+        front_lidar_indices,
+        agent_vz_batch
     )
     return float(reward_arr[0])
 
@@ -951,9 +990,7 @@ def evaluate_fixed_ramp_climb(mode, target, agent, device, episodes=3, max_steps
     episodes: 評価エピソード数
     max_steps: 1エピソードの最大ステップ数
     """
-    from collections import deque
     env = build_env(mode, target, ENV_CONFIG, render_mode=None)
-    idx = env.idx
     obs_dim = env.observation_space.shape[0]
     history = ObsHistory(1, SEQ_LEN, obs_dim, device)
     success_count = 0
@@ -1006,7 +1043,6 @@ def evaluate_fixed_ramp_climb(mode, target, agent, device, episodes=3, max_steps
 def run_ramp_check_viewer(mode, target, agent, device, episodes=1, max_steps=220):
     """ランプ登坂デバッグビューワ"""
     env = build_env(mode, target, ENV_CONFIG, render_mode="human")
-    idx = env.idx
     obs_dim = env.observation_space.shape[0]
     history = ObsHistory(1, SEQ_LEN, obs_dim, device)
     for ep in range(episodes):
@@ -1073,6 +1109,10 @@ def run_train(
     act_dim = env.action_space.shape[0]
     history = ObsHistory(1, SEQ_LEN, obs_dim, device)
 
+    # 前方LiDARインデックスと初期 agent_vz バッチ（単一環境用）
+    front_lidar_indices = np.array(idx.LIDAR_FRONT_IDX, dtype=np.int32)
+    agent_vz_batch = np.zeros((1,), dtype=np.float32)
+
     obs, _ = env.reset()
     history.prime_single(obs)
     if USE_VIEWER:
@@ -1090,370 +1130,7 @@ def run_train(
     train_start_time = time.time()
     print(f"Training updates: {num_updates}, model: {model_path}")
     interrupted = False
-    last_ramp_eval = None
-
-    # --- スケジューリング用パラメータ取得 ---
-    ent_coef_init = float(hp.get("ent_coef", 0.001))
-    ent_coef_final = float(hp.get("ent_coef_final", ent_coef_init * 0.5))
-    ent_coef_schedule = str(hp.get("ent_coef_schedule", "linear"))
-    lr_init = float(hp.get("learning_rate", 3e-4))
-    lr_final = float(hp.get("learning_rate_final", lr_init * 0.5))
-    lr_schedule = str(hp.get("learning_rate_schedule", "linear"))
-
-    try:
-        for update in range(1, num_updates + 1):
-            # --- ent_coef/learning_rateスケジューリング ---
-            frac = 1.0 - (update - 1) / max(num_updates - 1, 1)
-            if ent_coef_schedule == "linear":
-                hp["ent_coef"] = ent_coef_final + (ent_coef_init - ent_coef_final) * frac
-            if lr_schedule == "linear":
-                lr_now = lr_final + (lr_init - lr_final) * frac
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr_now
-
-            lock_evt_sum = 0
-            grab_evt_sum = 0
-            max_box_speed = 0.0
-            max_ramp_speed = 0.0
-            blocked_ramp_sum = 0
-            done_last = 0.0
-            rewards_sum = 0.0
-            hidden_steps = 0
-            learnable_seen_steps = 0
-            wall_stick_steps = 0
-            wall_stick_seen_steps = 0
-            entropy_sum = 0.0
-            entropy_count = 0
-            reward_compute_sec_sum = 0.0
-            env_step_sec_sum = 0.0
-
-            for t in range(hp["rollout_steps"]):
-                # _clear_wall_stick_state_cache()  # キャッシュクリア不要
-                seq = history.get()
-                rollout_obs[t] = seq
-
-                with torch.no_grad():
-                    action, logp, _, value = agent.get_action_and_value(seq)
-
-                action_np = action.cpu().numpy()
-                action_np = np.clip(action_np, env.action_space.low, env.action_space.high)
-                num_envs = action_np.shape[0]
-                step_t0 = time.perf_counter()
-                next_obs, base_r, term, trun, info = env.step(action_np)
-                if USE_VIEWER:
-                    env.render()
-                if next_obs.ndim == 1:
-                    next_obs = np.expand_dims(next_obs, axis=0)
-                env_step_sec_sum += time.perf_counter() - step_t0
-                done_np = np.atleast_1d(np.logical_or(term, trun).astype(np.float32))
-                done_last = done_np
-
-                reward_np = np.asarray(base_r, dtype=np.float32).copy()
-                reward_t0 = time.perf_counter()
-                if USE_CUSTOM_REWARD:
-                    # infoからwall_distanceを抽出
-                    if "wall_distance" in info:
-                        wd = info["wall_distance"]
-                        if isinstance(wd, (list, tuple, np.ndarray)):
-                            wall_distance_batch = np.asarray([float(wd[0])], dtype=np.float32)
-                        else:
-                            wall_distance_batch = np.asarray([float(wd)], dtype=np.float32)
-                    else:
-                        wall_distance_batch = np.full((num_envs,), np.nan, dtype=np.float32)
-                    enemy_quat_0_indices = reward_idx_cache["enemy_quat_0"]
-                    enemy_quat_1_indices = reward_idx_cache["enemy_quat_1"]
-                    reward_np = _compute_custom_reward_batch_numba(
-                        np.asarray(obs, dtype=np.float32).reshape(num_envs, -1),
-                        np.asarray(next_obs, dtype=np.float32).reshape(num_envs, -1),
-                        np.asarray(action_np, dtype=np.float32).reshape(num_envs, -1),
-                        np.asarray(reward_np, dtype=np.float32).reshape(num_envs),
-                        bool(ref_env.target == "hider"),
-                        int(reward_idx_cache["self_vel_x"]),
-                        int(reward_idx_cache["self_vel_y"]),
-                        reward_idx_cache["lidar"],
-                        reward_idx_cache["enemy_visible"],
-                        reward_idx_cache["enemy_rel_x"],
-                        reward_idx_cache["enemy_rel_y"],
-                        enemy_quat_0_indices,
-                        enemy_quat_1_indices,
-                        float(RW_MOVE_CTRL_COST),
-                        float(RW_MOVE_INCENTIVE),
-                        float(RW_IDLE_PENALTY),
-                        float(RW_WALL_AVOID_PENALTY),
-                        wall_distance_batch,
-                        float(IDLE_SPEED_THRESHOLD),
-                        float(MOVE_INCENTIVE_SPEED_THRESHOLD),
-                        float(MOVE_SAT_THRESHOLD),
-                        float(RW_MOVE_SAT_PENALTY),
-                        float(TURN_SAT_THRESHOLD),
-                        float(RW_TURN_SAT_PENALTY),
-                        float(RW_WALL_NEAR_THRESHOLD),
-                        float(RW_STILL_SPEED_THRESHOLD),
-                        float(RW_WALL_STICK_PENALTY),
-                        float(0.4),  # AGENT_RADIUS
-                        float(0.4 + 0.5),  # WALL_SAFE
-                        float(RW_HIDE_VISIBLE_NEAR_PENALTY),
-                        float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
-                        float(RW_HIDE_SEEKER_GAZE_SIN_REWARD),
-                        float(RW_SEEK_VISIBLE_BONUS),
-                    )
-                reward_compute_sec_sum += time.perf_counter() - reward_t0
-
-                global_step += num_envs
-                rollout_actions[t] = action
-                rollout_logp[t] = logp
-                rollout_rewards[t] = torch.as_tensor(reward_np, device=device)
-                rollout_dones[t] = torch.as_tensor(done_np, device=device)
-                rollout_values[t] = value.view(-1)
-
-                if t >= int(hp.get("warmup_steps", 0)):
-                    for i in range(num_envs):
-                        lock_evt_sum += int(_info_at(info, "lock_event", i, 0))
-                        grab_evt_sum += int(_info_at(info, "grab_event", i, 0))
-                        max_box_speed = max(
-                            max_box_speed,
-                            float(_info_at(info, "dbg_max_box_speed", i, 0.0)),
-                        )
-                        max_ramp_speed = max(
-                            max_ramp_speed,
-                            float(_info_at(info, "dbg_max_ramp_speed", i, 0.0)),
-                        )
-                        blocked_ramp_sum += int(
-                            _info_at(info, "dbg_blocked_ramp_count", i, 0)
-                        )
-                        if not bool(_info_at(info, "is_detected", i, False)):
-                            hidden_steps += 1
-                        seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, _info_at(info, "is_detected", i, False)))
-                        if seen_learnable:
-                            learnable_seen_steps += 1
-                        # speedは未計算なので従来通り内部計算
-                        is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache, agent_idx=i)
-                        if is_wall_stick:
-                            wall_stick_steps += 1
-                            if seen_learnable:
-                                wall_stick_seen_steps += 1
-
-                    rewards_sum += float(np.sum(reward_np))
-
-                history.update(next_obs)
-                for i in range(num_envs):
-                    if done_np[i] > 0.5:
-                        obs1d = np.asarray(next_obs[i]).flatten()
-                        if obs1d.size == history.obs_dim:
-                            # エピソード終了時に環境をリセット
-                            next_obs[i], _ = env.reset()
-                            history.reset_env(i, next_obs[i])
-                        else:
-                            print(f"[warn] next_obs[{i}] size {obs1d.size} != obs_dim {history.obs_dim}, skip reset")
-                obs = next_obs
-
-            with torch.no_grad():
-                next_value = agent.get_value(history.get()).view(num_envs)
-
-            advantages = torch.zeros((hp["rollout_steps"], num_envs), device=device)
-            lastgaelam = torch.zeros(num_envs, device=device)
-            done_last_t = torch.as_tensor(done_last, device=device)
-            for t in reversed(range(hp["rollout_steps"])):
-                if t == hp["rollout_steps"] - 1:
-                    next_nonterminal = 1.0 - done_last_t
-                    next_vals = next_value
-                else:
-                    next_nonterminal = 1.0 - rollout_dones[t + 1]
-                    next_vals = rollout_values[t + 1]
-                delta = (
-                    rollout_rewards[t]
-                    + hp["gamma"] * next_vals * next_nonterminal
-                    - rollout_values[t]
-                )
-                lastgaelam = (
-                    delta
-                    + hp["gamma"]
-                    * hp["gae_lambda"]
-                    * next_nonterminal
-                    * lastgaelam
-                )
-                advantages[t] = lastgaelam
-            returns = advantages + rollout_values
-
-            b_obs = rollout_obs.reshape(-1, SEQ_LEN, obs_dim)
-            b_actions = rollout_actions.reshape(-1, act_dim)
-            b_logp = rollout_logp.reshape(-1)
-            b_adv = advantages.reshape(-1)
-            b_ret = returns.reshape(-1)
-
-            batch_size = hp["rollout_steps"] * num_envs
-            inds = np.arange(batch_size)
-            for _ in range(hp["update_epochs"]):
-                np.random.shuffle(inds)
-                for start in range(0, batch_size, hp["minibatch_size"]):
-                    mb_idx = inds[start:start + hp["minibatch_size"]]
-                    _, new_logp, entropy, new_value = agent.get_action_and_value(
-                        b_obs[mb_idx],
-                        b_actions[mb_idx],
-                    )
-                    logratio = new_logp - b_logp[mb_idx]
-                    ratio = logratio.exp()
-
-                    mb_adv = b_adv[mb_idx]
-                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
-
-                    pg_loss1 = -mb_adv * ratio
-                    pg_loss2 = -mb_adv * torch.clamp(
-                        ratio,
-                        1.0 - hp["clip_coef"],
-                        1.0 + hp["clip_coef"],
-                    )
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                    v_loss = 0.5 * ((new_value.view(-1) - b_ret[mb_idx]) ** 2).mean()
-                    ent_loss = entropy.mean()
-                    loss = pg_loss + hp["vf_coef"] * v_loss - hp["ent_coef"] * ent_loss
-                    entropy_sum += float(ent_loss.detach().cpu().item())
-                    entropy_count += 1
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), hp["max_grad_norm"])
-                    optimizer.step()
-
-            elapsed = max(time.time() - train_start_time, 1e-6)
-            sps = int(global_step / elapsed)
-            hide_rate = hidden_steps / max(hp["rollout_steps"] * num_envs, 1)
-            learnable_seen_rate = learnable_seen_steps / max(hp["rollout_steps"] * num_envs, 1)
-            wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"] * num_envs, 1)
-            wall_stick_seen_ratio = wall_stick_seen_steps / max(wall_stick_steps, 1)
-            avg_reward = rewards_sum / (hp["rollout_steps"] * num_envs)
-            avg_blocked_ramp = blocked_ramp_sum / (hp["rollout_steps"] * num_envs)
-            avg_entropy = entropy_sum / max(entropy_count, 1)
-            reward_compute_ms_per_step = 1000.0 * reward_compute_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
-            env_step_ms_per_step = 1000.0 * env_step_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
-            reward_time_ratio = reward_compute_sec_sum / max(env_step_sec_sum, 1e-9)
-
-            ramp_eval = None
-            if (
-                RAMP_CHECK_ENABLED
-                and RAMP_CHECK_INTERVAL > 0
-                and update % RAMP_CHECK_INTERVAL == 0
-            ):
-                ramp_eval = evaluate_fixed_ramp_climb(
-                    MODE,
-                    training_target,
-                    agent,
-                    device,
-                    episodes=RAMP_CHECK_EPISODES,
-                    max_steps=RAMP_CHECK_STEPS,
-                )
-                last_ramp_eval = ramp_eval
-
-            if wandb_run is not None:
-                payload = {
-                    "global_step": global_step,
-                    "train/update": update,
-                    "train/sps": sps,
-                    "train/hide_rate": hide_rate,
-                    "train/avg_reward": avg_reward,
-                    "train/entropy": avg_entropy,
-                    "train/learnable_seen_rate": learnable_seen_rate,
-                    "train/wall_stick_ratio": wall_stick_ratio,
-                    "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
-                    "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,
-                    "perf/env_step_ms_per_step": env_step_ms_per_step,
-                    "perf/reward_to_env_time_ratio": reward_time_ratio,
-                    "env/lock_events": lock_evt_sum,
-                    "env/grab_events": grab_evt_sum,
-                    "env/max_box_speed": max_box_speed,
-                    "env/max_ramp_speed": max_ramp_speed,
-                    "env/avg_blocked_ramp": avg_blocked_ramp,
-                    "system/num_envs": num_envs,
-                }
-                if ramp_eval is not None:
-                    payload.update(
-                        {
-                            "eval/ramp_climb_success_rate": ramp_eval["success_rate"],
-                            "eval/ramp_peak_height_mean": ramp_eval["peak_height_mean"],
-                            "eval/ramp_peak_progress_mean": ramp_eval["peak_progress_mean"],
-                        }
-                    )
-                wandb_run.log(payload, step=global_step)
-
-            if update % hp["log_interval"] == 0:
-                print(f"Upd {update}/{num_updates} Step={global_step} SPS={sps} HideRate={hide_rate:.2f} WallStick={wall_stick_ratio:.2f} AvgR={avg_reward:.3f}")
-
-            if update % hp["save_interval"] == 0:
-                _atomic_save(model_path)
-
-    except KeyboardInterrupt:
-        interrupted = True
-        print("\nTraining interrupted. Saving checkpoint...")
-        raise
-    except WORKER_SHUTDOWN_ERRORS as exc:
-        interrupted = True
-        print(
-            f"\nVector worker terminated ({exc.__class__.__name__}). "
-            "Saving checkpoint and exiting cleanly..."
-        )
-    finally:
-        _atomic_save(model_path)
-        if interrupted:
-            print(f"Interrupted checkpoint saved: {model_path}")
-        else:
-            print(f"Saved model: {model_path}")
-
-
-# ============================================================================
-# 訓練関数（ベクター環境）
-# ============================================================================
-
-def run_train_vector(
-    envs,
-    ref_env,
-    agent,
-    optimizer,
-    model_path,
-    device,
-    hp,
-    training_target,
-    num_envs,
-    wandb_run=None,
-):
-    """ベクター環境での訓練"""
-    def _atomic_save(path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp_path = f"{path}.tmp"
-        torch.save(agent.state_dict(), tmp_path)
-        os.replace(tmp_path, path)
-
-    idx = ref_env.idx
-    reward_idx_cache = _build_reward_index_cache(idx)
-    obs_dim = ref_env.observation_space.shape[0]
-    act_dim = ref_env.action_space.shape[0]
-    history = ObsHistory(num_envs, SEQ_LEN, obs_dim, device)
-
-    obs, _ = envs.reset()
-    history.prime(obs)
-
-    rollout_obs = torch.zeros(
-        (hp["rollout_steps"], num_envs, SEQ_LEN, obs_dim),
-        device=device,
-    )
-    rollout_actions = torch.zeros(
-        (hp["rollout_steps"], num_envs, act_dim),
-        device=device,
-    )
-    rollout_logp = torch.zeros((hp["rollout_steps"], num_envs), device=device)
-    rollout_rewards = torch.zeros((hp["rollout_steps"], num_envs), device=device)
-    rollout_dones = torch.zeros((hp["rollout_steps"], num_envs), device=device)
-    rollout_values = torch.zeros((hp["rollout_steps"], num_envs), device=device)
-
-    num_updates = max(1, hp["total_timesteps"] // (hp["rollout_steps"] * num_envs))
-    global_step = 0
-    train_start_time = time.time()
-    print(
-        f"Vector training: envs={num_envs}, updates={num_updates}, "
-        f"model={model_path}"
-    )
-    interrupted = False
-    last_ramp_eval = None
+    # last_ramp_eval = None  # 未使用のため削除
 
     # --- スケジューリング用パラメータ取得 ---
     ent_coef_init = float(hp.get("ent_coef", 0.001))
@@ -1495,7 +1172,7 @@ def run_train_vector(
 
             info_buffer.clear()
             for t in range(hp["rollout_steps"]):
-                _clear_wall_stick_state_cache()  # 各ステップの先頭でキャッシュクリア
+                # _clear_wall_stick_state_cache()  # 各ステップの先頭でキャッシュクリア
                 seq = history.get()
                 rollout_obs[t] = seq
 
@@ -1503,7 +1180,7 @@ def run_train_vector(
                     action, logp, _, value = agent.get_action_and_value(seq)
                 action_np = action.cpu().numpy()
                 step_t0 = time.perf_counter()
-                next_obs, base_r, term, trun, info = envs.step(action_np)
+                next_obs, base_r, term, trun, info = env.step(action_np)
                 info_buffer.append(info)
                 env_step_sec_sum += time.perf_counter() - step_t0
                 done_np = np.logical_or(term, trun).astype(np.float32)
@@ -1537,12 +1214,11 @@ def run_train_vector(
                         bool(ref_env.target == "hider"),
                         int(reward_idx_cache["self_vel_x"]),
                         int(reward_idx_cache["self_vel_y"]),
-                        reward_idx_cache["lidar"],
-                        reward_idx_cache["enemy_visible"],
-                        reward_idx_cache["enemy_rel_x"],
-                        reward_idx_cache["enemy_rel_y"],
-                        reward_idx_cache["enemy_quat_0"],
-                        reward_idx_cache["enemy_quat_1"],
+                        np.array(reward_idx_cache["enemy_visible"], dtype=np.int32),
+                        np.array(reward_idx_cache["enemy_rel_x"], dtype=np.int32),
+                        np.array(reward_idx_cache["enemy_rel_y"], dtype=np.int32),
+                        np.array(reward_idx_cache["enemy_quat_0"], dtype=np.int32),
+                        np.array(reward_idx_cache["enemy_quat_1"], dtype=np.int32),
                         float(RW_MOVE_CTRL_COST),
                         float(RW_MOVE_INCENTIVE),
                         float(RW_IDLE_PENALTY),
@@ -1557,12 +1233,15 @@ def run_train_vector(
                         float(RW_WALL_NEAR_THRESHOLD),
                         float(RW_STILL_SPEED_THRESHOLD),
                         float(RW_WALL_STICK_PENALTY),
-                        float(0.4),  # AGENT_RADIUS
-                        float(0.4 + 0.5),  # WALL_SAFE
+                        float(AGENT_RADIUS),  # AGENT_RADIUS
+                        float(WALL_SAFE),  # WALL_SAFE
+                        float(WALL_NEAR_MARGIN),
                         float(RW_HIDE_VISIBLE_NEAR_PENALTY),
                         float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
                         float(RW_HIDE_SEEKER_GAZE_SIN_REWARD),
                         float(RW_SEEK_VISIBLE_BONUS),
+                        front_lidar_indices,
+                        agent_vz_batch
                     )
                 reward_compute_sec_sum += time.perf_counter() - reward_t0
 
@@ -1599,12 +1278,15 @@ def run_train_vector(
                     if seen_learnable:
                         learnable_seen_steps += 1
                     # wall_stick判定をNumba報酬計算済みのwall_distance_batchと速度から直接行う
-                    wall_near = (wall_distance_batch[i] < RW_WALL_NEAR_THRESHOLD)
+                    # エージェント半径を差し引いて壁近接判定を行う
+                    wall_near = ((wall_distance_batch[i] - AGENT_RADIUS) < RW_WALL_NEAR_THRESHOLD)
                     next_speed = math.sqrt(
                         float(next_obs[i, reward_idx_cache["self_vel_x"]])**2 +
                         float(next_obs[i, reward_idx_cache["self_vel_y"]])**2
                     )
                     is_wall_stick = wall_near and next_speed < RW_STILL_SPEED_THRESHOLD
+                    if update % hp["log_interval"] == 0 and i == 0:
+                        pass
                     if is_wall_stick:
                         wall_stick_steps += 1
                         if seen_learnable:
@@ -1726,7 +1408,425 @@ def run_train_vector(
                     episodes=RAMP_CHECK_EPISODES,
                     max_steps=RAMP_CHECK_STEPS,
                 )
-                last_ramp_eval = ramp_eval
+                # last_ramp_eval = ramp_eval  # 未使用のため削除
+
+            if wandb_run is not None:
+                payload = {
+                    "global_step": global_step,
+                    "train/update": update,
+                    "train/sps": sps,
+                    "train/hide_rate": hide_rate,
+                    "train/avg_reward": avg_reward,
+                    "train/entropy": avg_entropy,
+                    "train/learnable_seen_rate": learnable_seen_rate,
+                    "train/wall_stick_ratio": wall_stick_ratio,
+                    "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
+                    "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,
+                    "perf/env_step_ms_per_step": env_step_ms_per_step,
+                    "perf/reward_to_env_time_ratio": reward_time_ratio,
+                    "env/lock_events": lock_evt_sum,
+                    "env/grab_events": grab_evt_sum,
+                    "env/max_box_speed": max_box_speed,
+                    "env/max_ramp_speed": max_ramp_speed,
+                    "env/avg_blocked_ramp": avg_blocked_ramp,
+                    "system/num_envs": num_envs,
+                }
+                if ramp_eval is not None:
+                    payload.update(
+                        {
+                            "eval/ramp_climb_success_rate": ramp_eval["success_rate"],
+                            "eval/ramp_peak_height_mean": ramp_eval["peak_height_mean"],
+                            "eval/ramp_peak_progress_mean": ramp_eval["peak_progress_mean"],
+                        }
+                    )
+                wandb_run.log(payload, step=global_step)
+
+            if update % hp["log_interval"] == 0:
+                print(f"Upd {update}/{num_updates} Step={global_step} SPS={sps} HideRate={hide_rate:.2f} WallStick={wall_stick_ratio:.2f} AvgR={avg_reward:.3f}")
+
+            # wall_distance統計バッファ（ローカル変数で管理）
+            for info in info_buffer:
+                if isinstance(info, (list, tuple)):
+                    for i in range(num_envs):
+                        info_i = info[i] if len(info) > i else None
+                        if info_i and 'wall_distance' in info_i:
+                            wd = info_i['wall_distance']
+                            if isinstance(wd, (list, tuple, np.ndarray)):
+                                for v in wd:
+                                    wall_distance_buffer.append(float(v))
+                            else:
+                                wall_distance_buffer.append(float(wd))
+                elif isinstance(info, dict):
+                    if 'wall_distance' in info:
+                        wd = info['wall_distance']
+                        if isinstance(wd, (list, tuple, np.ndarray)):
+                            for v in wd:
+                                wall_distance_buffer.append(float(v))
+                        else:
+                            wall_distance_buffer.append(float(wd))
+
+            if update % hp["log_interval"] == 0 and wall_distance_buffer:
+                arr = np.array(wall_distance_buffer, dtype=np.float32)
+                print(f"[WallDist] step={global_step} mean={np.mean(arr):.3f} min={np.min(arr):.3f} max={np.max(arr):.3f}")
+                wall_distance_buffer.clear()
+
+            if update % hp["save_interval"] == 0:
+                _atomic_save(model_path)
+
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nTraining interrupted. Saving checkpoint...")
+        raise
+    except WORKER_SHUTDOWN_ERRORS as exc:
+        interrupted = True
+        print(
+            f"\nVector worker terminated ({exc.__class__.__name__}). "
+            "Saving checkpoint and exiting cleanly..."
+        )
+    finally:
+        _atomic_save(model_path)
+        if interrupted:
+            print(f"Interrupted checkpoint saved: {model_path}")
+        else:
+            print(f"Saved model: {model_path}")
+
+
+# ============================================================================
+# 訓練関数（ベクター環境）
+# ============================================================================
+
+def run_train_vector(
+    envs,
+    ref_env,
+    agent,
+    optimizer,
+    model_path,
+    device,
+    hp,
+    training_target,
+    num_envs,
+    wandb_run=None,
+):
+    """ベクター環境での訓練"""
+    def _atomic_save(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        torch.save(agent.state_dict(), tmp_path)
+        os.replace(tmp_path, path)
+
+    idx = ref_env.idx
+    reward_idx_cache = _build_reward_index_cache(idx)
+    obs_dim = ref_env.observation_space.shape[0]
+    act_dim = ref_env.action_space.shape[0]
+    history = ObsHistory(num_envs, SEQ_LEN, obs_dim, device)
+
+    # 前方LiDARインデックスと初期 agent_vz バッチ（NumPy配列）を用意
+    front_lidar_indices = np.array(idx.LIDAR_FRONT_IDX, dtype=np.int32)
+    agent_vz_batch = np.zeros((num_envs,), dtype=np.float32)
+
+    obs, _ = envs.reset()
+    history.prime(obs)
+
+    rollout_obs = torch.zeros(
+        (hp["rollout_steps"], num_envs, SEQ_LEN, obs_dim),
+        device=device,
+    )
+    rollout_actions = torch.zeros(
+        (hp["rollout_steps"], num_envs, act_dim),
+        device=device,
+    )
+    rollout_logp = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+    rollout_rewards = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+    rollout_dones = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+    rollout_values = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+
+    num_updates = max(1, hp["total_timesteps"] // (hp["rollout_steps"] * num_envs))
+    global_step = 0
+    train_start_time = time.time()
+    print(
+        f"Vector training: envs={num_envs}, updates={num_updates}, "
+        f"model={model_path}"
+    )
+    interrupted = False
+    # last_ramp_eval = None  # 未使用のため削除
+
+    # --- スケジューリング用パラメータ取得 ---
+    ent_coef_init = float(hp.get("ent_coef", 0.001))
+    ent_coef_final = float(hp.get("ent_coef_final", ent_coef_init * 0.5))
+    ent_coef_schedule = str(hp.get("ent_coef_schedule", "linear"))
+    lr_init = float(hp.get("learning_rate", 3e-4))
+    lr_final = float(hp.get("learning_rate_final", lr_init * 0.5))
+    lr_schedule = str(hp.get("learning_rate_schedule", "linear"))
+
+    try:
+        wall_distance_buffer = []
+        info_buffer = []
+        for update in range(1, num_updates + 1):
+            # --- ent_coef/learning_rateスケジューリング ---
+            frac = 1.0 - (update - 1) / max(num_updates - 1, 1)
+            if ent_coef_schedule == "linear":
+                hp["ent_coef"] = ent_coef_final + (ent_coef_init - ent_coef_final) * frac
+            if lr_schedule == "linear":
+                lr_now = lr_final + (lr_init - lr_final) * frac
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr_now
+
+            lock_evt_sum = 0
+            grab_evt_sum = 0
+            max_box_speed = 0.0
+            max_ramp_speed = 0.0
+            blocked_ramp_sum = 0
+            hidden_steps = 0
+            learnable_seen_steps = 0
+            wall_stick_steps = 0
+            wall_stick_seen_steps = 0
+            entropy_sum = 0.0
+            entropy_count = 0
+            reward_compute_sec_sum = 0.0
+            env_step_sec_sum = 0.0
+
+            done_last = np.zeros(num_envs, dtype=np.float32)
+            rewards_sum = 0.0
+
+            info_buffer.clear()
+            for t in range(hp["rollout_steps"]):
+                # _clear_wall_stick_state_cache()  # 各ステップの先頭でキャッシュクリア
+                seq = history.get()
+                rollout_obs[t] = seq
+
+                with torch.no_grad():
+                    action, logp, _, value = agent.get_action_and_value(seq)
+                action_np = action.cpu().numpy()
+                step_t0 = time.perf_counter()
+                next_obs, base_r, term, trun, info = envs.step(action_np)
+                info_buffer.append(info)
+                env_step_sec_sum += time.perf_counter() - step_t0
+                done_np = np.logical_or(term, trun).astype(np.float32)
+                done_last = done_np
+
+                reward_np = np.asarray(base_r, dtype=np.float32).copy()
+                reward_t0 = time.perf_counter()
+                if USE_CUSTOM_REWARD:
+                    # infoがリストの場合は各環境ごとにwall_distanceを抽出
+                    wall_distance_batch = np.full((action_np.shape[0],), np.nan, dtype=np.float32)
+                    if isinstance(info, (list, tuple)):
+                        for i in range(action_np.shape[0]):
+                            info_i = info[i] if len(info) > i else None
+                            if info_i is not None and "wall_distance" in info_i:
+                                wd = info_i["wall_distance"]
+                                if isinstance(wd, (list, tuple, np.ndarray)):
+                                    wall_distance_batch[i] = float(wd[0])
+                                else:
+                                    wall_distance_batch[i] = float(wd)
+                    elif isinstance(info, dict) and "wall_distance" in info:
+                        wd = info["wall_distance"]
+                        if isinstance(wd, (list, tuple, np.ndarray)):
+                            wall_distance_batch[0] = float(wd[0])
+                        else:
+                            wall_distance_batch[0] = float(wd)
+                    reward_np = _compute_custom_reward_batch_numba(
+                        np.asarray(obs, dtype=np.float32).reshape(action_np.shape[0], -1),
+                        np.asarray(next_obs, dtype=np.float32).reshape(action_np.shape[0], -1),
+                        np.asarray(action_np, dtype=np.float32).reshape(action_np.shape[0], -1),
+                        np.asarray(reward_np, dtype=np.float32).reshape(action_np.shape[0]),
+                        bool(ref_env.target == "hider"),
+                        int(reward_idx_cache["self_vel_x"]),
+                        int(reward_idx_cache["self_vel_y"]),
+                        np.array(reward_idx_cache["enemy_visible"], dtype=np.int32),
+                        np.array(reward_idx_cache["enemy_rel_x"], dtype=np.int32),
+                        np.array(reward_idx_cache["enemy_rel_y"], dtype=np.int32),
+                        np.array(reward_idx_cache["enemy_quat_0"], dtype=np.int32),
+                        np.array(reward_idx_cache["enemy_quat_1"], dtype=np.int32),
+                        float(RW_MOVE_CTRL_COST),
+                        float(RW_MOVE_INCENTIVE),
+                        float(RW_IDLE_PENALTY),
+                        float(RW_WALL_AVOID_PENALTY),
+                        wall_distance_batch,
+                        float(IDLE_SPEED_THRESHOLD),
+                        float(MOVE_INCENTIVE_SPEED_THRESHOLD),
+                        float(MOVE_SAT_THRESHOLD),
+                        float(RW_MOVE_SAT_PENALTY),
+                        float(TURN_SAT_THRESHOLD),
+                        float(RW_TURN_SAT_PENALTY),
+                        float(RW_WALL_NEAR_THRESHOLD),
+                        float(RW_STILL_SPEED_THRESHOLD),
+                        float(RW_WALL_STICK_PENALTY),
+                        float(AGENT_RADIUS),  # AGENT_RADIUS
+                        float(WALL_SAFE),  # WALL_SAFE
+                        float(WALL_NEAR_MARGIN),
+                        float(RW_HIDE_VISIBLE_NEAR_PENALTY),
+                        float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
+                        float(RW_HIDE_SEEKER_GAZE_SIN_REWARD),
+                        float(RW_SEEK_VISIBLE_BONUS),
+                        front_lidar_indices,
+                        agent_vz_batch
+                    )
+                reward_compute_sec_sum += time.perf_counter() - reward_t0
+
+                global_step += num_envs
+                rollout_actions[t] = action
+                rollout_logp[t] = logp
+                rollout_rewards[t] = torch.as_tensor(reward_np, device=device)
+                rollout_dones[t] = torch.as_tensor(done_np, device=device)
+                rollout_values[t] = value.view(-1)
+                # --- 詳細な統計情報の加算 ---
+                # infoの型チェックはループ外で一度だけ
+                info_is_list = isinstance(info, (list, tuple))
+                info_is_dict = isinstance(info, dict)
+                # infoはlist/tupleまたはdict
+                for i in range(num_envs):
+                    # info_iの取得
+                    if info_is_list:
+                        info_i = info[i] if len(info) > i else None
+                    elif info_is_dict:
+                        info_i = info
+                    else:
+                        info_i = None
+                    if info_i is None:
+                        continue
+                    lock_evt_sum += int(_info_at(info, "lock_event", i, 0))
+                    grab_evt_sum += int(_info_at(info, "grab_event", i, 0))
+                    max_box_speed = max(max_box_speed, float(_info_at(info, "dbg_max_box_speed", i, 0.0)))
+                    max_ramp_speed = max(max_ramp_speed, float(_info_at(info, "dbg_max_ramp_speed", i, 0.0)))
+                    blocked_ramp_sum += int(_info_at(info, "dbg_blocked_ramp_count", i, 0))
+                    is_detected = bool(_info_at(info, "is_detected", i, False))
+                    if not is_detected:
+                        hidden_steps += 1
+                    seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, is_detected))
+                    if seen_learnable:
+                        learnable_seen_steps += 1
+                    # wall_stick判定をNumba報酬計算済みのwall_distance_batchと速度から直接行う
+                    # エージェント半径を差し引いて壁近接判定を行う
+                    wall_near = ((wall_distance_batch[i] - AGENT_RADIUS) < RW_WALL_NEAR_THRESHOLD)
+                    next_speed = math.sqrt(
+                        float(next_obs[i, reward_idx_cache["self_vel_x"]])**2 +
+                        float(next_obs[i, reward_idx_cache["self_vel_y"]])**2
+                    )
+                    is_wall_stick = wall_near and next_speed < RW_STILL_SPEED_THRESHOLD
+                    if update % hp["log_interval"] == 0 and i == 0:
+                        pass
+                    if is_wall_stick:
+                        wall_stick_steps += 1
+                        if seen_learnable:
+                            wall_stick_seen_steps += 1
+                    rewards_sum += float(reward_np[i])
+
+                for i in range(num_envs):
+                    if done_np[i] > 0.5:
+                        obs1d = np.asarray(next_obs[i]).flatten()
+                        if obs1d.size == history.obs_dim:
+                            # 個別reset: サブ環境iだけresetし、その観測だけをnext_obs[i]に代入
+                            if hasattr(envs, 'reset_at'):
+                                next_obs_i, _ = envs.reset_at(i)
+                            else:
+                                # reset_maskで個別リセット
+                                mask = np.zeros(num_envs, dtype=bool)
+                                mask[i] = True
+                                next_obses, _ = envs.reset(options={"reset_mask": mask})
+                                next_obs_i = next_obses[i]
+                            next_obs[i] = next_obs_i
+                            history.reset_env(i, next_obs[i])
+                        else:
+                            print(f"[warn] next_obs[{i}] size {obs1d.size} != obs_dim {history.obs_dim}, skip reset")
+                obs = next_obs
+
+            with torch.no_grad():
+                next_value = agent.get_value(history.get()).view(num_envs)
+
+            advantages = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+            lastgaelam = torch.zeros(num_envs, device=device)
+            done_last_t = torch.as_tensor(done_last, device=device)
+            for t in reversed(range(hp["rollout_steps"])):
+                if t == hp["rollout_steps"] - 1:
+                    next_nonterminal = 1.0 - done_last_t
+                    next_vals = next_value
+                else:
+                    next_nonterminal = 1.0 - rollout_dones[t + 1]
+                    next_vals = rollout_values[t + 1]
+                delta = (
+                    rollout_rewards[t]
+                    + hp["gamma"] * next_vals * next_nonterminal
+                    - rollout_values[t]
+                )
+                lastgaelam = (
+                    delta
+                    + hp["gamma"]
+                    * hp["gae_lambda"]
+                    * next_nonterminal
+                    * lastgaelam
+                )
+                advantages[t] = lastgaelam
+            returns = advantages + rollout_values
+
+            b_obs = rollout_obs.reshape(-1, SEQ_LEN, obs_dim)
+            b_actions = rollout_actions.reshape(-1, act_dim)
+            b_logp = rollout_logp.reshape(-1)
+            b_adv = advantages.reshape(-1)
+            b_ret = returns.reshape(-1)
+
+            batch_size = hp["rollout_steps"] * num_envs
+            inds = np.arange(batch_size)
+            for _ in range(hp["update_epochs"]):
+                np.random.shuffle(inds)
+                for start in range(0, batch_size, hp["minibatch_size"]):
+                    mb_idx = inds[start:start + hp["minibatch_size"]]
+                    _, new_logp, entropy, new_value = agent.get_action_and_value(
+                        b_obs[mb_idx],
+                        b_actions[mb_idx],
+                    )
+                    logratio = new_logp - b_logp[mb_idx]
+                    ratio = logratio.exp()
+
+                    mb_adv = b_adv[mb_idx]
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+
+                    pg_loss1 = -mb_adv * ratio
+                    pg_loss2 = -mb_adv * torch.clamp(
+                        ratio,
+                        1.0 - hp["clip_coef"],
+                        1.0 + hp["clip_coef"],
+                    )
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    v_loss = 0.5 * ((new_value.view(-1) - b_ret[mb_idx]) ** 2).mean()
+                    ent_loss = entropy.mean()
+                    loss = pg_loss + hp["vf_coef"] * v_loss - hp["ent_coef"] * ent_loss
+                    entropy_sum += float(ent_loss.detach().cpu().item())
+                    entropy_count += 1
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), hp["max_grad_norm"])
+                    optimizer.step()
+
+            elapsed = max(time.time() - train_start_time, 1e-6)
+            sps = int(global_step / elapsed)
+            hide_rate = hidden_steps / max(hp["rollout_steps"] * num_envs, 1)
+            learnable_seen_rate = learnable_seen_steps / max(hp["rollout_steps"] * num_envs, 1)
+            wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"] * num_envs, 1)
+            wall_stick_seen_ratio = wall_stick_seen_steps / max(wall_stick_steps, 1)
+            avg_reward = rewards_sum / (hp["rollout_steps"] * num_envs)
+            avg_blocked_ramp = blocked_ramp_sum / (hp["rollout_steps"] * num_envs)
+            avg_entropy = entropy_sum / max(entropy_count, 1)
+            reward_compute_ms_per_step = 1000.0 * reward_compute_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
+            env_step_ms_per_step = 1000.0 * env_step_sec_sum / max(hp["rollout_steps"] * num_envs, 1)
+            reward_time_ratio = reward_compute_sec_sum / max(env_step_sec_sum, 1e-9)
+
+            ramp_eval = None
+            if (
+                RAMP_CHECK_ENABLED
+                and RAMP_CHECK_INTERVAL > 0
+                and update % RAMP_CHECK_INTERVAL == 0
+            ):
+                ramp_eval = evaluate_fixed_ramp_climb(
+                    MODE,
+                    training_target,
+                    agent,
+                    device,
+                    episodes=RAMP_CHECK_EPISODES,
+                    max_steps=RAMP_CHECK_STEPS,
+                )
+                # last_ramp_eval = ramp_eval  # 未使用のため削除
 
             if wandb_run is not None:
                 payload = {

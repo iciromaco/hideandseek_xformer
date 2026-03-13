@@ -1082,6 +1082,10 @@ class TeamCosEnv(gym.Env):
                learnable_agent_pos[1]
         )
         
+        # z方向速度をinfoに追加
+        jz = self.qpos_indices[self.learnable_agent_key]['z']
+        vz_idx = self.model.jnt_dofadr[jz]
+        agent_vz = float(self.data.qvel[vz_idx])
         obs = self._normalize_obs(self._get_obs(idx_to_obs))
         reward = float(rb if self.target == "hider" else -rb)
         done = self.current_step >= self.max_episode_steps
@@ -1107,6 +1111,7 @@ class TeamCosEnv(gym.Env):
             "dbg_seek_gaze_cos_front_dist_max": float(gaze_cos_front_dist_max),
             "dbg_learnable_hider_seen": bool(learnable_hider_seen),
             "wall_distance": wall_dist,
+            "agent_vz": agent_vz,
         }
         self._debug_collect_stats(reward, info)
         return obs, reward, False, done, info
