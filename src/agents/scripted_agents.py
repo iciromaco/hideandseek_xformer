@@ -3,10 +3,11 @@
 
 import numpy as np
 import math
+from src.core.constants import P_SCALE, L_SCALE, R_SCALE
 
 
 def _nearest_pushable(obs, idx):
-    p_scale = 12.0
+    p_scale = P_SCALE
     best = None
     for obj in list(idx.B) + list(idx.RAMP):
         rel_x = float(obs[obj.REL_X]) * p_scale
@@ -35,7 +36,7 @@ def _interaction_buttons(obs, idx, interact_cooldown, interact_focus_steps, supp
     _, rel_x, obj = best
     is_locked = float(obs[obj.IS_LOCKED]) > 0.5
     is_moving = float(obs[obj.IS_MOVING]) > 0.5
-    lidar_raw = obs[idx.LIDAR] * 15.0
+    lidar_raw = obs[idx.LIDAR] * L_SCALE
     front_min = float(np.min(lidar_raw[idx.LIDAR_FRONT_IDX]))
 
     if rel_x > 0.05:
@@ -79,7 +80,7 @@ class RuleBasedSeeker:
         self.interact_focus_steps = 0
 
     def get_action(self, obs, idx):
-        L_SCALE, P_SCALE, R_SCALE = 15.0, 12.0, 5.0
+        p_scale = P_SCALE
         lidar_raw = obs[idx.LIDAR] * L_SCALE
         cur_rot = obs[idx.SELF.ROT] * R_SCALE
         
@@ -115,7 +116,7 @@ class RuleBasedSeeker:
         else:
             if len(visible_enemies) > 0:
                 target = visible_enemies[0]
-                tx, ty = obs[target.REL_X] * P_SCALE, obs[target.REL_Y] * P_SCALE
+                tx, ty = obs[target.REL_X] * p_scale, obs[target.REL_Y] * p_scale
                 self.last_known_rel_pos_x, self.last_known_rel_pos_y = tx, ty
                 self.memory_timer = 180
                 target_angle = math.atan2(ty, tx)
@@ -157,7 +158,7 @@ class RuleBasedHider:
         self.interact_focus_steps = 0
 
     def get_action(self, obs, idx):
-        L_SCALE, P_SCALE, R_SCALE = 15.0, 12.0, 5.0
+        p_scale = P_SCALE
         lidar_raw = obs[idx.LIDAR] * L_SCALE
         cur_rot = obs[idx.SELF.ROT] * R_SCALE
         
@@ -192,7 +193,7 @@ class RuleBasedHider:
             self.escape_turn_dir = 1.0 if l_gap >= r_gap else -1.0
         else:
             if seeker_vis:
-                tx, ty = obs[idx.OTHERS[0].REL_X] * P_SCALE, obs[idx.OTHERS[0].REL_Y] * P_SCALE
+                tx, ty = obs[idx.OTHERS[0].REL_X] * p_scale, obs[idx.OTHERS[0].REL_Y] * p_scale
                 angle_to_seeker = math.atan2(ty, tx)
                 escape_base = (angle_to_seeker + np.pi + np.pi) % (2*np.pi) - np.pi
                 side_bias = 1.2 if l_gap > r_gap else -1.2
@@ -215,8 +216,8 @@ class RuleBasedHider:
 
         seeker_dist = float("inf")
         if len(idx.OTHERS) > 0:
-            sx = float(obs[idx.OTHERS[0].REL_X]) * P_SCALE
-            sy = float(obs[idx.OTHERS[0].REL_Y]) * P_SCALE
+            sx = float(obs[idx.OTHERS[0].REL_X]) * p_scale
+            sy = float(obs[idx.OTHERS[0].REL_Y]) * p_scale
             seeker_dist = math.hypot(sx, sy)
         escape_priority = seeker_vis and seeker_dist < 7.0
         lck, grb, self.interact_cooldown, self.interact_focus_steps = _interaction_buttons(

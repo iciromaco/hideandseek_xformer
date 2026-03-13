@@ -8,9 +8,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from src.core.constants import P_SCALE
 import gymnasium as gym
 from functools import partial
-from numba import njit, prange, float32, int32, boolean
+from numba import njit, prange
 
 try:
     import tomllib  # Python 3.11+
@@ -269,6 +270,13 @@ if not TRAIN_MODE:
 MODE = _cfg("mode", "refinement", str, RUNTIME_OVERRIDES)
 TRAINING_TARGET = _cfg("training_target", "seeker", str, RUNTIME_OVERRIDES)
 
+
+SEQ_LEN = _cfg("seq_len", "16", int, RUNTIME_OVERRIDES)
+HIDDEN_DIM = _cfg("hidden_dim", "256", int, RUNTIME_OVERRIDES)
+NUM_ENVS = _cfg("num_envs", "8", int, RUNTIME_OVERRIDES)
+
+
+# ENV_CONFIGはグローバル定数初期化後に定義し、依存関係を明確化
 ENV_CONFIG = {
     "n_seekers": _cfg("n_seekers", "1", int, RUNTIME_OVERRIDES),
     "n_hiders": _cfg("n_hiders", "2", int, RUNTIME_OVERRIDES),
@@ -279,13 +287,8 @@ ENV_CONFIG = {
     "policy_source_log": _cfg("policy_source_log", "0", _to_bool, RUNTIME_OVERRIDES),
     "policy_source_log_each_reset": _cfg("policy_source_log_each_reset", "0", _to_bool, RUNTIME_OVERRIDES),
     "debug_log_interval_steps": _cfg("debug_log_interval_steps", "200", int, RUNTIME_OVERRIDES),
-    "action_repeat": _cfg("action_repeat", "16", int, RUNTIME_OVERRIDES),
+    "action_repeat": _cfg("action_repeat", "10", int, RUNTIME_OVERRIDES),
 }
-
-SEQ_LEN = _cfg("seq_len", "16", int, RUNTIME_OVERRIDES)
-HIDDEN_DIM = _cfg("hidden_dim", "256", int, RUNTIME_OVERRIDES)
-NUM_ENVS = _cfg("num_envs", "8", int, RUNTIME_OVERRIDES)
-ACTION_REPEAT = _cfg("action_repeat", "10", int, RUNTIME_OVERRIDES)
 
 RAMP_CHECK_ENABLED = _cfg("ramp_check_enabled", "0", _to_bool, RUNTIME_OVERRIDES)
 RAMP_CHECK_INTERVAL = _cfg("ramp_check_interval", str(hp.get("save_interval", 50)), int, RUNTIME_OVERRIDES)
@@ -565,6 +568,13 @@ def _compute_custom_reward_batch_numba(
 
         # --- 壁回避ペナルティ（hider/seeker共通, next_obsのwall_distance_batchに基づく） ---
         wall_distance = wall_distance_batch[i]
+        # next_obsから座標取得（x:0, y:1, z:2想定）
+        x = float(next_obs_batch[i, 0])
+        y = float(next_obs_batch[i, 1])
+        z = float(next_obs_batch[i, 2])
+        wall_avoid_penalty_effective = wall_avoid_penalty
+        if z > 0.5 and (abs(x) < 5.0 and abs(y) < 5.0):
+            wall_avoid_penalty_effective = 0.0
         if wall_distance < agent_radius + 0.2:
             wall_near_val = agent_radius + 0.2
             ratio = wall_distance / wall_near_val
@@ -572,10 +582,10 @@ def _compute_custom_reward_batch_numba(
                 ratio = 0.0
             elif ratio > 1.0:
                 ratio = 1.0
-            bonus -= wall_avoid_penalty * (1.0 - ratio)
+            bonus -= wall_avoid_penalty_effective * (1.0 - ratio)
         elif wall_distance < wall_safe:
             bonus -= (
-                wall_avoid_penalty
+                wall_avoid_penalty_effective
                 * (wall_safe - wall_distance)
                 / (wall_safe - (agent_radius + 0.2))
                 / 2.0
@@ -585,11 +595,12 @@ def _compute_custom_reward_batch_numba(
         if target_is_hider:
             for j in range(enemy_visible_indices.shape[0]):
                 idx_vis = int(enemy_visible_indices[j])
-                if obs_batch[i, idx_vis] > 0.5: # 敵が見えている場合　ここはnext_obs_batchにしてはいけない（見えているかは行動前の状態に基づくべき）  
-                    idx_x = int(enemy_rel_x_indices[j]) 
+                if obs_batch[i, idx_vis] > 0.5:
+                    idx_x = int(enemy_rel_x_indices[j])
                     idx_y = int(enemy_rel_y_indices[j])
-                    dx = float(next_obs_batch[i, idx_x])
-                    dy = float(next_obs_batch[i, idx_y])
+                    # 正規化値→ワールド座標スケールに変換
+                    dx = float(next_obs_batch[i, idx_x]) * P_SCALE
+                    dy = float(next_obs_batch[i, idx_y]) * P_SCALE
                     dist = np.sqrt(dx * dx + dy * dy)
                     if dist < 2.0:
                         bonus -= rw_hide_visible_near_penalty * (2.0 - dist) / 2.0
@@ -598,19 +609,27 @@ def _compute_custom_reward_batch_numba(
                         idx_quat_1 = int(enemy_quat_1_indices[j])
                         cos_theta = float(next_obs_batch[i, idx_quat_0])
                         sin_theta = float(next_obs_batch[i, idx_quat_1])
-                        bonus -= rw_hide_seeker_gaze_cos_penalty * cos_theta
-                        # 横方向は常に報酬
-                        bonus += rw_hide_seeker_gaze_sin_reward * abs(sin_theta)
+                        seeker_local_x = float(next_obs_batch[i, idx_x])
+                        seeker_local_y = float(next_obs_batch[i, idx_y])
+                        dist2 = np.sqrt(seeker_local_x ** 2 + seeker_local_y ** 2) + 1e-6
+                        dir_to_hider_x = -seeker_local_x / dist2
+                        dir_to_hider_y = -seeker_local_y / dist2
+                        gaze_cos = cos_theta * dir_to_hider_x + sin_theta * dir_to_hider_y
+                        bonus -= rw_hide_seeker_gaze_cos_penalty * gaze_cos
+                        # 横方向はSeeker視線とHider方向ベクトルの外積（sin）
+                        gaze_sin = cos_theta * dir_to_hider_y - sin_theta * dir_to_hider_x
+                        bonus += rw_hide_seeker_gaze_sin_reward * abs(gaze_sin)
 
         # --- seeker固有ボーナス ---
         if not target_is_hider:
             for j in range(enemy_visible_indices.shape[0]):
                 idx_vis = int(enemy_visible_indices[j])
-                if obs_batch[i, idx_vis] > 0.5: # 敵が見えている場合　ここはnext_obs_batchにしてはいけない（見えているかは行動前の状態に基づくべき）  
+                if obs_batch[i, idx_vis] > 0.5:
                     idx_x = int(enemy_rel_x_indices[j])
                     idx_y = int(enemy_rel_y_indices[j])
-                    dx = float(next_obs_batch[i, idx_x])
-                    dy = float(next_obs_batch[i, idx_y])
+                    # 正規化値→ワールド座標スケールに変換
+                    dx = float(next_obs_batch[i, idx_x]) * P_SCALE
+                    dy = float(next_obs_batch[i, idx_y]) * P_SCALE
                     dist = np.sqrt(dx * dx + dy * dy)
                     bonus += rw_seek_visible_bonus / (dist + 1.0)
 
@@ -1109,7 +1128,7 @@ def run_train(
             env_step_sec_sum = 0.0
 
             for t in range(hp["rollout_steps"]):
-                _clear_wall_stick_state_cache()  # 各ステップの先頭でキャッシュクリア
+                # _clear_wall_stick_state_cache()  # キャッシュクリア不要
                 seq = history.get()
                 rollout_obs[t] = seq
 
@@ -1121,7 +1140,8 @@ def run_train(
                 num_envs = action_np.shape[0]
                 step_t0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = env.step(action_np)
-                env.render()
+                if USE_VIEWER:
+                    env.render()
                 if next_obs.ndim == 1:
                     next_obs = np.expand_dims(next_obs, axis=0)
                 env_step_sec_sum += time.perf_counter() - step_t0
@@ -1481,7 +1501,6 @@ def run_train_vector(
 
                 with torch.no_grad():
                     action, logp, _, value = agent.get_action_and_value(seq)
-
                 action_np = action.cpu().numpy()
                 step_t0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = envs.step(action_np)
@@ -1553,42 +1572,39 @@ def run_train_vector(
                 rollout_rewards[t] = torch.as_tensor(reward_np, device=device)
                 rollout_dones[t] = torch.as_tensor(done_np, device=device)
                 rollout_values[t] = value.view(-1)
-
-
                 # --- 詳細な統計情報の加算 ---
+                # infoの型チェックはループ外で一度だけ
+                info_is_list = isinstance(info, (list, tuple))
+                info_is_dict = isinstance(info, dict)
                 # infoはlist/tupleまたはdict
                 for i in range(num_envs):
                     # info_iの取得
-                    if isinstance(info, (list, tuple)):
+                    if info_is_list:
                         info_i = info[i] if len(info) > i else None
-                    elif isinstance(info, dict):
+                    elif info_is_dict:
                         info_i = info
                     else:
                         info_i = None
                     if info_i is None:
                         continue
-                    # lock/grabイベント
-                    def _scalar_from_info(val, idx, default=0):
-                        # valが配列/リストならidx番目、スカラーならそのまま
-                        if isinstance(val, (list, tuple, np.ndarray)):
-                            if len(val) > idx:
-                                return val[idx]
-                            else:
-                                return default
-                        return val
-
-                    lock_evt_sum += int(_scalar_from_info(info_i.get("lock_event", 0), i, 0))
-                    grab_evt_sum += int(_scalar_from_info(info_i.get("grab_event", 0), i, 0))
-                    max_box_speed = max(max_box_speed, float(_scalar_from_info(info_i.get("dbg_max_box_speed", 0.0), i, 0.0)))
-                    max_ramp_speed = max(max_ramp_speed, float(_scalar_from_info(info_i.get("dbg_max_ramp_speed", 0.0), i, 0.0)))
-                    blocked_ramp_sum += int(_scalar_from_info(info_i.get("dbg_blocked_ramp_count", 0), i, 0))
-                    is_detected = bool(_scalar_from_info(info_i.get("is_detected", False), i, False))
+                    lock_evt_sum += int(_info_at(info, "lock_event", i, 0))
+                    grab_evt_sum += int(_info_at(info, "grab_event", i, 0))
+                    max_box_speed = max(max_box_speed, float(_info_at(info, "dbg_max_box_speed", i, 0.0)))
+                    max_ramp_speed = max(max_ramp_speed, float(_info_at(info, "dbg_max_ramp_speed", i, 0.0)))
+                    blocked_ramp_sum += int(_info_at(info, "dbg_blocked_ramp_count", i, 0))
+                    is_detected = bool(_info_at(info, "is_detected", i, False))
                     if not is_detected:
                         hidden_steps += 1
-                    seen_learnable = bool(_scalar_from_info(info_i.get("dbg_learnable_hider_seen", is_detected), i, is_detected))
+                    seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, is_detected))
                     if seen_learnable:
                         learnable_seen_steps += 1
-                    is_wall_stick = _is_wall_stick_state(next_obs[i], idx, reward_idx_cache=reward_idx_cache, agent_idx=i)
+                    # wall_stick判定をNumba報酬計算済みのwall_distance_batchと速度から直接行う
+                    wall_near = (wall_distance_batch[i] < RW_WALL_NEAR_THRESHOLD)
+                    next_speed = math.sqrt(
+                        float(next_obs[i, reward_idx_cache["self_vel_x"]])**2 +
+                        float(next_obs[i, reward_idx_cache["self_vel_y"]])**2
+                    )
+                    is_wall_stick = wall_near and next_speed < RW_STILL_SPEED_THRESHOLD
                     if is_wall_stick:
                         wall_stick_steps += 1
                         if seen_learnable:

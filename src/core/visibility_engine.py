@@ -14,23 +14,32 @@ from numba import njit
 
 SDF_CELL_SIZE = 0.02 # 2cm セルサイズで静的SDFグリッドを構築
 
-@njit(cache=True)
+
 def _compute_wall_sdf_grid_jit(min_x, min_y, cell_size, n_x, n_y, walls_xpos, walls_size, max_dist):
+    # walls_xpos: (N,2), walls_size: (N,2)
     grid = np.empty((n_y, n_x), dtype=np.float32)
+    obstacles = np.concatenate([walls_xpos, walls_size], axis=1)  # (N,4)
+    debug_printed = False
     for iy in range(n_y):
         py = min_y + iy * cell_size
         for ix in range(n_x):
             px = min_x + ix * cell_size
-            d_min = max_dist
-            for j in range(len(walls_xpos)):
-                dx = abs(px - walls_xpos[j, 0]) - walls_size[j, 0]
-                dy = abs(py - walls_xpos[j, 1]) - walls_size[j, 1]
-                d_box = math.sqrt(max(dx, 0.0) ** 2 + max(dy, 0.0) ** 2) + min(max(dx, dy), 0.0)
-                if d_box < d_min:
-                    d_min = d_box
-            grid[iy, ix] = d_min
+            p = np.array([px, py])
+            d = np.abs(p - obstacles[:, :2]) - obstacles[:, 2:]
+            outside = np.any(d > 0, axis=1)
+            dist_out = np.linalg.norm(np.maximum(d, 0.0), axis=1)
+            dist_in = -np.min(np.abs(d), axis=1)
+            sdf_vals = np.where(outside, dist_out, dist_in)
+            d_min = np.min(sdf_vals)
+            grid[iy, ix] = d_min if d_min < max_dist else max_dist
+            # --- デバッグ出力: SDF値が-0.1以下となった最初のグリッド点 ---
+            if not debug_printed and d_min < -0.2:
+                wall_idx = np.argmin(sdf_vals)
+                wall_pos = obstacles[wall_idx, :2]
+                wall_size = obstacles[wall_idx, 2:]
+                print(f"[SDF DEBUG] mode=static_grid, grid=({ix},{iy}), world=({px:.3f},{py:.3f}), SDF={d_min:.4f}, wall_center=({wall_pos[0]:.3f},{wall_pos[1]:.3f}), wall_size=({wall_size[0]:.3f},{wall_size[1]:.3f})")
+                debug_printed = True
     return grid
-
 
 @njit(cache=True)
 def _sample_sdf_grid_bilinear(px, py, sdf_grid, min_x, min_y, cell_size, max_dist):
@@ -428,7 +437,7 @@ class VisibilityEngine:
 
         # ファイル名を壁配置・サイズ・cell_sizeで一意に決定
         wall_hash = hash((tuple(np.round(walls.flatten(), 4)), tuple(np.round(wall_sizes.flatten(), 4)), round(cell, 4)))
-        sdf_dir = os.path.join(os.path.dirname(__file__), "../../envs")
+        sdf_dir = os.path.join(os.path.dirname(__file__), "../envs")
         os.makedirs(sdf_dir, exist_ok=True)
         sdf_path = os.path.join(sdf_dir, f"sdfgrid_mode4_{wall_hash}.pkl")
 

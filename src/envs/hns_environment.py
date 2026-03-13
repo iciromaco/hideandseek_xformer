@@ -1,5 +1,6 @@
 # mathのimportを明示的に追加
 import math
+from src.core.constants import P_SCALE, L_SCALE, R_SCALE, V_SCALE
 # src/envs/hns_environment.py
 # hns_environment.py v4.5９
 
@@ -784,6 +785,16 @@ class TeamCosEnv(gym.Env):
                 owner = st["owner"]
                 opos = self.data.xpos[self.body_ids[owner]][XY_START:XY_STOP]
                 cur_xy = self.data.qpos[qadr:qadr+POSE_SIZE][XY_START:XY_STOP].copy()
+                # --- 距離・壁判定によるgrab解除 ---
+                grab_dist = float(np.linalg.norm(cur_xy - opos))
+                if (
+                    grab_dist > self.GRAB_BREAK_DIST or
+                    self._interaction_blocked_by_static_walls(opos, cur_xy)
+                ):
+                    st["mode"] = "free"
+                    st["owner"] = None
+                    self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP] *= 0.5
+                    continue
                 err_xy = opos - cur_xy
                 self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = err_xy  # 速度を直接目標方向に
                 self.data.qvel[vadr:vadr+VEL_SIZE][Z_VEL_IDX] = 0.0
@@ -883,8 +894,13 @@ class TeamCosEnv(gym.Env):
         lim = float(self.SAFE_HALF - radius - margin)
         if abs(px) > lim or abs(py) > lim:
             return False
+        # 内壁（maze_walls）との重なりチェック
         for wx, wy, sx, sy in self.maze_walls:
             if abs(px - wx) <= (sx + radius + margin) and abs(py - wy) <= (sy + radius + margin):
+                return False
+        # static_wall_aabbs（外壁・内壁）との重なりチェック
+        for cx, cy, hx, hy in getattr(self, 'static_wall_aabbs', []):
+            if abs(px - cx) <= (hx + radius + margin) and abs(py - cy) <= (hy + radius + margin):
                 return False
         for pp, pr in placed:
             if np.linalg.norm(pos_xy - pp) < (radius + pr + margin):
@@ -1159,15 +1175,15 @@ class TeamCosEnv(gym.Env):
 
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
         rel = t_pos - pos; dist = math.sqrt(np.sum(rel**2)) + 1e-8
-        if dist > 15.0 or (math.cos(rot)*(rel[0]/dist) + math.sin(rot)*(rel[1]/dist)) < 0.38: return False
+        if dist > L_SCALE or (math.cos(rot)*(rel[0]/dist) + math.sin(rot)*(rel[1]/dist)) < 0.38: return False
         return self.vis_engine.is_visible(pos, t_pos, body_exclude=my_id, target_body_id=t_id)
 
     def _normalize_obs(self, o):
         v = o.copy(); idx = self.idx
-        v[idx.SELF.VEL_X] /= 10.0; v[idx.SELF.VEL_Y] /= 10.0; v[idx.SELF.ROT] /= 5.0; v[idx.LIDAR] /= 15.0
-        for b in idx.B: v[b.REL_X] /= 12.0; v[b.REL_Y] /= 12.0; v[b.VEL_X] /= 10.0; v[b.VEL_Y] /= 10.0
-        for r in idx.RAMP: v[r.REL_X] /= 12.0; v[r.REL_Y] /= 12.0; v[r.VEL_X] /= 10.0; v[r.VEL_Y] /= 10.0
-        for en in idx.OTHERS: v[en.REL_X] /= 12.0; v[en.REL_Y] /= 12.0; v[en.VEL_X] /= 10.0; v[en.VEL_Y] /= 10.0
+        v[idx.SELF.VEL_X] /= V_SCALE; v[idx.SELF.VEL_Y] /= V_SCALE; v[idx.SELF.ROT] /= R_SCALE; v[idx.LIDAR] /= L_SCALE
+        for b in idx.B: v[b.REL_X] /= P_SCALE; v[b.REL_Y] /= P_SCALE; v[b.VEL_X] /= V_SCALE; v[b.VEL_Y] /= V_SCALE
+        for r in idx.RAMP: v[r.REL_X] /= P_SCALE; v[r.REL_Y] /= P_SCALE; v[r.VEL_X] /= V_SCALE; v[r.VEL_Y] /= V_SCALE
+        for en in idx.OTHERS: v[en.REL_X] /= P_SCALE; v[en.REL_Y] /= P_SCALE; v[en.VEL_X] /= V_SCALE; v[en.VEL_Y] /= V_SCALE
         return v
 
     def _get_obs(self, idx):
@@ -1250,7 +1266,7 @@ class TeamCosEnv(gym.Env):
                 o[en_idx.QUAT_0] = math.cos(rel_agent_rot)
                 o[en_idx.QUAT_1] = math.sin(rel_agent_rot)
             else:
-                o[en_idx.REL_X], o[en_idx.REL_Y] = 15.0, 15.0
+                o[en_idx.REL_X], o[en_idx.REL_Y] = L_SCALE, L_SCALE
                 o[en_idx.VISIBLE] = 0.0
                 o[en_idx.QUAT_0] = 0.0
                 o[en_idx.QUAT_1] = 0.0
