@@ -1,0 +1,2 @@
+corr(model_out0, team_rb) = 0.3264
+corr(model_out0, reward) = -0.3264

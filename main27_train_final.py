@@ -568,6 +568,7 @@ def _compute_custom_reward_batch_numba(
     rw_hide_seeker_gaze_cos_penalty,
     rw_hide_seeker_gaze_sin_reward,
     rw_seek_visible_bonus,
+    p_scale,
     front_lidar_indices,
     agent_vz_batch
 ):
@@ -635,47 +636,68 @@ def _compute_custom_reward_batch_numba(
         # --- hider固有ペナルティ ---
         if target_is_hider:
             for j in range(enemy_visible_indices.shape[0]):
-                idx_vis = int(enemy_visible_indices[j])
-                if obs_batch[i, idx_vis] > 0.5:
-                    idx_x = int(enemy_rel_x_indices[j])
-                    idx_y = int(enemy_rel_y_indices[j])
-                    # 正規化値→ワールド座標スケールに変換
-                    dx = float(next_obs_batch[i, idx_x]) * P_SCALE
-                    dy = float(next_obs_batch[i, idx_y]) * P_SCALE
-                    dist = np.sqrt(dx * dx + dy * dy)
-                    if dist < 2.0:
-                        bonus -= rw_hide_visible_near_penalty * (2.0 - dist) / 2.0
-                    if dist > 0.1:
-                        idx_quat_0 = int(enemy_quat_0_indices[j])
-                        idx_quat_1 = int(enemy_quat_1_indices[j])
-                        cos_theta = float(next_obs_batch[i, idx_quat_0])
-                        sin_theta = float(next_obs_batch[i, idx_quat_1])
-                        seeker_local_x = float(next_obs_batch[i, idx_x])
-                        seeker_local_y = float(next_obs_batch[i, idx_y])
-                        dist2 = np.sqrt(seeker_local_x ** 2 + seeker_local_y ** 2) + 1e-6
-                        dir_to_hider_x = -seeker_local_x / dist2
-                        dir_to_hider_y = -seeker_local_y / dist2
-                        gaze_cos = cos_theta * dir_to_hider_x + sin_theta * dir_to_hider_y
-                        bonus -= rw_hide_seeker_gaze_cos_penalty * gaze_cos
-                        # 横方向はSeeker視線とHider方向ベクトルの外積（sin）
-                        gaze_sin = cos_theta * dir_to_hider_y - sin_theta * dir_to_hider_x
-                        bonus += rw_hide_seeker_gaze_sin_reward * abs(gaze_sin)
+                vis, dx, dy, dist, amount, idx_x, idx_y, idx_vis = _enemy_proximity_numba(
+                    obs_batch[i], next_obs_batch[i], enemy_visible_indices, enemy_rel_x_indices, enemy_rel_y_indices, j, p_scale
+                )
+                if not vis:
+                    continue
+                if amount > 0.0:
+                    bonus -= rw_hide_visible_near_penalty * amount
+                if dist > 0.1:
+                    idx_quat_0 = int(enemy_quat_0_indices[j])
+                    idx_quat_1 = int(enemy_quat_1_indices[j])
+                    cos_theta = float(next_obs_batch[i, idx_quat_0])
+                    sin_theta = float(next_obs_batch[i, idx_quat_1])
+                    seeker_local_x = dx
+                    seeker_local_y = dy
+                    dist2 = np.sqrt(seeker_local_x ** 2 + seeker_local_y ** 2) + 1e-6
+                    dir_to_hider_x = -seeker_local_x / dist2
+                    dir_to_hider_y = -seeker_local_y / dist2
+                    gaze_cos = cos_theta * dir_to_hider_x + sin_theta * dir_to_hider_y
+                    bonus -= rw_hide_seeker_gaze_cos_penalty * gaze_cos
+                    # 横方向はSeeker視線とHider方向ベクトルの外積（sin）
+                    gaze_sin = cos_theta * dir_to_hider_y - sin_theta * dir_to_hider_x
+                    bonus += rw_hide_seeker_gaze_sin_reward * abs(gaze_sin)
 
         # --- seeker固有ボーナス ---
         if not target_is_hider:
             for j in range(enemy_visible_indices.shape[0]):
-                idx_vis = int(enemy_visible_indices[j])
-                if obs_batch[i, idx_vis] > 0.5:
-                    idx_x = int(enemy_rel_x_indices[j])
-                    idx_y = int(enemy_rel_y_indices[j])
-                    # 正規化値→ワールド座標スケールに変換
-                    dx = float(next_obs_batch[i, idx_x]) * P_SCALE
-                    dy = float(next_obs_batch[i, idx_y]) * P_SCALE
-                    dist = np.sqrt(dx * dx + dy * dy)
-                    bonus += rw_seek_visible_bonus / (dist + 1.0)
+                vis, dx, dy, dist, amount, idx_x, idx_y, idx_vis = _enemy_proximity_numba(
+                    obs_batch[i], next_obs_batch[i], enemy_visible_indices, enemy_rel_x_indices, enemy_rel_y_indices, j, p_scale
+                )
+                if not vis:
+                    continue
+                if amount > 0.0:
+                    bonus += rw_seek_visible_bonus * amount
+                rel_dist = np.sqrt(dx * dx + dy * dy) + 1e-6
+                frontness = dx / rel_dist
+                if frontness > 0.0:
+                    bonus += rw_seek_visible_bonus * frontness
+                lateral = abs(dy) / rel_dist
+                bonus -= rw_hide_seeker_gaze_sin_reward * lateral
 
         rewards[i] = float(base_reward_batch[i]) + bonus + control_cost
     return rewards
+
+
+@njit(cache=True)
+def _enemy_proximity_numba(obs_row, next_obs_row, enemy_visible_indices, enemy_rel_x_indices, enemy_rel_y_indices, j, p_scale):
+    """Numba-compatible helper: 可視な敵について相対位置・距離・正規化量を返す。
+    戻り値は (visible_flag, dx, dy, dist, amount, idx_x, idx_y, idx_vis) のタプル。
+    """
+    idx_vis = int(enemy_visible_indices[j])
+    if obs_row[idx_vis] <= 0.5:
+        return False, 0.0, 0.0, 0.0, 0.0, 0, 0, 0
+    idx_x = int(enemy_rel_x_indices[j])
+    idx_y = int(enemy_rel_y_indices[j])
+    dx = float(next_obs_row[idx_x])
+    dy = float(next_obs_row[idx_y])
+    dist = (dx * dx + dy * dy) ** 0.5 * p_scale
+    if dist < 2.0:
+        amount = (2.0 - dist) / 2.0
+    else:
+        amount = 0.0
+    return True, dx, dy, dist, amount, idx_x, idx_y, idx_vis
 
 
 def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info, reward_idx_cache=None):
@@ -716,6 +738,18 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
     enemy_rel_y_indices = cache["enemy_rel_y"]
     enemy_quat_0_indices = cache["enemy_quat_0"]
     enemy_quat_1_indices = cache["enemy_quat_1"]
+    # 共通処理: 可視な敵の相対位置から距離・正規化近接量を計算して返す
+    def _enemy_proximity(i, j):
+        idx_vis = int(enemy_visible_indices[j])
+        if obs_batch[i, idx_vis] <= 0.5:
+            return None
+        idx_x = int(enemy_rel_x_indices[j])
+        idx_y = int(enemy_rel_y_indices[j])
+        dx = float(next_obs_batch[i, idx_x])
+        dy = float(next_obs_batch[i, idx_y])
+        dist = np.sqrt(dx * dx + dy * dy) * P_SCALE
+        amount = (2.0 - dist) / 2.0 if dist < 2.0 else 0.0
+        return dx, dy, dist, amount, idx_x, idx_y, idx_vis
     # wall_distance_batchの生成（infoから取得、なければnan）
     if info is not None and "wall_distance" in info:
         wd = info["wall_distance"]
@@ -773,6 +807,7 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
         float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
         float(RW_HIDE_SEEKER_GAZE_SIN_REWARD),
         float(RW_SEEK_VISIBLE_BONUS),
+        float(P_SCALE),
         front_lidar_indices,
         agent_vz_batch
     )
@@ -1385,6 +1420,7 @@ def run_train_vector(
                         float(RW_HIDE_SEEKER_GAZE_COS_PENALTY),
                         float(RW_HIDE_SEEKER_GAZE_SIN_REWARD),
                         float(RW_SEEK_VISIBLE_BONUS),
+                        float(P_SCALE),
                         front_lidar_indices,
                         agent_vz_batch
                     )

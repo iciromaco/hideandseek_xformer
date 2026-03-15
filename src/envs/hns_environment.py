@@ -187,8 +187,8 @@ class TeamCosEnv(gym.Env):
         self.n_ramps = int(n_ramps)
         if self.n_seekers < 1 or self.n_hiders < 1:
             raise ValueError("n_seekers and n_hiders must be >= 1")
-        if self.n_ramps < 1:
-            raise ValueError("n_ramps must be >= 1")
+        if self.n_ramps < 0:
+            raise ValueError("n_ramps must be >= 0")
         self.mode, self.target, self.render_mode = mode, target, render_mode
         self.show_turn_lines = bool(show_turn_lines)
         self.mode4_sdf_cell_size = float(mode4_sdf_cell_size)
@@ -508,7 +508,10 @@ class TeamCosEnv(gym.Env):
 
     def _body_speed_xy(self, bid):
         vadr = self.model.jnt_dofadr[self.model.body_jntadr[bid]]
-        return math.sqrt(self.data.qvel[vadr] ** 2 + self.data.qvel[vadr + 1] ** 2)
+        qlen = self.data.qvel.shape[0]
+        vx = self.data.qvel[vadr] if vadr < qlen else 0.0
+        vy = self.data.qvel[vadr + 1] if (vadr + 1) < qlen else 0.0
+        return math.sqrt(vx ** 2 + vy ** 2)
 
     def _ramp_uphill_dir(self, rid):
         quat = self.data.xquat[rid]
