@@ -81,7 +81,7 @@ train_other_seeker_policy = "model_if_available"
 npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 100_000_000
-wandb_run_name = "wall_only_confirm_1M"
+wandb_run_name = "wall_only_confirm_100M"
 rw_move_sat_penalty = 0.0
 
 # runtime.train1: Viewer 表示ありの学習環境
@@ -97,6 +97,32 @@ total_timesteps = 100_000_000
 wandb_run_name = "train1"
 rw_move_sat_penalty = 0.0
 num_envs = 1
+
+# runtime.trainseeker: 学習向け設定 Seeker
+[runtime.trainseeker]
+train_mode = true
+use_viewer = true
+training_target = "seeker"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "wall_only_confirm_10M"
+rw_move_sat_penalty = 0.0
+
+# runtime.trainseeker_forRB: 学習向け設定 Seeker
+[runtime.trainseeker_forRB]
+train_mode = true
+use_viewer = false
+training_target = "seeker"
+train_other_hider_policy = "rule"
+train_other_seeker_policy = "rule"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 1_000_000
+wandb_run_name = "wall_only_confirm_1M"
+rw_move_sat_penalty = 0.0
 
 # base: PPOの基本ハイパーパラメータ（全ターゲット共通）
 [base]

@@ -1114,6 +1114,7 @@ class TeamCosEnv(gym.Env):
             "agent_vz": agent_vz,
         }
         self._debug_collect_stats(reward, info)
+        
         return obs, reward, False, done, info
 
     def _compute_team_reward(self):
@@ -1152,6 +1153,9 @@ class TeamCosEnv(gym.Env):
  
                 if self._is_vis(spos, srot, hpos, sid, hid):
                     seen = True
+                    # 学習対象がシーカーの場合、学習シーカーがこのハイダーを見ていればフラグを立てる
+                    if sk == self.learnable_agent_key:
+                        learnable_hider_seen = True
                     break
             if seen:
                 seen_count += 1
