@@ -930,7 +930,8 @@ class TeamCosEnv(gym.Env):
                     # ランプのみx, y出力とqpos値も出力
                     # if (bid, rad, z) in ramp_specs:
                     #    print(f"[reset] ramp placed: x={p[0]:.3f}, y={p[1]:.3f}, qpos={self.data.qpos[adr]:.3f},{self.data.qpos[adr+1]:.3f}")
-                    # break
+                    # 正常に配置できたら inner loop を抜け、次のオブジェクト配置に進む
+                    break
         for ak in self.agent_keys:
             for _ in range(500):
                 p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2); rot = np.random.uniform(-np.pi, np.pi)

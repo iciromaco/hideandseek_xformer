@@ -129,13 +129,27 @@ def _load_runtime_config(path, profile_override=None, available_profiles=None):
         profile_origin = (
             "cli(--profile)" if profile_override is not None else "toml(runtime.active_profile)"
         )
-        profile = _normalize_profile_name(profile_value, available_profiles)
+        profile_lower = _normalize_profile_name(profile_value, available_profiles)
         common = (
             runtime_cfg.get("common", {}) if isinstance(runtime_cfg, dict) else {}
         )
+        # runtime_cfg のキーは TOML の記述通りの大文字小文字を保持している可能性があるため、
+        # 小文字化した profile 名から実際のキー名を検索して一致させる。
+        profile_key = None
+        if isinstance(runtime_cfg, dict):
+            for k in runtime_cfg.keys():
+                if not isinstance(k, str):
+                    continue
+                if k.lower() == profile_lower:
+                    profile_key = k
+                    break
+        if profile_key is None:
+            profile_key = profile_lower
         profile_cfg = (
-            runtime_cfg.get(profile, {}) if isinstance(runtime_cfg, dict) else {}
+            runtime_cfg.get(profile_key, {}) if isinstance(runtime_cfg, dict) else {}
         )
+        # 戻り値としては実際に選ばれたプロファイルキー（大文字小文字を含む実際のキー）を返す。
+        profile = profile_key
         if not isinstance(common, dict):
             common = {}
         if not isinstance(profile_cfg, dict):
@@ -250,30 +264,36 @@ if RUNTIME_OVERRIDES:
     hp.update(RUNTIME_OVERRIDES)
 
 # フラグの初期化
-TRAIN_MODE = _cfg("train_mode", "0", _to_bool, RUNTIME_OVERRIDES)
-USE_VIEWER = _cfg("use_viewer", "1", _to_bool, RUNTIME_OVERRIDES)
-NPC_ONLY_DEBUG = _cfg("npc_only_debug", "1", _to_bool, RUNTIME_OVERRIDES)
-SHOW_TURN_LINES = _cfg("show_turn_lines", "0", _to_bool, RUNTIME_OVERRIDES)
-USE_CUSTOM_REWARD = _cfg("use_custom_reward", "1", _to_bool, RUNTIME_OVERRIDES)
-AUTO_TUNE_HPARAMS = _cfg("auto_tune_hparams", "1", _to_bool, RUNTIME_OVERRIDES)
-DEBUG_HIDER_POLICY = _cfg("debug_hider_policy", "rule", str, RUNTIME_OVERRIDES)
-DEBUG_SEEKER_POLICY = _cfg("debug_seeker_policy", "rule", str, RUNTIME_OVERRIDES)
-DEBUG_DETERMINISTIC_INFERENCE = _cfg("debug_deterministic_inference", "0", _to_bool, RUNTIME_OVERRIDES)
-DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("debug_symmetric_hider_policy", "0", _to_bool, RUNTIME_OVERRIDES)
-TRAIN_OTHER_HIDER_POLICY = _cfg("train_other_hider_policy", "rule", str, RUNTIME_OVERRIDES)
-TRAIN_OTHER_SEEKER_POLICY = _cfg("train_other_seeker_policy", "rule", str, RUNTIME_OVERRIDES)
+# プロファイルで指定した値（hp）をデフォルトにし、さらに CLI/ランタイムオーバーライドで上書きする。
+TRAIN_MODE = _cfg("train_mode", hp.get("train_mode", "0"), _to_bool, RUNTIME_OVERRIDES)
+USE_VIEWER = _cfg("use_viewer", hp.get("use_viewer", "1"), _to_bool, RUNTIME_OVERRIDES)
+NPC_ONLY_DEBUG = _cfg("npc_only_debug", hp.get("npc_only_debug", "1"), _to_bool, RUNTIME_OVERRIDES)
+SHOW_TURN_LINES = _cfg("show_turn_lines", hp.get("show_turn_lines", "0"), _to_bool, RUNTIME_OVERRIDES)
+USE_CUSTOM_REWARD = _cfg("use_custom_reward", hp.get("use_custom_reward", "1"), _to_bool, RUNTIME_OVERRIDES)
+AUTO_TUNE_HPARAMS = _cfg("auto_tune_hparams", hp.get("auto_tune_hparams", "1"), _to_bool, RUNTIME_OVERRIDES)
+DEBUG_HIDER_POLICY = _cfg("debug_hider_policy", hp.get("debug_hider_policy", "rule"), str, RUNTIME_OVERRIDES)
+DEBUG_SEEKER_POLICY = _cfg("debug_seeker_policy", hp.get("debug_seeker_policy", "rule"), str, RUNTIME_OVERRIDES)
+DEBUG_DETERMINISTIC_INFERENCE = _cfg("debug_deterministic_inference", hp.get("debug_deterministic_inference", "0"), _to_bool, RUNTIME_OVERRIDES)
+DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("debug_symmetric_hider_policy", hp.get("debug_symmetric_hider_policy", "0"), _to_bool, RUNTIME_OVERRIDES)
+TRAIN_OTHER_HIDER_POLICY = _cfg("train_other_hider_policy", hp.get("train_other_hider_policy", "rule"), str, RUNTIME_OVERRIDES)
+TRAIN_OTHER_SEEKER_POLICY = _cfg("train_other_seeker_policy", hp.get("train_other_seeker_policy", "rule"), str, RUNTIME_OVERRIDES)
 
+# 以前の挙動では推論モード (TRAIN_MODE=False) のとき必ずビューアを有効化していたが、
+# プロファイルで明示的に `use_viewer = false` とした場合でも上書きされてしまっていた。
+# ここでは「デバッグプロファイル（RUN_PROFILE == 'debug'）から来た推論実行」の場合に
+# 自動でビューアを有効化するのみとし、プロファイルで明示指定された `use_viewer` を尊重する。
 if not TRAIN_MODE:
-    USE_VIEWER = True
+    if RUN_PROFILE == "debug":
+        USE_VIEWER = True
     AUTO_TUNE_HPARAMS = False
 
-MODE = _cfg("mode", "refinement", str, RUNTIME_OVERRIDES)
-TRAINING_TARGET = _cfg("training_target", "seeker", str, RUNTIME_OVERRIDES)
+MODE = _cfg("mode", hp.get("mode", "refinement"), str, RUNTIME_OVERRIDES)
+TRAINING_TARGET = _cfg("training_target", hp.get("training_target", "seeker"), str, RUNTIME_OVERRIDES)
 
 
-SEQ_LEN = _cfg("seq_len", "16", int, RUNTIME_OVERRIDES)
-HIDDEN_DIM = _cfg("hidden_dim", "256", int, RUNTIME_OVERRIDES)
-NUM_ENVS = _cfg("num_envs", "8", int, RUNTIME_OVERRIDES)
+SEQ_LEN = _cfg("seq_len", hp.get("seq_len", "16"), int, RUNTIME_OVERRIDES)
+HIDDEN_DIM = _cfg("hidden_dim", hp.get("hidden_dim", "256"), int, RUNTIME_OVERRIDES)
+NUM_ENVS = _cfg("num_envs", hp.get("num_envs", "8"), int, RUNTIME_OVERRIDES)
 
 
 # ENV_CONFIGはグローバル定数初期化後に定義し、依存関係を明確化
@@ -1631,7 +1651,13 @@ def run_debug_or_playback(env, agent, device, model_loaded):
 
     log_interval = hp["log_interval"]
     wall_dist_interval = 1000
-    num_episodes = hp["play_episodes"]
+    # `play_episodes` はデバッグ/再生用プロファイルで定義される想定。
+    # 定義がないプロファイルから呼ばれた場合は安全なデフォルトを使う。
+    if "play_episodes" in hp:
+        num_episodes = int(hp["play_episodes"])
+    else:
+        num_episodes = int(hp.get("PLAY_EPISODES", 100))
+        print(f"Warning: 'play_episodes' not found in profile; defaulting to {num_episodes} episodes.")
     episode_rewards = []
     hide_rates = []
     wall_distance_buffer = []
