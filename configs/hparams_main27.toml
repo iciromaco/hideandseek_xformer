@@ -101,7 +101,7 @@ num_envs = 1
 # runtime.trainseeker: 学習向け設定 Seeker
 [runtime.trainseeker]
 train_mode = true
-use_viewer = true
+use_viewer = false
 training_target = "seeker"
 train_other_hider_policy = "model_if_available"
 train_other_seeker_policy = "model_if_available"

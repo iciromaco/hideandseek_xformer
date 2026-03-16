@@ -1183,57 +1183,75 @@ def _info_at(info, key, env_idx, default=0):
 # This helps catch any accidental external callers early.
 # ============================================================================
 
-<<<<<<< Updated upstream
 def run_train(*args, **kwargs):
     raise RuntimeError(
         "run_train() has been removed — wrap single env with SingleVecWrapper "
         "and call run_train_vector(envs, ...) instead."
     )
-=======
-def run_train(
-    env,
+
+# ============================================================================
+# 訓練関数（ベクター環境）
+# ============================================================================
+
+def run_train_vector(
+    envs,
     ref_env,
     agent,
     optimizer,
     model_path,
     device,
     hp,
-    runtime_target,
+    training_target,
     num_envs,
     wandb_run=None,
 ):
+    """ベクター環境での訓練"""
     def _atomic_save(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp_path = f"{path}.tmp"
         torch.save(agent.state_dict(), tmp_path)
         os.replace(tmp_path, path)
 
-    idx = env.idx
+    idx = ref_env.idx
     reward_idx_cache = _build_reward_index_cache(idx)
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-    history = ObsHistory(1, SEQ_LEN, obs_dim, device)
+    obs_dim = ref_env.observation_space.shape[0]
+    act_dim = ref_env.action_space.shape[0]
+    history = ObsHistory(num_envs, SEQ_LEN, obs_dim, device)
 
-    # 前方LiDARインデックスと初期 agent_vz バッチ（単一環境用）
+    # 前方LiDARインデックスと初期 agent_vz バッチ（NumPy配列）を用意
     front_lidar_indices = np.array(idx.LIDAR_FRONT_IDX, dtype=np.int32)
-    agent_vz_batch = np.zeros((1,), dtype=np.float32)
+    agent_vz_batch = np.zeros((num_envs,), dtype=np.float32)
 
-    obs, _ = env.reset()
-    history.prime_single(obs)
+    obs, _ = envs.reset()
+    history.prime(obs)
+    # ビューワが要求されている場合は初期フレームを描画してウィンドウを起動
     if USE_VIEWER:
-        env.render()
+        try:
+            if hasattr(envs, "render"):
+                envs.render()
+        except Exception:
+            pass
 
-    rollout_obs = torch.zeros((hp["rollout_steps"], SEQ_LEN, obs_dim), device=device)
-    rollout_actions = torch.zeros((hp["rollout_steps"], act_dim), device=device)
-    rollout_logp = torch.zeros(hp["rollout_steps"], device=device)
-    rollout_rewards = torch.zeros(hp["rollout_steps"], device=device)
-    rollout_dones = torch.zeros(hp["rollout_steps"], device=device)
-    rollout_values = torch.zeros(hp["rollout_steps"], device=device)
+    rollout_obs = torch.zeros(
+        (hp["rollout_steps"], num_envs, SEQ_LEN, obs_dim),
+        device=device,
+    )
+    rollout_actions = torch.zeros(
+        (hp["rollout_steps"], num_envs, act_dim),
+        device=device,
+    )
+    rollout_logp = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+    rollout_rewards = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+    rollout_dones = torch.zeros((hp["rollout_steps"], num_envs), device=device)
+    rollout_values = torch.zeros((hp["rollout_steps"], num_envs), device=device)
 
-    num_updates = max(1, hp["total_timesteps"] // hp["rollout_steps"])
+    num_updates = max(1, hp["total_timesteps"] // (hp["rollout_steps"] * num_envs))
     global_step = 0
     train_start_time = time.time()
-    print(f"Training updates: {num_updates}, model: {model_path}")
+    print(
+        f"Vector training: envs={num_envs}, updates={num_updates}, "
+        f"model={model_path}"
+    )
     interrupted = False
     # last_ramp_eval = None  # 未使用のため削除
 
@@ -1248,6 +1266,7 @@ def run_train(
     try:
         wall_distance_buffer = []
         info_buffer = []
+        viewer_started = False
         for update in range(1, num_updates + 1):
             # --- ent_coef/learning_rateスケジューリング ---
             frac = 1.0 - (update - 1) / max(num_updates - 1, 1)
@@ -1285,7 +1304,33 @@ def run_train(
                     action, logp, _, value = agent.get_action_and_value(seq)
                 action_np = action.cpu().numpy()
                 step_t0 = time.perf_counter()
-                next_obs, base_r, term, trun, info = env.step(action_np)
+                next_obs, base_r, term, trun, info = envs.step(action_np)
+                # Viewer 更新（可能なら）およびクローズ検出
+                if USE_VIEWER:
+                    try:
+                        if hasattr(envs, "render"):
+                            envs.render()
+                            time.sleep(0.025)
+                        # viewer 実行中か確認（SingleVecWrapper や env を透過的に扱う）
+                        v = getattr(envs, "viewer", None)
+                        if v is None and hasattr(envs, "_env"):
+                            v = getattr(envs._env, "viewer", None)
+                        running = False
+                        if v is not None:
+                            is_run = getattr(v, "is_running", None)
+                            if callable(is_run):
+                                running = bool(is_run())
+                            else:
+                                running = True
+                        if not running and viewer_started:
+                            print("Viewer closed by user — aborting training.")
+                            raise KeyboardInterrupt()
+                        if running:
+                            viewer_started = True
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception:
+                        pass
                 info_buffer.append(info)
                 env_step_sec_sum += time.perf_counter() - step_t0
                 done_np = np.logical_or(term, trun).astype(np.float32)
@@ -1594,8 +1639,6 @@ def run_train(
             print(f"Interrupted checkpoint saved: {model_path}")
         else:
             print(f"Saved model: {model_path}")
->>>>>>> Stashed changes
-
 
 # ============================================================================
 # 訓練関数（ベクター環境）
@@ -2405,13 +2448,8 @@ def run():
                     device,
                     hp,
                     runtime_target,
-<<<<<<< Updated upstream
                     num_envs=1,
                     wandb_run=wandb_run,
-=======
-                    num_envs,
-                    wandb_run,
->>>>>>> Stashed changes
                 )
         else:
             run_debug_or_playback(env, agent, device, model_loaded)
