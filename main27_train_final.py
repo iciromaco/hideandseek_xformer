@@ -8,6 +8,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import random
+import json
 from src.core.constants import P_SCALE
 import gymnasium as gym
 from functools import partial
@@ -273,7 +275,7 @@ USE_CUSTOM_REWARD = _cfg("use_custom_reward", hp.get("use_custom_reward", "1"), 
 AUTO_TUNE_HPARAMS = _cfg("auto_tune_hparams", hp.get("auto_tune_hparams", "1"), _to_bool, RUNTIME_OVERRIDES)
 DEBUG_HIDER_POLICY = _cfg("debug_hider_policy", hp.get("debug_hider_policy", "rule"), str, RUNTIME_OVERRIDES)
 DEBUG_SEEKER_POLICY = _cfg("debug_seeker_policy", hp.get("debug_seeker_policy", "rule"), str, RUNTIME_OVERRIDES)
-DEBUG_DETERMINISTIC_INFERENCE = _cfg("debug_deterministic_inference", hp.get("debug_deterministic_inference", "0"), _to_bool, RUNTIME_OVERRIDES)
+MODEL_POLICY_DETERMINISTIC = _cfg("model_policy_deterministic", hp.get("model_policy_deterministic", "0"), _to_bool, RUNTIME_OVERRIDES)
 DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("debug_symmetric_hider_policy", hp.get("debug_symmetric_hider_policy", "0"), _to_bool, RUNTIME_OVERRIDES)
 TRAIN_OTHER_HIDER_POLICY = _cfg("train_other_hider_policy", hp.get("train_other_hider_policy", "rule"), str, RUNTIME_OVERRIDES)
 TRAIN_OTHER_SEEKER_POLICY = _cfg("train_other_seeker_policy", hp.get("train_other_seeker_policy", "rule"), str, RUNTIME_OVERRIDES)
@@ -998,8 +1000,9 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
         seeker_mode = _normalize_policy_mode(DEBUG_SEEKER_POLICY)
 
     # Preserve explicit debug override; do not force deterministic behavior
-    # during training unless explicitly requested.
-    model_policy_deterministic = bool(DEBUG_DETERMINISTIC_INFERENCE)
+    # during training unless explicitly requested. Use the boolean flag
+    # Use the configured deterministic flag (MODEL_POLICY_DETERMINISTIC).
+    model_policy_deterministic = MODEL_POLICY_DETERMINISTIC
     det_sync_ok = _set_model_policy_deterministic(env, vec_envs, model_policy_deterministic)
 
     hider_keys = [k for k in ref_env.hider_keys if k != ref_env.learnable_agent_key]
@@ -1058,7 +1061,7 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
         "Policy wiring: "
         f"hider_mode={hider_mode}, "
         f"seeker_mode={seeker_mode}, "
-        f"model_policy_deterministic={model_policy_deterministic}, "
+        f"model_policy_deterministic={MODEL_POLICY_DETERMINISTIC}, "
         f"det_sync_ok={det_sync_ok}, "
         f"override_learnable_policy={override_enabled}"
     )
@@ -2278,6 +2281,14 @@ def run_debug_or_playback(env, agent, device, model_loaded):
 
     for episode in range(num_episodes):
         obs, _ = env.reset()
+        # If deterministic policy replay is requested via TOML (model_policy_deterministic),
+        # seed RNGs at episode start so
+        # sampled actions become reproducible.
+        if MODEL_POLICY_DETERMINISTIC:
+            seed = 123456789
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
         history.prime_single(obs)
         done = False
         ep_reward = 0.0
@@ -2285,6 +2296,9 @@ def run_debug_or_playback(env, agent, device, model_loaded):
         lock_events = 0
         wall_stick = 0.0
         wall_dist = []
+        # per-step debug logging (first N steps)
+        debug_log_n = int(hp.get("debug_log_interval_steps", 200))
+        step_logs = []
 
         viewer_started = False
         while not done:
@@ -2309,7 +2323,7 @@ def run_debug_or_playback(env, agent, device, model_loaded):
             elif model_loaded:
                 with torch.no_grad():
                     seq = history.get()
-                    if DEBUG_DETERMINISTIC_INFERENCE and hasattr(agent, "get_deterministic_action_and_value"):
+                    if MODEL_POLICY_DETERMINISTIC and hasattr(agent, "get_deterministic_action_and_value"):
                         out = agent.get_deterministic_action_and_value(seq)
                     else:
                         out = agent.get_action_and_value(seq)
@@ -2338,6 +2352,86 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                     wall_dist.append(float(wd))
             info_buffer.append(info)
 
+            # collect per-step debug info for the first debug_log_n steps
+            if step_count <= debug_log_n:
+                try:
+                    vx = float(next_obs[reward_idx_cache["self_vel_x"]])
+                    vy = float(next_obs[reward_idx_cache["self_vel_y"]])
+                except Exception:
+                    vx = 0.0
+                    vy = 0.0
+                speed = math.sqrt(vx * vx + vy * vy)
+                # wall_distance (prefer scalar)
+                wall_d = None
+                if info is not None and "wall_distance" in info:
+                    wd = info["wall_distance"]
+                    if isinstance(wd, (list, tuple, np.ndarray)):
+                        wall_d = float(wd[0])
+                    else:
+                        wall_d = float(wd)
+                # enemy visibility and nearest distance
+                enemy_visible = False
+                nearest_dist = None
+                ev_idxs = reward_idx_cache.get("enemy_visible", None)
+                rel_x_idxs = reward_idx_cache.get("enemy_rel_x", None)
+                rel_y_idxs = reward_idx_cache.get("enemy_rel_y", None)
+                if ev_idxs is not None and rel_x_idxs is not None and rel_y_idxs is not None:
+                    for j in range(len(ev_idxs)):
+                        try:
+                            idx_vis = int(ev_idxs[j])
+                            if float(next_obs[idx_vis]) > 0.5:
+                                enemy_visible = True
+                                dx = float(next_obs[int(rel_x_idxs[j])])
+                                dy = float(next_obs[int(rel_y_idxs[j])])
+                                d = math.sqrt(dx * dx + dy * dy) * P_SCALE
+                                if nearest_dist is None or d < nearest_dist:
+                                    nearest_dist = d
+                        except Exception:
+                            continue
+                # gaze value (if present in info)
+                gaze_v = None
+                if info is not None:
+                    gaze_v = info.get("dbg_seek_gaze_cos_front_max", None)
+
+                # also sample both deterministic and stochastic actions for comparison when model_loaded
+                sampled_a = None
+                det_a = None
+                if model_loaded:
+                    with torch.no_grad():
+                        seq = history.get()
+                        try:
+                            sa_out = agent.get_action_and_value(seq)
+                            sampled_a = sa_out[0].cpu().numpy().reshape(-1)
+                        except Exception:
+                            sampled_a = None
+                        if hasattr(agent, "get_deterministic_action_and_value"):
+                            try:
+                                da_out = agent.get_deterministic_action_and_value(seq)
+                                det_a = da_out[0].cpu().numpy().reshape(-1)
+                            except Exception:
+                                det_a = None
+
+                step_logs.append(
+                    {
+                        "step": step_count,
+                        "action": action.tolist() if hasattr(action, "tolist") else np.asarray(action).tolist(),
+                        "obs": obs.tolist() if (hasattr(obs, "tolist") or isinstance(obs, (list, tuple, np.ndarray))) else obs,
+                        "next_obs": next_obs.tolist() if (hasattr(next_obs, "tolist") or isinstance(next_obs, (list, tuple, np.ndarray))) else next_obs,
+                        "sampled_action": sampled_a.tolist() if isinstance(sampled_a, np.ndarray) else sampled_a,
+                        "det_action": det_a.tolist() if isinstance(det_a, np.ndarray) else det_a,
+                        "vx": vx,
+                        "vy": vy,
+                        "speed": speed,
+                        "wall_distance": wall_d,
+                        "enemy_visible": enemy_visible,
+                        "nearest_enemy_dist": nearest_dist,
+                        "gaze": gaze_v,
+                        "base_reward": float(base_r),
+                        "reward": float(reward),
+                        "custom_component": float(reward - base_r),
+                    }
+                )
+
             if USE_VIEWER:
                 try:
                     env.render()
@@ -2349,6 +2443,49 @@ def run_debug_or_playback(env, agent, device, model_loaded):
             done = bool(term or trun)
 
         episode_rewards.append(ep_reward)
+        # Print per-step debug summary if we collected logs
+        if step_logs:
+            try:
+                arr_forward = [s["action"][0] for s in step_logs if s.get("action")]
+                arr_speed = [s["speed"] for s in step_logs]
+                arr_custom = [s["custom_component"] for s in step_logs]
+                arr_det_forward = [s["det_action"][0] for s in step_logs if s.get("det_action")]
+                arr_samp_forward = [s["sampled_action"][0] for s in step_logs if s.get("sampled_action")]
+                vis_count = sum(1 for s in step_logs if s.get("enemy_visible"))
+                nearest_list = [s["nearest_enemy_dist"] for s in step_logs if s.get("nearest_enemy_dist") is not None]
+                import numpy as _np
+                forward_mean = float(_np.mean(arr_forward)) if arr_forward else 0.0
+                det_forward_mean = float(_np.mean(arr_det_forward)) if arr_det_forward else float('nan')
+                samp_forward_mean = float(_np.mean(arr_samp_forward)) if arr_samp_forward else float('nan')
+                speed_mean = float(_np.mean(arr_speed)) if arr_speed else 0.0
+                custom_mean = float(_np.mean(arr_custom)) if arr_custom else 0.0
+                nearest_mean = float(_np.mean(nearest_list)) if nearest_list else float("nan")
+                print(
+                    f"[DebugLog] ep={episode} logged_steps={len(step_logs)} forward_mean={forward_mean:.3f} "
+                    f"speed_mean={speed_mean:.3f} enemy_vis={vis_count}/{len(step_logs)} "
+                    f"nearest_mean={nearest_mean:.3f} custom_mean={custom_mean:.4f} "
+                    f"det_forward_mean={det_forward_mean:.3f} samp_forward_mean={samp_forward_mean:.3f}"
+                )
+                try:
+                    def _to_primitive(v):
+                        if isinstance(v, (np.generic,)):
+                            return v.item()
+                        if hasattr(v, "tolist"):
+                            try:
+                                return v.tolist()
+                            except Exception:
+                                pass
+                        return v
+
+                    fname = f"debug_step_logs_ep{episode}.jsonl"
+                    with open(fname, "w") as jf:
+                        for s in step_logs:
+                            safe = {k: _to_primitive(v) for k, v in (s.items() if isinstance(s, dict) else {})}
+                            jf.write(json.dumps(safe) + "\n")
+                except Exception:
+                    pass
+            except Exception:
+                pass
         hide_rates.append(float(info.get("hide_rate", 0.0)))
         lock_events_list.append(lock_events)
         wall_stick_list.append(wall_stick / max(step_count, 1))
@@ -2447,7 +2584,7 @@ def run():
         f"RUNTIME_TARGET={runtime_target}, "
         f"DEBUG_HIDER_POLICY={DEBUG_HIDER_POLICY}, "
         f"DEBUG_SEEKER_POLICY={DEBUG_SEEKER_POLICY}, "
-        f"DEBUG_DETERMINISTIC_INFERENCE={DEBUG_DETERMINISTIC_INFERENCE}, "
+        f"MODEL_POLICY_DETERMINISTIC={MODEL_POLICY_DETERMINISTIC}, "
         f"DEBUG_SYMMETRIC_HIDER_POLICY={DEBUG_SYMMETRIC_HIDER_POLICY}, "
         f"USE_CUSTOM_REWARD={USE_CUSTOM_REWARD}, "
         f"HPARAMS_CONFIG_PATH={HPARAMS_CONFIG_PATH}, "

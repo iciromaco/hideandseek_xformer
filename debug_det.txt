@@ -1,0 +1,3 @@
+failed to dlopen path '/Users/dan/Desktop/Semi/hideandseek_xformer/.venv/bin/python3': dlopen(/Users/dan/Desktop/Semi/hideandseek_xformer/.venv/bin/python3, 0x000A): Library not loaded: @executable_path/../lib/libpython3.11.dylib
+  Referenced from: <4C4C448C-5555-3144-A170-80FA37EB67C5> /Users/dan/.local/share/uv/python/cpython-3.11.14-macos-aarch64-none/bin/python3.11
+  Reason: tried: '/Users/dan/Desktop/Semi/hideandseek_xformer/.venv/lib/python3.11/site-packages/mujoco/MuJoCo_(mjpython).app/Contents/lib/libpython3.11.dylib' (no such file), '/Users/dan/Desktop/Semi/hideandseek_xformer/.venv/bin/../lib/libpython3.11.dylib' (no such file), '/usr/local/lib/libpython3.11.dylib' (no such file), '/usr/lib/libpython3.11.dylib' (no such file, not in dyld cache)

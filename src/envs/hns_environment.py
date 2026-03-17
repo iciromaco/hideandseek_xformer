@@ -304,6 +304,8 @@ class TeamCosEnv(gym.Env):
         self.model_policy_deterministic = bool(enabled)
         return True
 
+    
+
     def _ensure_policy_history(self, agent_key, seq_len):
         sl = int(seq_len)
         obs_dim = int(self.observation_space.shape[0])
@@ -1090,6 +1092,15 @@ class TeamCosEnv(gym.Env):
         jz = self.qpos_indices[self.learnable_agent_key]['z']
         vz_idx = self.model.jnt_dofadr[jz]
         agent_vz = float(self.data.qvel[vz_idx])
+        # xy 速度と直近コントロールも取得して info に含める
+        learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
+        vadr = self.model.jnt_dofadr[self.model.body_jntadr[learnable_agent_body_id]]
+        qlen = self.data.qvel.shape[0]
+        agent_vx = float(self.data.qvel[vadr]) if vadr < qlen else 0.0
+        agent_vy = float(self.data.qvel[vadr + 1]) if (vadr + 1) < qlen else 0.0
+        last_ctrl = self.last_debug_ctrl.get(self.learnable_agent_key, (0.0, 0.0))
+        last_ctrl_f = float(last_ctrl[0])
+        last_ctrl_t = float(last_ctrl[1])
         obs = self._normalize_obs(self._get_obs(idx_to_obs))
         reward = float(rb if self.target == "hider" else -rb)
         done = self.current_step >= self.max_episode_steps
@@ -1116,6 +1127,10 @@ class TeamCosEnv(gym.Env):
             "dbg_learnable_hider_seen": bool(learnable_hider_seen),
             "wall_distance": wall_dist,
             "agent_vz": agent_vz,
+            "agent_vx": agent_vx,
+            "agent_vy": agent_vy,
+            "dbg_last_ctrl_f": last_ctrl_f,
+            "dbg_last_ctrl_t": last_ctrl_t,
         }
         self._debug_collect_stats(reward, info)
         

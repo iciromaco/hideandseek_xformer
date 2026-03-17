@@ -65,11 +65,14 @@ rw_move_sat_penalty = 0.0
 train_mode = false
 debug_hider_policy = "model_if_available"
 debug_seeker_policy = "model_if_available"
-debug_deterministic_inference = false
+# model_policy_deterministic = true
 debug_symmetric_hider_policy = false
 npc_only_debug = false
-play_episodes = 100
+# play_episodes = 100
 auto_tune_hparams = false
+play_episodes = 1
+debug_log_interval_steps = 200
+model_policy_deterministic = true
 
 # runtime.train: 学習向け設定
 [runtime.train]
@@ -114,7 +117,7 @@ rw_move_sat_penalty = 0.0
 # runtime.trainseeker_forRB: 学習向け設定 Seeker
 [runtime.trainseeker_forRB]
 train_mode = true
-use_viewer = true
+use_viewer = false
 training_target = "seeker"
 train_other_hider_policy = "rule"
 train_other_seeker_policy = "rule"
