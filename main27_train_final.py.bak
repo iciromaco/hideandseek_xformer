@@ -328,7 +328,6 @@ WANDB_MODE = _cfg("wandb_mode", "online", str, RUNTIME_OVERRIDES)
 WANDB_RUN_NAME = _cfg("wandb_run_name", "", str, RUNTIME_OVERRIDES)
 WANDB_LOG_CODE = _cfg("wandb_log_code", "1", _to_bool, RUNTIME_OVERRIDES)
 WANDB_CODE_ROOT = _cfg("wandb_code_root", os.path.dirname(__file__), str, RUNTIME_OVERRIDES)
- 
 
 RESUME_TRAINING = _cfg("resume_training", "0", _to_bool, RUNTIME_OVERRIDES)
 RESET_MODEL_ON_TRAIN = _cfg("reset_model_on_train", "0", _to_bool, RUNTIME_OVERRIDES)
@@ -706,8 +705,8 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
         base_reward_batch = base_reward_arr
     else:
         base_reward_batch = base_reward_arr
-
     target_is_hider = target
+    # インデックスキャッシュ
     cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
     self_vel_x_idx = int(idx.SELF.VEL_X)
     self_vel_y_idx = int(idx.SELF.VEL_Y)
@@ -796,7 +795,7 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
 # ============================================================================
 
 def env_signature(config):
-    """環境設定のシグネチャ文字列を生成（名やログ用）"""
+    """環境設定のシグネチャ文字列を生成（wandb名やログ用）"""
     keys = [
         "n_seekers",
         "n_hiders",
@@ -1609,65 +1608,36 @@ def run_train_vector(
                 gaze_dist_sum = 0.0
                 gaze_dist_max = 0.0
                 for info in info_buffer:
-                    def get_info_i(info_obj, j):
-                        if isinstance(info_obj, (list, tuple)):
-                            return info_obj[j] if len(info_obj) > j else None
-                        if isinstance(info_obj, dict):
-                            return info_obj
-                        return None
-
-                    # support both list-of-dicts and dict-of-arrays
-                    for i in range(num_envs):
-                        info_i = get_info_i(info, i)
-                        if info_i is None:
-                            continue
-
-                        if isinstance(info, dict):
-                            # dict-of-arrays: use None default to detect missing
-                            raw_v = _info_at(info, "dbg_seek_gaze_cos_front_max", i, None)
-                            raw_d = _info_at(info, "dbg_seek_gaze_cos_front_dist_max", i, None)
-                            if raw_v is None and raw_d is None:
-                                continue
-                            val = float(raw_v) if raw_v is not None else 0.0
-                            val2 = float(raw_d) if raw_d is not None else 0.0
-                        else:
-                            # list-of-dicts: check key presence per-env
-                            if not (isinstance(info_i, dict) and ("dbg_seek_gaze_cos_front_max" in info_i or "dbg_seek_gaze_cos_front_dist_max" in info_i)):
-                                continue
-                            val = float(info_i.get("dbg_seek_gaze_cos_front_max", 0.0))
-                            val2 = float(info_i.get("dbg_seek_gaze_cos_front_dist_max", 0.0))
-
-                        # Count only non-zero measurements. Many envs produce
-                        # dict-of-arrays with zeros for "no measurement",
-                        # so treat strictly-zero entries as absent here to
-                        # avoid counting every (env,step) pair.
-                        if (val != 0.0) or (val2 != 0.0):
-                            gaze_sum += val
-                            gaze_dist_sum += val2
-                            gaze_max = max(gaze_max, val)
-                            gaze_dist_max = max(gaze_dist_max, val2)
-                            gaze_count += 1
-                # Always include gaze keys in payload; use 0.0 for means when no samples
+                    if isinstance(info, (list, tuple)):
+                        for i in range(num_envs):
+                            val = float(_info_at(info, "dbg_seek_gaze_cos_front_max", i, 0.0))
+                            val2 = float(_info_at(info, "dbg_seek_gaze_cos_front_dist_max", i, 0.0))
+                            if val != 0.0 or val2 != 0.0:
+                                gaze_sum += val
+                                gaze_dist_sum += val2
+                                gaze_max = max(gaze_max, val)
+                                gaze_dist_max = max(gaze_dist_max, val2)
+                                gaze_count += 1
+                    elif isinstance(info, dict):
+                        for i in range(num_envs):
+                            val = float(_info_at(info, "dbg_seek_gaze_cos_front_max", i, 0.0))
+                            val2 = float(_info_at(info, "dbg_seek_gaze_cos_front_dist_max", i, 0.0))
+                            if val != 0.0 or val2 != 0.0:
+                                gaze_sum += val
+                                gaze_dist_sum += val2
+                                gaze_max = max(gaze_max, val)
+                                gaze_dist_max = max(gaze_dist_max, val2)
+                                gaze_count += 1
                 if gaze_count > 0:
-                    gaze_mean = gaze_sum / float(gaze_count)
-                    gaze_dist_mean = gaze_dist_sum / float(gaze_count)
-                else:
-                    gaze_mean = 0.0
-                    gaze_dist_mean = 0.0
-                payload.update(
-                    {
-                        "env/dbg_seek_gaze_cos_front_max_mean": gaze_mean,
-                        "env/gaze_count": gaze_count,
-                        "env/dbg_seek_gaze_cos_front_max": gaze_max,
-                        "env/dbg_seek_gaze_cos_front_dist_max_mean": gaze_dist_mean,
-                        "env/dbg_seek_gaze_cos_front_dist_max": gaze_dist_max,
-                    }
-                )
-                # Debug: show gaze_count and which keys are being logged
-                try:
-                    print(f"[GazeDebug] Step={global_step} gaze_count={gaze_count} payload_keys={list(payload.keys())}")
-                except Exception:
-                    pass
+                    payload.update(
+                        {
+                            "env/dbg_seek_gaze_cos_front_max_mean": gaze_sum / float(gaze_count),
+                            "env/gaze_count": gaze_count,
+                            "env/dbg_seek_gaze_cos_front_max": gaze_max,
+                            "env/dbg_seek_gaze_cos_front_dist_max_mean": gaze_dist_sum / float(gaze_count),
+                            "env/dbg_seek_gaze_cos_front_dist_max": gaze_dist_max,
+                        }
+                    )
                 wandb_run.log(payload, step=global_step)
 
             if update % hp["log_interval"] == 0:
@@ -2140,57 +2110,34 @@ def run_train(
                 gaze_dist_sum = 0.0
                 gaze_dist_max = 0.0
                 for info in info_buffer:
-                    # unify handling: dict-of-arrays vs list-of-dicts
                     if isinstance(info, (list, tuple)):
                         for i in range(num_envs):
-                            info_i = info[i] if len(info) > i else None
-                            if info_i is None:
-                                continue
-                            if not (isinstance(info_i, dict) and ("dbg_seek_gaze_cos_front_max" in info_i or "dbg_seek_gaze_cos_front_dist_max" in info_i)):
-                                continue
-                            val = float(info_i.get("dbg_seek_gaze_cos_front_max", 0.0))
-                            val2 = float(info_i.get("dbg_seek_gaze_cos_front_dist_max", 0.0))
-                            if (val != 0.0) or (val2 != 0.0):
-                                gaze_sum += val
-                                gaze_dist_sum += val2
-                                gaze_max = max(gaze_max, val)
-                                gaze_dist_max = max(gaze_dist_max, val2)
-                                gaze_count += 1
+                            val = float(_info_at(info, "dbg_seek_gaze_cos_front_max", i, 0.0))
+                            val2 = float(_info_at(info, "dbg_seek_gaze_cos_front_dist_max", i, 0.0))
+                            gaze_sum += val
+                            gaze_dist_sum += val2
+                            gaze_max = max(gaze_max, val)
+                            gaze_dist_max = max(gaze_dist_max, val2)
+                            gaze_count += 1
                     elif isinstance(info, dict):
                         for i in range(num_envs):
-                            raw_v = _info_at(info, "dbg_seek_gaze_cos_front_max", i, None)
-                            raw_d = _info_at(info, "dbg_seek_gaze_cos_front_dist_max", i, None)
-                            if raw_v is None and raw_d is None:
-                                continue
-                            val = float(raw_v) if raw_v is not None else 0.0
-                            val2 = float(raw_d) if raw_d is not None else 0.0
-                            if (val != 0.0) or (val2 != 0.0):
-                                gaze_sum += val
-                                gaze_dist_sum += val2
-                                gaze_max = max(gaze_max, val)
-                                gaze_dist_max = max(gaze_dist_max, val2)
-                                gaze_count += 1
-                # Always include gaze keys in payload; use 0.0 for means when no samples
+                            val = float(_info_at(info, "dbg_seek_gaze_cos_front_max", i, 0.0))
+                            val2 = float(_info_at(info, "dbg_seek_gaze_cos_front_dist_max", i, 0.0))
+                            gaze_sum += val
+                            gaze_dist_sum += val2
+                            gaze_max = max(gaze_max, val)
+                            gaze_dist_max = max(gaze_dist_max, val2)
+                            gaze_count += 1
                 if gaze_count > 0:
-                    gaze_mean = gaze_sum / float(gaze_count)
-                    gaze_dist_mean = gaze_dist_sum / float(gaze_count)
-                else:
-                    gaze_mean = 0.0
-                    gaze_dist_mean = 0.0
-                payload.update(
-                    {
-                        "env/dbg_seek_gaze_cos_front_max_mean": gaze_mean,
-                        "env/gaze_count": gaze_count,
-                        "env/dbg_seek_gaze_cos_front_max": gaze_max,
-                        "env/dbg_seek_gaze_cos_front_dist_max_mean": gaze_dist_mean,
-                        "env/dbg_seek_gaze_cos_front_dist_max": gaze_dist_max,
-                    }
-                )
-                # Debug: show gaze_count and which keys are being logged
-                try:
-                    print(f"[GazeDebug] Step={global_step} gaze_count={gaze_count} payload_keys={list(payload.keys())}")
-                except Exception:
-                    pass
+                    payload.update(
+                        {
+                            "env/dbg_seek_gaze_cos_front_max_mean": gaze_sum / float(gaze_count),
+                            "env/gaze_count": gaze_count,
+                            "env/dbg_seek_gaze_cos_front_max": gaze_max,
+                            "env/dbg_seek_gaze_cos_front_dist_max_mean": gaze_dist_sum / float(gaze_count),
+                            "env/dbg_seek_gaze_cos_front_dist_max": gaze_dist_max,
+                        }
+                    )
                 wandb_run.log(payload, step=global_step)
 
             if update % hp["log_interval"] == 0:

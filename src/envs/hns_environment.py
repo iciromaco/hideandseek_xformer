@@ -1147,11 +1147,21 @@ class TeamCosEnv(gym.Env):
                 dist = math.sqrt(dx * dx + dy * dy)
                 min_seeker_dist = min(min_seeker_dist, dist)
 
-                #gaze_cos 計算
-                if hk == self.learnable_agent_key:     
-                    dist_with_margin = dist + 1e-8
-                    cos_align = (math.cos(srot) * (dx / dist_with_margin)) + (math.sin(srot) * (dy / dist_with_margin))
-                    frontness = max(float(cos_align), 0.0)
+                # gaze_cos 計算:
+                # - 学習対象がハイダーの場合 (learnable_agent_key が h... ),
+                #   そのハイダーに対する各シーカーの frontness を集計する。
+                # - 学習対象がシーカーの場合 (learnable_agent_key が s... ),
+                #   学習シーカーが各ハイダーを見ている度合いを集計する。
+                # 両方のケースをサポートし、どちらか該当する場合に frontness を反映する。
+                dist_with_margin = dist + 1e-8
+                cos_align = (math.cos(srot) * (dx / dist_with_margin)) + (math.sin(srot) * (dy / dist_with_margin))
+                frontness = max(float(cos_align), 0.0)
+                if hk == self.learnable_agent_key:
+                    # learnable がハイダー: シーカー側から見た frontness を計上
+                    gaze_cos_front_max = max(gaze_cos_front_max, frontness)
+                    gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, frontness / (dist + 0.2))
+                if sk == self.learnable_agent_key:
+                    # learnable がシーカー: 学習シーカーの視線（この seeker が見ている frontness）を計上
                     gaze_cos_front_max = max(gaze_cos_front_max, frontness)
                     gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, frontness / (dist + 0.2))
  
@@ -1167,10 +1177,12 @@ class TeamCosEnv(gym.Env):
             if hk == self.learnable_agent_key:
                 learnable_hider_seen = bool(seen)
 
-        # === ここから改善案 1a（報酬計算部分のみ変更）===
-        # 現在（削除）：team_reward = 1.0 if seen_count == 0 else -1.0
+        # === 報酬計算（現行実装の説明） ===
+        # 以前の単純実装（削除済み）は `team_reward = 1.0 if seen_count == 0 else -1.0` でしたが、
+        # 現在は以下のように可視数と最短シーカー距離に基づく base/dist_bonus を組み合わせた
+        # ロジックが採用されています（ゼロサム化はしているが、後段のカスタム報酬で非対称項が加わります）。
         
-        # 改善案 1a（新規）：
+        # 新しいロジック：
         if seen_count == 0:
             base = 1.0
             # 敵から遠いほど+ボーナス

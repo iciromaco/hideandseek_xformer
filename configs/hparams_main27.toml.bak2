@@ -24,23 +24,29 @@ debug_log_interval_steps = 200
 use_custom_reward = true
 # 前進飽和抑制（常時前進ボーナスは使わない）
 rw_move_sat_penalty = 0.02
-# 壁張り付き対策（hider）
-rw_hide_wall_stick_penalty = 0.1
-rw_hide_wall_near_threshold = 0.18
-rw_hide_still_speed_threshold = 0.05
-rw_hide_visible_front_penalty = 0.04
-rw_hide_visible_near_penalty = 0.015
-rw_hide_seeker_gaze_cos_penalty = 0.03
-rw_hide_seeker_gaze_cos_dist_penalty = 0.01
+ # 壁張り付き対策（全エージェント共通）
+rw_wall_stick_penalty = 0.15
+
+rw_wall_near_threshold = 0.18  # 壁近判定閾値（全エージェント共通）
+rw_still_speed_threshold = 0.05  # 静止判定速度閾値（全エージェント共通）
+rw_hide_visible_near_penalty = 0.025
+rw_hide_seeker_gaze_penalty = 0.03
+rw_seek_gaze_reward = 0.03
 rw_wall_avoid_penalty = 0.15
-ramp_check_enabled = true
+ramp_check_enabled = false
 ramp_check_viewer = false
-ramp_check_force_uphill = true
+ramp_check_force_uphill = false
 ramp_check_episodes = 3
 ramp_check_steps = 220
 # 実行基盤
 wandb_enabled = true
 num_envs = 10
+
+# 速度・移動関連閾値
+move_sat_threshold = 1.0
+turn_sat_threshold = 1.0
+idle_speed_threshold = 0.1
+move_incentive_speed_threshold = 0.3
 
 [runtime.optuna]
 train_mode = true
@@ -74,8 +80,48 @@ train_other_hider_policy = "model_if_available"
 train_other_seeker_policy = "model_if_available"
 npc_only_debug = false
 auto_tune_hparams = false
-total_timesteps = 10000000
-wandb_run_name = "wall_only_confirm_1M"
+total_timesteps = 100_000_000
+wandb_run_name = "wall_only_confirm_100M"
+rw_move_sat_penalty = 0.0
+
+# runtime.train1: Viewer 表示ありの学習環境
+[runtime.train1]
+train_mode = true
+use_viewer = true
+training_target = "hider"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 100_000_000
+wandb_run_name = "train1"
+rw_move_sat_penalty = 0.0
+num_envs = 1
+
+# runtime.trainseeker: 学習向け設定 Seeker
+[runtime.trainseeker]
+train_mode = true
+use_viewer = false
+training_target = "seeker"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "wall_only_confirm_10M"
+rw_move_sat_penalty = 0.0
+
+# runtime.trainseeker_forRB: 学習向け設定 Seeker
+[runtime.trainseeker_forRB]
+train_mode = true
+use_viewer = false
+training_target = "seeker"
+train_other_hider_policy = "rule"
+train_other_seeker_policy = "rule"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "wall_only_confirm_10M"
 rw_move_sat_penalty = 0.0
 
 # base: PPOの基本ハイパーパラメータ（全ターゲット共通）
@@ -187,3 +233,4 @@ total_timesteps_min = 700000
 hider_clip_coef_min = 0.20
 hider_ent_coef_min = 2.0e-3
 seeker_clip_coef_max = 0.19
+rw_wall_avoid_penalty = 0.24852274025182242
