@@ -1197,17 +1197,28 @@ class TeamCosEnv(gym.Env):
         # 現在は以下のように可視数と最短シーカー距離に基づく base/dist_bonus を組み合わせた
         # ロジックが採用されています（ゼロサム化はしているが、後段のカスタム報酬で非対称項が加わります）。
         
-        # 新しいロジック：
+        # 新しいロジック（修正）:
+        # ハイダーが1体でも見つかっていればハイダー側へ明確な負のペナルティを与える。
+        # 具体的には:
+        # - seen_count == 0 -> base = 1.0 (+ dist bonus)
+        # - seen_count >= 1 -> base = -1.0 (明確なペナルティ)
+        # これにより、学習対象（ハイダー）視点で「1体でも見られているときに中立(0)」
+        # となる挙動を避けられます（n_hiders==2 の場合に見られた1体で base==0 になっていた問題を解消）。
         if seen_count == 0:
             base = 1.0
             # 敵から遠いほど+ボーナス
             dist_ratio = min(min_seeker_dist / 12.0, 1.0)
             dist_bonus = 0.2 * dist_ratio
         else:
-            # k/n が見つかった場合、線形に減少
-            visibility_factor = seen_count / len(self.hider_keys)
-            base = 1.0 - 2.0 * visibility_factor
-            dist_bonus = 0.0
+            # seen_count が 1 のときも負の報酬を与えるが、段階的にする。
+            # 例: n_hiders=2 の場合 seen_count=1 -> base=-0.5, seen_count=2 -> base=-1.0
+            base = -float(seen_count) / float(len(self.hider_keys))
+            # シーカーが見つけたハイダーに近づくほどハイダー側の報酬をさらに下げる
+            # （これによりシーカー側は近づくインセンティブを得る）
+            # min_seeker_dist が小さいほどペナルティが大きくなる。遠ければほぼ0。
+            dist_far_ratio = min(min_seeker_dist / 12.0, 1.0)
+            seeker_proximity_penalty = 0.2 * (1.0 - dist_far_ratio)
+            dist_bonus = -seeker_proximity_penalty
         
         team_reward = base + dist_bonus
         

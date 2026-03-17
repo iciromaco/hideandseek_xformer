@@ -72,7 +72,6 @@ npc_only_debug = false
 auto_tune_hparams = false
 play_episodes = 1
 debug_log_interval_steps = 200
-model_policy_deterministic = true
 
 # runtime.train: 学習向け設定
 [runtime.train]
@@ -128,7 +127,7 @@ total_timesteps = 10_000_000
 wandb_run_name = "wall_only_confirm_10M"
 rw_move_sat_penalty = 0.0
 # 壁張り付き対策（全エージェント共通）
-rw_wall_stick_penalty = 0.5
+rw_wall_stick_penalty = 0.15
 rw_wall_near_threshold = 0.18  # 壁近判定閾値（全エージェント共通）
 rw_still_speed_threshold = 0.05  # 静止判定速度閾値（全エージェント共通）
 

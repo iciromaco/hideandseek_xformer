@@ -1,0 +1,49 @@
+Enemy visible comparison
+========================
+
+Visible=False:
+  Count: 144
+  action[0]: n=144, mean=-0.354528, sd=0.0406603
+  action[1]: n=144, mean=0.468569, sd=0.0372842
+  action[2]: n=144, mean=-0.189002, sd=0.0604806
+  action[3]: n=144, mean=-0.0981821, sd=0.125075
+  back: n=144, mean=0.406544, sd=0.323495
+  base_reward: n=144, mean=-0.47544, sd=0.533462
+  det_action[0]: n=144, mean=-0.354145, sd=0.0408446
+  det_action[1]: n=144, mean=0.468621, sd=0.0362679
+  det_action[2]: n=144, mean=-0.188785, sd=0.0603346
+  det_action[3]: n=144, mean=-0.0977212, sd=0.1249
+  front_min: n=144, mean=0.122209, sd=0.0474218
+  gaze: n=144, mean=0.209301, sd=0.331951
+  nearest_enemy_dist: n=0, mean=nan, sd=nan
+  reward: n=144, mean=-0.47902, sd=0.533731
+  sampled_action[0]: n=144, mean=-0.311155, sd=0.998365
+  sampled_action[1]: n=144, mean=0.469331, sd=0.996431
+  sampled_action[2]: n=144, mean=-0.155409, sd=1.02079
+  sampled_action[3]: n=144, mean=-0.0860185, sd=0.966842
+  speed: n=144, mean=0.0246851, sd=0.0746321
+  wall_distance: n=144, mean=0.774515, sd=0.294117
+
+Visible=True:
+  Count: 56
+  action[0]: n=56, mean=-0.311145, sd=0.0238341
+  action[1]: n=56, mean=0.402028, sd=0.0323937
+  action[2]: n=56, mean=-0.106258, sd=0.0149379
+  action[3]: n=56, mean=0.0720083, sd=0.0301878
+  back: n=56, mean=0.0299078, sd=0.00306491
+  base_reward: n=56, mean=0.142857, sd=0.353094
+  det_action[0]: n=56, mean=-0.310506, sd=0.0229412
+  det_action[1]: n=56, mean=0.400712, sd=0.0328757
+  det_action[2]: n=56, mean=-0.104536, sd=0.00841044
+  det_action[3]: n=56, mean=0.0755606, sd=0.0142852
+  front_min: n=56, mean=0.0719871, sd=0.00282958
+  gaze: n=56, mean=0.590224, sd=0.124574
+  nearest_enemy_dist: n=56, mean=4.741, sd=1.54916
+  reward: n=56, mean=0.155614, sd=0.356332
+  sampled_action[0]: n=56, mean=-0.345866, sd=0.956844
+  sampled_action[1]: n=56, mean=0.521879, sd=0.928331
+  sampled_action[2]: n=56, mean=-0.187322, sd=1.09062
+  sampled_action[3]: n=56, mean=0.0725539, sd=0.978131
+  speed: n=56, mean=0.0179003, sd=0.0210415
+  wall_distance: n=56, mean=0.399937, sd=8.25769e-05
+

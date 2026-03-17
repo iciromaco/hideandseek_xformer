@@ -1667,10 +1667,10 @@ def run_train_vector(
                     }
                 )
                 # Debug: show gaze_count and which keys are being logged
-                try:
-                    print(f"[GazeDebug] Step={global_step} gaze_count={gaze_count} payload_keys={list(payload.keys())}")
-                except Exception:
-                    pass
+                # try:
+                #    print(f"[GazeDebug] Step={global_step} gaze_count={gaze_count} payload_keys={list(payload.keys())}")
+                # except Exception:
+                #    pass
                 wandb_run.log(payload, step=global_step)
 
             if update % hp["log_interval"] == 0:
@@ -2190,10 +2190,10 @@ def run_train(
                     }
                 )
                 # Debug: show gaze_count and which keys are being logged
-                try:
-                    print(f"[GazeDebug] Step={global_step} gaze_count={gaze_count} payload_keys={list(payload.keys())}")
-                except Exception:
-                    pass
+                # try:
+                #     print(f"[GazeDebug] Step={global_step} gaze_count={gaze_count} payload_keys={list(payload.keys())}")
+                # except Exception:
+                #     pass
                 wandb_run.log(payload, step=global_step)
 
             if update % hp["log_interval"] == 0:
