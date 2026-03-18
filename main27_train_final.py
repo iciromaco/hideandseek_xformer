@@ -8,8 +8,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import random
-import json
 from src.core.constants import P_SCALE
 import gymnasium as gym
 from functools import partial
@@ -238,6 +236,7 @@ def _cfg(name, default, cast=None, overrides=None):
 # グローバル設定の初期化（一度だけ）
 # ============================================================================
 
+#
 # CLI設定の取得
 CLI_PROFILE_OVERRIDE = _cli_profile_override_from_argv()
 CLI_COMPARE_PROFILES = _cli_compare_profiles_from_argv()
@@ -280,7 +279,7 @@ DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("debug_symmetric_hider_policy", hp.get("debu
 TRAIN_OTHER_HIDER_POLICY = _cfg("train_other_hider_policy", hp.get("train_other_hider_policy", "rule"), str, RUNTIME_OVERRIDES)
 TRAIN_OTHER_SEEKER_POLICY = _cfg("train_other_seeker_policy", hp.get("train_other_seeker_policy", "rule"), str, RUNTIME_OVERRIDES)
 
-# 以前の挙動では推論モード (TRAIN_MODE=False) のとき必ずビューアを有効化していたが、
+ # 以前の挙動では推論モード (TRAIN_MODE=False) のとき必ずビューアを有効化していたが、
 # プロファイルで明示的に `use_viewer = false` とした場合でも上書きされてしまっていた。
 # ここでは「デバッグプロファイル（RUN_PROFILE == 'debug'）から来た推論実行」の場合に
 # 自動でビューアを有効化するのみとし、プロファイルで明示指定された `use_viewer` を尊重する。
@@ -332,31 +331,27 @@ WANDB_LOG_CODE = _cfg("wandb_log_code", "1", _to_bool, RUNTIME_OVERRIDES)
 WANDB_CODE_ROOT = _cfg("wandb_code_root", os.path.dirname(__file__), str, RUNTIME_OVERRIDES)
  
 
-RESUME_TRAINING = _cfg("resume_training", "0", _to_bool, RUNTIME_OVERRIDES)
-RESET_MODEL_ON_TRAIN = _cfg("reset_model_on_train", "0", _to_bool, RUNTIME_OVERRIDES)
-HPARAMS_CONFIG_PATH = CONFIG_PATH
+RESUME_TRAINING = _cfg("resume_training", "0", _to_bool, RUNTIME_OVERRIDES) # 学習再開フラグ（Trueの場合、checkpoint_pathからモデルをロードして学習再開を試みる）
+RESET_MODEL_ON_TRAIN = _cfg("reset_model_on_train", "0", _to_bool, RUNTIME_OVERRIDES) # 学習開始時にモデルを初期化するか（Trueの場合、checkpoint_pathからモデル構造はロードするが重みはランダム初期化する。RESUME_TRAINING=Trueと組み合わせて、構造は同じで重みだけリセットして学習再開したい場合などに使用）
+HPARAMS_CONFIG_PATH = CONFIG_PATH # ハイパーパラメータの設定ファイルパス（学習再開時に前回と同じハイパーパラメータで再開するために使用）
 
 # 報酬形成係数
-RW_SEEK_VISIBLE_BONUS = _cfg("rw_seek_visible_bonus", "0.03", float, RUNTIME_OVERRIDES)
-RW_WALL_NEAR_THRESHOLD = _cfg("rw_wall_near_threshold", "0.18", float, RUNTIME_OVERRIDES)  # 壁近判定閾値（全エージェント共通）
-RW_STILL_SPEED_THRESHOLD = _cfg("rw_still_speed_threshold", "0.05", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値（全エージェント共通）
+RW_SEEK_VISIBLE_BONUS = _cfg("rw_seek_visible_bonus", "0.03", float, RUNTIME_OVERRIDES) # SeekerがHiderを視界に捉えている場合の報酬（Seeker専用、視界に入っているほど報酬大）
+RW_STILL_SPEED_THRESHOLD = _cfg("rw_still_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値（全エージェント共通）
 
-RW_MOVE_SAT_PENALTY = _cfg("rw_move_sat_penalty", "0.02", float, RUNTIME_OVERRIDES)
-RW_TURN_SAT_PENALTY = _cfg("rw_turn_sat_penalty", "0.01", float, RUNTIME_OVERRIDES)
-RW_MOVE_CTRL_COST = _cfg("rw_move_ctrl_cost", "0.001", float, RUNTIME_OVERRIDES)
+RW_MOVE_SAT_PENALTY = _cfg("rw_move_sat_penalty", "0.02", float, RUNTIME_OVERRIDES) # 移動行動の飽和ペナルティ（全エージェント共通、速度の絶対値が閾値を超えるとペナルティ発生）
+RW_TURN_SAT_PENALTY = _cfg("rw_turn_sat_penalty", "0.01", float, RUNTIME_OVERRIDES) # 回転行動の飽和ペナルティ（全エージェント共通、回転の絶対値が閾値を超えるとペナルティ発生）
+RW_MOVE_CTRL_COST = _cfg("rw_move_ctrl_cost", "0.001", float, RUNTIME_OVERRIDES) # 行動コスト（移動と回転の両方に適用、全エージェント共通）
 
-RW_MOVE_INCENTIVE = _cfg("rw_move_incentive", "0.02", float, RUNTIME_OVERRIDES)
-RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float, RUNTIME_OVERRIDES)
-RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.05", float, RUNTIME_OVERRIDES)
+RW_MOVE_INCENTIVE = _cfg("rw_move_incentive", "0.02", float, RUNTIME_OVERRIDES) # 移動インセンティブ（速度が閾値に近づくほど増加、閾値以上で一定、閾値以下で減少。全エージェント共通）
+RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float, RUNTIME_OVERRIDES) # 動いていないほどペナルティ大（全エージェント共通）
+RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.15", float, RUNTIME_OVERRIDES) # 壁回避ペナルティ（全エージェント共通、壁に近いほどペナルティ大）
 
-# --- 壁張り付きペナルティ（全エージェント共通） ---
-RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.5", float, RUNTIME_OVERRIDES)
-# --- HiderがSeekerに近い場合のペナルティ ---
-RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("rw_hide_visible_near_penalty", "0.025", float, RUNTIME_OVERRIDES)
+RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.15", float, RUNTIME_OVERRIDES) # 壁に張り付いていると判断された場合のペナルティ（全エージェント共通）
+RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("rw_hide_visible_near_penalty", "0.05", float, RUNTIME_OVERRIDES) # HiderがSeekerに近くて見えている場合のペナルティ（Hider専用、距離が近いほどペナルティ大）
 
-# 新パラメータ定義（既存と同じ方式で初期値0.03）
-RW_HIDE_SEEKER_GAZE_PENALTY = _cfg("rw_hide_seeker_gaze_penalty", "0.03", float, RUNTIME_OVERRIDES)
-RW_SEEK_GAZE_REWARD = _cfg("c", "0.03", float, RUNTIME_OVERRIDES)
+RW_HIDE_SEEKER_GAZE_PENALTY = _cfg("rw_hide_seeker_gaze_penalty", "0.03", float, RUNTIME_OVERRIDES) # HiderがSeekerの視界に入っている場合のペナルティ（Hider専用、Seekerの視界に入っているほどペナルティ大）
+RW_SEEK_GAZE_REWARD = _cfg("c", "0.03", float, RUNTIME_OVERRIDES) # SeekerがHiderを視界に捉えている場合の報酬（Seeker専用、視界に入っているほど報酬大）
 
 # --- 速度・回転の閾値（TOMLで設定可） ---
 IDLE_SPEED_THRESHOLD = _cfg("idle_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値
@@ -369,9 +364,9 @@ WALL_SAFE = _cfg("wall_safe", "1.0", float, RUNTIME_OVERRIDES)
 
 # エージェント半径を設定ファイルから取得（デフォルト 0.4）
 AGENT_RADIUS = _cfg("agentl_radius", "0.4", float, RUNTIME_OVERRIDES)
-# 壁近マージン（エージェント表面からの近接閾値; デフォルト 0.2）
-WALL_NEAR_MARGIN = _cfg("wall_near_margin", "0.2", float, RUNTIME_OVERRIDES)
-
+# 壁近マージン（エージェント表面からの近接閾値; デフォルト 0.4）
+WALL_NEAR_MARGIN = _cfg("wall_near_margin", "0.4", float, RUNTIME_OVERRIDES)
+AGENT_HEAD_CLEARANCE = _cfg("agent_head_clearance", "0.2", float, RUNTIME_OVERRIDES)  # 壁近判定閾値（全エージェント共通）
 
 # ============================================================================
 # 観測履歴・ユーティリティクラス
@@ -415,10 +410,8 @@ class ObsHistory:
         self.buffer[:, self.ptr] = obs_t
         self.buffer[:, self.ptr + self.seq_len] = obs_t
         self.ptr = (self.ptr + 1) % self.seq_len
-
     def prime_single(self, obs):
         self.prime(np.asarray(obs, dtype=np.float32).reshape(1, -1))
-
     def update_single(self, obs):
         self.update(np.asarray(obs, dtype=np.float32).reshape(1, -1))
 
@@ -482,8 +475,6 @@ def _min_lidar_from_obs(obs, lidar_indices):
             lidar_min = value
     return lidar_min
 
-
-
 # 各エージェントごとに1つだけキャッシュ（idx, reward_idx_cacheのid）
 _wall_stick_state_cache = {}
 def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None, agent_idx=None):
@@ -497,12 +488,12 @@ def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None,
     # まずinfo['wall_distance']があればそれを使う
     wall_near = None
     if info is not None and 'wall_distance' in info:
-        wall_distance = info['wall_distance']
+        wall_distance = info['wall_distance'] # infoから壁距離を取得 これは正規化されていない生の距離値
         if isinstance(wall_distance, (list, tuple, np.ndarray)):
             wall_distance = float(np.min(wall_distance))
         else:
             wall_distance = float(wall_distance)
-        wall_near = (wall_distance - AGENT_RADIUS) < RW_WALL_NEAR_THRESHOLD
+        wall_near = (wall_distance - AGENT_RADIUS) < WALL_NEAR_MARGIN
     if wall_near is None:
         cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
         lidar_indices = cache["lidar"]
@@ -513,9 +504,9 @@ def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None,
             value = float(obs[int(lidar_idx)])
             if value < lidar_min:
                 lidar_min = value
-        wall_near = (lidar_min - AGENT_RADIUS) < RW_WALL_NEAR_THRESHOLD
+        wall_near = (lidar_min - AGENT_RADIUS) < WALL_NEAR_MARGIN
     if not wall_near:
-        # print(f"[DEBUG] wall_stick: wall_near=False (lidar_min={lidar_min:.3f}, threshold={RW_WALL_NEAR_THRESHOLD})")
+        # print(f"[DEBUG] wall_stick: wall_near=False (lidar_min={lidar_min:.3f}, threshold={AGENT_HEAD_CLEARANCE})")
         _wall_stick_state_cache[key] = False
         return False
     # 壁際なら速度判定
@@ -560,7 +551,7 @@ def _compute_custom_reward_batch_numba(
     move_sat_penalty,
     turn_sat_threshold,
     turn_sat_penalty,
-    wall_near_threshold,
+    agent_head_clearance,
     still_speed_threshold,
     wall_stick_penalty,
     agent_radius,
@@ -608,7 +599,7 @@ def _compute_custom_reward_batch_numba(
                 lidar_min = lidar_val
         # infoからz速度を取得し、正のz速度なら壁ペナルティをスキップ
         skip_wall_penalty = False
-        if agent_vz_batch[i] > 0.02:
+        if agent_vz_batch[i] > 0.02: # Z軸の速度が0.02以上なら上昇中とみなし、壁ペナルティをスキップ
             skip_wall_penalty = True
 
         if not skip_wall_penalty:
@@ -625,9 +616,8 @@ def _compute_custom_reward_batch_numba(
                 # LiDAR値はセンサー先端までの距離なので、エージェント半径を引いて判定する 
 
                 TESTR = 2.0
-
                 if next_speed < still_speed_threshold:
-                    front_wall_near = ((lidar_min - agent_radius) < wall_near_threshold) # 前方が壁近で速度が遅い（張り付き状態）かどうか
+                    front_wall_near = ((lidar_min - agent_radius) < agent_head_clearance) # 前方が壁近で速度が遅い（張り付き状態）かどうか
                     pr = TESTR if front_wall_near else 1.0
                     bonus -= pr * wall_stick_penalty * (1.0 - ratio)  # 壁近マージン内で速度が遅いほどペナルティが増加（壁に張り付いている状態を強くペナルティ）
 
@@ -777,7 +767,7 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
         float(RW_MOVE_SAT_PENALTY),
         float(TURN_SAT_THRESHOLD),
         float(RW_TURN_SAT_PENALTY),
-        float(RW_WALL_NEAR_THRESHOLD),
+        float(AGENT_HEAD_CLEARANCE),
         float(RW_STILL_SPEED_THRESHOLD),
         float(RW_WALL_STICK_PENALTY),
         float(AGENT_RADIUS),  # AGENT_RADIUS
@@ -1391,7 +1381,7 @@ def run_train_vector(
                         float(RW_MOVE_SAT_PENALTY),
                         float(TURN_SAT_THRESHOLD),
                         float(RW_TURN_SAT_PENALTY), 
-                        float(RW_WALL_NEAR_THRESHOLD),
+                        float(AGENT_HEAD_CLEARANCE),
                         float(RW_STILL_SPEED_THRESHOLD),
                         float(RW_WALL_STICK_PENALTY),
                         float(AGENT_RADIUS),  # AGENT_RADIUS
@@ -1915,7 +1905,7 @@ def run_train(
                         float(RW_MOVE_SAT_PENALTY),
                         float(TURN_SAT_THRESHOLD),
                         float(RW_TURN_SAT_PENALTY),
-                        float(RW_WALL_NEAR_THRESHOLD),
+                        float(AGENT_HEAD_CLEARANCE),
                         float(RW_STILL_SPEED_THRESHOLD),
                         float(RW_WALL_STICK_PENALTY),
                         float(AGENT_RADIUS),  # AGENT_RADIUS
@@ -1928,7 +1918,6 @@ def run_train(
                         front_lidar_indices,
                         agent_vz_batch
                     )
-
                 reward_compute_sec_sum += time.perf_counter() - reward_t0
 
                 global_step += num_envs
@@ -1965,7 +1954,7 @@ def run_train(
                         learnable_seen_steps += 1
                     # wall_stick判定をNumba報酬計算済みのwall_distance_batchと速度から直接行う
                     # エージェント半径を差し引いて壁近接判定を行う
-                    wall_near = ((wall_distance_batch[i] - AGENT_RADIUS) < RW_WALL_NEAR_THRESHOLD)
+                    wall_near = ((wall_distance_batch[i] - AGENT_RADIUS) < AGENT_HEAD_CLEARANCE)
                     next_speed = math.sqrt(
                         float(next_obs[i, reward_idx_cache["self_vel_x"]])**2 +
                         float(next_obs[i, reward_idx_cache["self_vel_y"]])**2
@@ -1979,7 +1968,7 @@ def run_train(
                         except Exception:
                             wd_val = None
                         if wd_val is not None and not np.isnan(wd_val):
-                            relaxed_thresh = AGENT_RADIUS + (RW_WALL_NEAR_THRESHOLD * 1.5)
+                            relaxed_thresh = AGENT_RADIUS + (AGENT_HEAD_CLEARANCE * 1.5)
                             if (wd_val < relaxed_thresh) and (next_speed < (RW_STILL_SPEED_THRESHOLD * 2.0)):
                                 is_wall_stick = True
                     if update % hp["log_interval"] == 0 and i == 0:

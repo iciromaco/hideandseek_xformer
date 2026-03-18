@@ -24,12 +24,12 @@ debug_log_interval_steps = 200
 use_custom_reward = true
 # 前進飽和抑制（常時前進ボーナスは使わない）
 rw_move_sat_penalty = 0.02
- # 壁張り付き対策（全エージェント共通）
-rw_wall_stick_penalty = 0.5
-
-rw_wall_near_threshold = 0.18  # 壁近判定閾値（全エージェント共通）
-rw_still_speed_threshold = 0.05  # 静止判定速度閾値（全エージェント共通）
-rw_hide_visible_near_penalty = 0.025
+# 壁張り付き対策（全エージェント共通）
+rw_wall_stick_penalty = 0.15
+agent_head_clearance = 0.2  # 壁近判定閾値（全エージェント共通）
+wall_near_margin = 0.4  # 壁近マージン（エージェント表面からの近接閾値）
+rw_still_speed_threshold = 0.1  # 静止判定速度閾値（全エージェント共通）
+rw_hide_visible_near_penalty = 0.05
 rw_hide_seeker_gaze_penalty = 0.03
 rw_seek_gaze_reward = 0.03
 rw_wall_avoid_penalty = 0.15
@@ -58,7 +58,6 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 30000
 wandb_run_name = "wall_only_confirm_1M"
-rw_move_sat_penalty = 0.0
 
 # runtime.debug: 再生/検証向け設定
 [runtime.debug]
@@ -84,7 +83,6 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 100_000_000
 wandb_run_name = "wall_only_confirm_100M"
-rw_move_sat_penalty = 0.0
 
 # runtime.train1: Viewer 表示ありの学習環境
 [runtime.train1]
@@ -97,7 +95,6 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 100_000_000
 wandb_run_name = "train1"
-rw_move_sat_penalty = 0.0
 num_envs = 1
 
 # runtime.trainseeker: 学習向け設定 Seeker
@@ -111,7 +108,6 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 10_000_000
 wandb_run_name = "wall_only_confirm_10M"
-rw_move_sat_penalty = 0.0
 
 # runtime.trainseeker_forRB: 学習向け設定 Seeker
 [runtime.trainseeker_forRB]
@@ -125,11 +121,12 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 10_000_000
 wandb_run_name = "wall_only_confirm_10M"
-rw_move_sat_penalty = 0.0
-# 壁張り付き対策（全エージェント共通）
-rw_wall_stick_penalty = 0.15
-rw_wall_near_threshold = 0.18  # 壁近判定閾値（全エージェント共通）
-rw_still_speed_threshold = 0.05  # 静止判定速度閾値（全エージェント共通）
+# rw_move_sat_penalty = 0.02
+
+# w_wall_avoid_penalty = 0.15
+# rw_wall_stick_penalty = 0.15 # 壁張り付き対策（全エージェント共通）
+# rw_wall_near_threshold = 0.4  # 壁近判定閾値（全エージェント共通）
+# rw_still_speed_threshold = 0.1  # 静止判定速度閾値（全エージェント共通）
 
 # base: PPOの基本ハイパーパラメータ（全ターゲット共通）
 [base]

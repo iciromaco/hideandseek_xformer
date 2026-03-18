@@ -31,7 +31,10 @@ def _compute_wall_sdf_grid_jit(min_x, min_y, cell_size, n_x, n_y, walls_xpos, wa
             dist_in = -np.min(np.abs(d), axis=1)
             sdf_vals = np.where(outside, dist_out, dist_in)
             d_min = np.min(sdf_vals)
-            grid[iy, ix] = d_min if d_min < max_dist else max_dist
+            if d_min < max_dist:
+                grid[iy, ix] = d_min
+            else:
+                grid[iy, ix] = max_dist
             # --- デバッグ出力: SDF値が-0.1以下となった最初のグリッド点 ---
             if not debug_printed and d_min < -0.2:
                 wall_idx = np.argmin(sdf_vals)
