@@ -993,6 +993,7 @@ class TeamCosEnv(gym.Env):
         max_lock_btn = 0.0
         max_grab_btn = 0.0
         boosted_agents = 0
+        applied_forward_learnable = 0.0
         
         for i, ak in enumerate(self.agent_keys):
             is_seeker = ak.startswith("s")
@@ -1020,6 +1021,10 @@ class TeamCosEnv(gym.Env):
             if boost > 0.0:
                 f = float(np.clip(f + self.RAMP_BOOST_FWD * boost, -1.0, 1.0))
                 boosted_agents += 1
+
+            # record the final applied forward for the learnable agent
+            if ak == self.learnable_agent_key:
+                applied_forward_learnable = float(f)
 
             max_lock_btn = max(max_lock_btn, float(lck))
             max_grab_btn = max(max_grab_btn, float(grb))
@@ -1131,6 +1136,7 @@ class TeamCosEnv(gym.Env):
             "agent_vy": agent_vy,
             "dbg_last_ctrl_f": last_ctrl_f,
             "dbg_last_ctrl_t": last_ctrl_t,
+            "applied_forward": applied_forward_learnable,
         }
         self._debug_collect_stats(reward, info)
         
@@ -1220,8 +1226,8 @@ class TeamCosEnv(gym.Env):
             seeker_proximity_penalty = 0.2 * (1.0 - dist_far_ratio)
             dist_bonus = -seeker_proximity_penalty
         
-        team_reward = base + dist_bonus
-        # team_reward = dist_bonus
+        # team_reward = base + dist_bonus
+        team_reward = 0.0
         
         return team_reward, bool(seen_count > 0), gaze_cos_front_max, gaze_cos_front_dist_max, bool(learnable_hider_seen)
 
