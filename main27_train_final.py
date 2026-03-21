@@ -345,6 +345,7 @@ RW_MOVE_CTRL_COST = _cfg("rw_move_ctrl_cost", "0.001", float, RUNTIME_OVERRIDES)
 
 RW_MOVE_INCENTIVE = _cfg("rw_move_incentive", "0.02", float, RUNTIME_OVERRIDES) # 移動インセンティブ（速度が閾値に近づくほど増加、閾値以上で一定、閾値以下で減少。全エージェント共通）
 RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float, RUNTIME_OVERRIDES) # 動いていないほどペナルティ大（全エージェント共通）
+RW_TURN_INCENTIVE = _cfg("rw_turn_incentive", "0.0", float, RUNTIME_OVERRIDES) # 敵が見えていない時の回転インセンティブ（デフォルト0）
 RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.15", float, RUNTIME_OVERRIDES) # 壁回避ペナルティ（全エージェント共通、壁に近いほどペナルティ大）
 
 RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.15", float, RUNTIME_OVERRIDES) # 壁に張り付いていると判断された場合のペナルティ（全エージェント共通）
@@ -551,6 +552,7 @@ def _compute_custom_reward_batch_numba(
     move_sat_penalty,
     turn_sat_threshold,
     turn_sat_penalty,
+    rw_turn_incentive,
     agent_head_clearance,
     still_speed_threshold,
     wall_stick_penalty,
@@ -575,6 +577,8 @@ def _compute_custom_reward_batch_numba(
         next_speed = np.float32(np.sqrt(next_vel_x * next_vel_x + next_vel_y * next_vel_y))
 
         bonus = np.float32(0.0)
+
+        # --- 速度ペナルティ・インセンティブ（hider/seeker共通） ---
         if next_speed < idle_speed_threshold:
             bonus -= idle_penalty * (idle_speed_threshold - next_speed)
         elif next_speed < move_incentive_speed_threshold:
@@ -587,8 +591,20 @@ def _compute_custom_reward_batch_numba(
 
         if np.abs(turn) > turn_sat_threshold:
             bonus -= turn_sat_penalty
+        else:
+            # 敵が見えていない場合は回転にインセンティブを与える
+            visible = False
+            for j in range(enemy_visible_indices.shape[0]):
+                idx_vis = int(enemy_visible_indices[j])
+                if obs_batch[i, idx_vis] > 0.5:
+                    visible = True
+                    break
+            if not visible:
+                # rw_turn_incentive は小さな正の値を期待する（例: 0.01 程度）
+                bonus += rw_turn_incentive * np.abs(turn)
 
-        control_cost = -move_ctrl_cost * (move * move + turn * turn)
+        # control_cost = -move_ctrl_cost * (move * move + turn * turn)
+        control_cost = 0.0 # 行動コストは一旦無効化（速度ペナルティと重複するため）
 
         # --- 壁張り付きペナルティ（hider/seeker共通, Python版に忠実に） ---
         # 前方LiDAR最小値
@@ -767,6 +783,7 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
         float(RW_MOVE_SAT_PENALTY),
         float(TURN_SAT_THRESHOLD),
         float(RW_TURN_SAT_PENALTY),
+        float(RW_TURN_INCENTIVE),
         float(AGENT_HEAD_CLEARANCE),
         float(RW_STILL_SPEED_THRESHOLD),
         float(RW_WALL_STICK_PENALTY),
@@ -1380,7 +1397,8 @@ def run_train_vector(
                         float(MOVE_SAT_THRESHOLD),
                         float(RW_MOVE_SAT_PENALTY),
                         float(TURN_SAT_THRESHOLD),
-                        float(RW_TURN_SAT_PENALTY), 
+                        float(RW_TURN_SAT_PENALTY),
+                        float(RW_TURN_INCENTIVE),
                         float(AGENT_HEAD_CLEARANCE),
                         float(RW_STILL_SPEED_THRESHOLD),
                         float(RW_WALL_STICK_PENALTY),
@@ -1905,6 +1923,7 @@ def run_train(
                         float(RW_MOVE_SAT_PENALTY),
                         float(TURN_SAT_THRESHOLD),
                         float(RW_TURN_SAT_PENALTY),
+                        float(RW_TURN_INCENTIVE),
                         float(AGENT_HEAD_CLEARANCE),
                         float(RW_STILL_SPEED_THRESHOLD),
                         float(RW_WALL_STICK_PENALTY),

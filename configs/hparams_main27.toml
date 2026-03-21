@@ -32,6 +32,8 @@ rw_still_speed_threshold = 0.1  # 静止判定速度閾値（全エージェン�
 rw_hide_visible_near_penalty = 0.05
 rw_hide_seeker_gaze_penalty = 0.03
 rw_seek_gaze_reward = 0.03
+# 敵が見えていないときの回転インセンティブ（小さな正の値を設定）
+rw_turn_incentive = 0.01
 rw_wall_avoid_penalty = 0.15
 ramp_check_enabled = false
 ramp_check_viewer = false
@@ -119,11 +121,11 @@ train_other_seeker_policy = "rule"
 use_custom_reward = false
 npc_only_debug = false
 auto_tune_hparams = false
-total_timesteps = 10_000_000
-wandb_run_name = "wall_only_confirm_10M"
+total_timesteps = 100_000
+wandb_run_name = "wall_only_confirm_100K"
 # rw_move_sat_penalty = 0.02
 
-# w_wall_avoid_penalty = 0.15
+# w_wall_avoid_penalty = 0.0
 # rw_wall_stick_penalty = 0.15 # 壁張り付き対策（全エージェント共通）
 # rw_wall_near_threshold = 0.4  # 壁近判定閾値（全エージェント共通）
 # rw_still_speed_threshold = 0.1  # 静止判定速度閾値（全エージェント共通）

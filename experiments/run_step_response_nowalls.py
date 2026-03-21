@@ -11,7 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.envs.hns_environment import TeamCosEnv
 from experiments.utils import prepare_env
 
-# prefer stdlib tomllib (py3.11+), fall back to tomli if available
+# load toml safely
 try:
     import tomllib as _tomlib
 except Exception:
@@ -33,64 +33,50 @@ def _load_action_repeat_from_config():
         return 0
 
 
-def main(steps=500, hold_action=1.0, out_json='experiments/step_response.json', out_png='experiments/plots/step_response.png',
-         stop_thresh=0.02, stop_frames=5, max_wait_steps=500):
+def main(steps=400, hold_action=0.25, out_json='experiments/step_response_nowalls.json', out_png='experiments/plots/step_response_nowalls.png'):
     os.makedirs(os.path.dirname(out_json) or '.', exist_ok=True)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     env = TeamCosEnv(debug_mode=False, target="seeker")
-    # avoid prep behavior
-    try:
-        env.prep_steps = 0
-    except Exception:
-        pass
 
-    # set action_repeat from config if present
-    ar_cfg = _load_action_repeat_from_config()
-    if ar_cfg:
-        env = prepare_env(env, action_repeat=ar_cfg, place_far=False)
+    ar = _load_action_repeat_from_config()
+    if ar:
+        env = prepare_env(env, action_repeat=ar, place_far=True)
     else:
-        env = prepare_env(env, action_repeat=None, place_far=False)
+        env = prepare_env(env, action_repeat=None, place_far=True)
 
     # warm
     env.step(env.action_space.sample())
 
-    # wait until agent body linear speed is below threshold for stop_frames consecutive steps
-    learnable = env.learnable_agent_key
-    body_id = env.body_ids[learnable]
-    stable = 0
-    waited = 0
-    while stable < stop_frames and waited < max_wait_steps:
-        # apply zero action while waiting
-        obs, reward, term, trunc, info = env.step(env.action_space.sample() * 0.0)
-        try:
-            v = env.data.xvelp[body_id]
-        except AttributeError:
-            try:
-                cv = env.data.cvel[body_id]
-                v = np.array([float(cv[3]), float(cv[4]), float(cv[5])])
-            except Exception:
-                v = np.array([float(info.get('agent_vx', 0.0)), float(info.get('agent_vy', 0.0)), 0.0])
-        speed = float((v[0]**2 + v[1]**2)**0.5)
-        if speed <= stop_thresh:
-            stable += 1
-        else:
-            stable = 0
-        waited += 1
-
-    if waited >= max_wait_steps:
-        print(f'Warning: waited {max_wait_steps} steps but did not reach stable stop threshold')
+    # wait until prep_steps elapse (Viewer uses prep_steps=80)
+    wait_steps = getattr(env, 'prep_steps', 80)
+    for _ in range(wait_steps):
+        env.step(env.action_space.sample() * 0.0)
 
     records = []
     a = np.array([hold_action, 0.0, 0.0, 0.0], dtype=np.float32)
     for i in range(steps):
         obs, reward, term, trunc, info = env.step(a)
-        # body velocities
+        # Prefer body linear velocity (xvelp) to match recorder logic; fall back to joint qvel then info
+        vx, vy = 0.0, 0.0
         try:
-            bid = env.body_ids[env.learnable_agent_key]
-            v = env.data.xvelp[bid]
-            vx = float(v[0]); vy = float(v[1])
+            name = env.learnable_agent_key
+            bid = env.body_ids.get(name)
+            if bid is not None:
+                vv = env.data.xvelp[bid]
+                vx = float(vv[0]); vy = float(vv[1])
         except Exception:
-            vx = float(info.get('agent_vx', 0.0)); vy = float(info.get('agent_vy', 0.0))
+            try:
+                qmap = getattr(env, 'qpos_indices', {})
+                name = env.learnable_agent_key
+                if name in qmap:
+                    jx = qmap[name].get('x')
+                    if jx is not None:
+                        dof_adr = int(env.model.jnt_dofadr[jx])
+                        vx = float(env.data.qvel[dof_adr]); vy = float(env.data.qvel[dof_adr+1])
+            except Exception:
+                vx = float(info.get('agent_vx', 0.0)); vy = float(info.get('agent_vy', 0.0))
+
+        # compute yaw (qpos) when available, otherwise use info
         yaw = 0.0
         try:
             rot_jid = env.qpos_indices[env.learnable_agent_key]['rot']
@@ -98,8 +84,20 @@ def main(steps=500, hold_action=1.0, out_json='experiments/step_response.json', 
             yaw = float(env.data.qpos[qadr])
         except Exception:
             yaw = float(info.get('agent_yaw', 0.0) or 0.0)
+
         signed = float(vx * math.cos(yaw) + vy * math.sin(yaw))
-        applied = float(info.get('applied_forward', 0.0))
+
+        # prefer the actual ctrl value written to the actuator (signed); fallback to info
+        applied = None
+        try:
+            aid = env.actuator_ids.get(f"{env.learnable_agent_key}_fwd")
+            if aid is not None:
+                applied = float(env.data.ctrl[aid])
+        except Exception:
+            applied = None
+        if applied is None:
+            applied = float(info.get('applied_forward', 0.0))
+
         records.append({'step': i, 'applied': applied, 'vx': vx, 'vy': vy, 'signed_forward': signed})
         if term or trunc:
             env.reset()
@@ -123,7 +121,6 @@ def main(steps=500, hold_action=1.0, out_json='experiments/step_response.json', 
     with open(out_json, 'w') as f:
         json.dump(out, f, indent=2)
 
-    # plot time series
     t = np.arange(len(records))
     plt.figure(figsize=(8,4))
     plt.plot(t, [r['signed_forward'] for r in records], label='signed_forward')

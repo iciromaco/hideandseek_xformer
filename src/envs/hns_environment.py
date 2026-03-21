@@ -1,6 +1,6 @@
 # mathのimportを明示的に追加
 import math
-from src.core.constants import P_SCALE, L_SCALE, R_SCALE, V_SCALE
+from core.constants import P_SCALE, L_SCALE, R_SCALE, V_SCALE
 # src/envs/hns_environment.py
 # hns_environment.py v4.5９
 
@@ -171,6 +171,11 @@ class TeamCosEnv(gym.Env):
     FREE_OBJ_LINEAR_DAMP = 0.90
     FREE_OBJ_STOP_EPS = 0.045
     INTERACT_OCCLUSION_MARGIN = 0.03
+    # When an inference model is present for the learnable agent, the model's
+    # forward channel can be multiplied by this sign. Set to 1.0 for no change
+    # or -1.0 to flip the forward direction at apply-time. Keeping this as a
+    # tunable class attribute avoids editing code logic elsewhere.
+    INFERENCE_FORWARD_SIGN = 1.0
 
     def __init__(self, mode="initial", target="hider", n_seekers=1,
                  n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None,
@@ -458,6 +463,24 @@ class TeamCosEnv(gym.Env):
             }
             self.actuator_ids[f"{ak}_fwd"] = m.actuator(f"{ak}_fwd").id
             self.actuator_ids[f"{ak}_turn"] = m.actuator(f"{ak}_turn").id
+        # cache agent geom ids and default colors for runtime recoloring
+        self.agent_geom_ids = {}
+        self.agent_default_rgba = {}
+        for ak in self.agent_keys:
+            geom_names = [f"{ak}_capsule", f"{ak}_nose", f"{ak}_tail"]
+            ids = []
+            cols = []
+            for gname in geom_names:
+                try:
+                    gid = m.geom(gname).id
+                    ids.append(gid)
+                    cols.append(m.geom_rgba[gid].copy())
+                except Exception:
+                    # ignore missing
+                    pass
+            self.agent_geom_ids[ak] = ids
+            # store per-geom default rgba array list
+            self.agent_default_rgba[ak] = cols
         self.ramp_ids = [
             m.body(f"ramp{i}_body").id
             for i in range(1, self.n_ramps + 1)
@@ -994,6 +1017,9 @@ class TeamCosEnv(gym.Env):
         max_grab_btn = 0.0
         boosted_agents = 0
         applied_forward_learnable = 0.0
+        # keep both the raw model forward and the actual applied forward (after any inference-only transform)
+        applied_forward_model = 0.0
+        applied_forward_env = 0.0
         
         for i, ak in enumerate(self.agent_keys):
             is_seeker = ak.startswith("s")
@@ -1022,9 +1048,9 @@ class TeamCosEnv(gym.Env):
                 f = float(np.clip(f + self.RAMP_BOOST_FWD * boost, -1.0, 1.0))
                 boosted_agents += 1
 
-            # record the final applied forward for the learnable agent
+            # record the final model forward for the learnable agent (before any env-side transform)
             if ak == self.learnable_agent_key:
-                applied_forward_learnable = float(f)
+                applied_forward_model = float(f)
 
             max_lock_btn = max(max_lock_btn, float(lck))
             max_grab_btn = max(max_grab_btn, float(grb))
@@ -1041,8 +1067,18 @@ class TeamCosEnv(gym.Env):
             any_lock_event = any_lock_event or lock_evt
             any_grab_event = any_grab_event or grab_evt
             
-            cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = f, t
-            self.last_debug_ctrl[ak] = (f, t)
+            # For inference-only compatibility: some checkpoints were trained with the
+            # opposite sign convention for the forward channel. Apply a runtime-only
+            # transform controlled by `INFERENCE_FORWARD_SIGN` so this behavior can be
+            # toggled without editing logic below.
+            if ak == self.learnable_agent_key and self._inference_models.get(ak) is not None:
+                f_env = float(self.INFERENCE_FORWARD_SIGN * f)
+            else:
+                f_env = float(f)
+
+            applied_forward_env = f_env
+            cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = f_env, t
+            self.last_debug_ctrl[ak] = (f_env, t)
             
         self.data.ctrl[:] = cv
         for _ in range(self.action_repeat):
@@ -1063,7 +1099,7 @@ class TeamCosEnv(gym.Env):
             )
         )
         
-        rb, find, gaze_cos_front_max, gaze_cos_front_dist_max, learnable_hider_seen = self._compute_team_reward()
+        rb, find, gaze_cos_front_max, gaze_dist_max, learnable_hider_seen = self._compute_team_reward()
 
         for i, ak in enumerate(self.agent_keys):
             if ak == self.learnable_agent_key and not self.override_learnable_policy:
@@ -1128,7 +1164,7 @@ class TeamCosEnv(gym.Env):
             "dbg_override_learnable_policy": bool(self.override_learnable_policy),
             "dbg_model_policy_deterministic": bool(self.model_policy_deterministic),
             "dbg_seek_gaze_cos_front_max": float(gaze_cos_front_max),
-            "dbg_seek_gaze_cos_front_dist_max": float(gaze_cos_front_dist_max),
+            "dbg_seek_gaze_cos_front_dist_max": float(gaze_dist_max),
             "dbg_learnable_hider_seen": bool(learnable_hider_seen),
             "wall_distance": wall_dist,
             "agent_vz": agent_vz,
@@ -1136,7 +1172,12 @@ class TeamCosEnv(gym.Env):
             "agent_vy": agent_vy,
             "dbg_last_ctrl_f": last_ctrl_f,
             "dbg_last_ctrl_t": last_ctrl_t,
-            "applied_forward": applied_forward_learnable,
+            # whether current step is within prep/warmup
+            "in_prep": bool(self.current_step <= self.prep_steps),
+            # 'applied_forward_model' is the raw model output; 'applied_forward' is what was
+            # actually applied to the actuator (may be transformed at runtime for compatibility)
+            "applied_forward_model": applied_forward_model,
+            "applied_forward": applied_forward_env,
         }
         self._debug_collect_stats(reward, info)
         
@@ -1149,7 +1190,7 @@ class TeamCosEnv(gym.Env):
         seen_count = 0
         min_seeker_dist = 13.0  # ← 追加
         gaze_cos_front_max = 0.0
-        gaze_cos_front_dist_max = 0.0
+        gaze_dist_max = 0.0
         learnable_hider_seen = False
 
         for hk in self.hider_keys:
@@ -1180,11 +1221,11 @@ class TeamCosEnv(gym.Env):
                 if hk == self.learnable_agent_key:
                     # learnable がハイダー: シーカー側から見た frontness を計上
                     gaze_cos_front_max = max(gaze_cos_front_max, frontness)
-                    gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, frontness / (dist + 0.2))
+                    gaze_dist_max = max(gaze_dist_max, frontness / (dist + 0.2))
                 if sk == self.learnable_agent_key:
                     # learnable がシーカー: 学習シーカーの視線（この seeker が見ている frontness）を計上
                     gaze_cos_front_max = max(gaze_cos_front_max, frontness)
-                    gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, frontness / (dist + 0.2))
+                    gaze_dist_max = max(gaze_dist_max, frontness / (dist + 0.2))
  
                 if self._is_vis(spos, srot, hpos, sid, hid):
                     seen = True
@@ -1210,26 +1251,25 @@ class TeamCosEnv(gym.Env):
         # - seen_count >= 1 -> base = -1.0 (明確なペナルティ)
         # これにより、学習対象（ハイダー）視点で「1体でも見られているときに中立(0)」
         # となる挙動を避けられます（n_hiders==2 の場合に見られた1体で base==0 になっていた問題を解消）。
+        
+        dist_ratio = min(min_seeker_dist / 12.0, 1.0)
         if seen_count == 0:
             base = 1.0
             # 敵から遠いほど+ボーナス
-            dist_ratio = min(min_seeker_dist / 12.0, 1.0)
-            dist_bonus = 0.2 * dist_ratio
+            dist_bonus = dist_ratio  # 0.0 (近い) ~ 1.0 (遠い)
         else:
             # seen_count が 1 のときも負の報酬を与えるが、段階的にする。
             # 例: n_hiders=2 の場合 seen_count=1 -> base=-0.5, seen_count=2 -> base=-1.0
             base = -float(seen_count) / float(len(self.hider_keys))
             # シーカーが見つけたハイダーに近づくほどハイダー側の報酬をさらに下げる
-            # （これによりシーカー側は近づくインセンティブを得る）
-            # min_seeker_dist が小さいほどペナルティが大きくなる。遠ければほぼ0。
-            dist_far_ratio = min(min_seeker_dist / 12.0, 1.0)
-            seeker_proximity_penalty = 0.2 * (1.0 - dist_far_ratio)
-            dist_bonus = -seeker_proximity_penalty
+            dist_bonus = dist_ratio - 1.0  # 0.0 (遠い) ~ -1.0 (近い)
         
-        # team_reward = base + dist_bonus
-        team_reward = dist_bonus
-        
-        return team_reward, bool(seen_count > 0), gaze_cos_front_max, gaze_cos_front_dist_max, bool(learnable_hider_seen)
+        WR_OF_DIST_BONUS = 1.0  # 距離ボーナスの重み（0.0なら距離無視、1.0なら完全に距離で評価）
+        team_reward = (1 - WR_OF_DIST_BONUS) * base \
+                        + WR_OF_DIST_BONUS * dist_bonus
+        # debug storage removed
+
+        return team_reward, bool(seen_count > 0), gaze_cos_front_max, gaze_dist_max, bool(learnable_hider_seen)
 
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
         rel = t_pos - pos; dist = math.sqrt(np.sum(rel**2)) + 1e-8
@@ -1360,17 +1400,82 @@ class TeamCosEnv(gym.Env):
                         mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 8.0 + abs(t_val)*25, p_start, p_end)
                         g.rgba[:] = color
                         self.viewer.user_scn.ngeom += 1
-                targets = [
-                    (self.body_ids[k], [1, 0, 0, 1] if ak.startswith("s") else [0, 0, 1, 1])
-                    for k in self.agent_keys if k != ak
-                ]
-                for tid, color in targets:
-                    if self._is_vis(pos[:2], rot, self.data.xpos[tid][:2], sid, tid):
-                        if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
-                            g = self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom]
-                            mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 2.0, pos, self.data.xpos[tid])
-                            g.rgba[:] = color
-                            self.viewer.user_scn.ngeom += 1
+                for k in self.agent_keys:
+                    if k == ak:
+                        continue
+                    tid = self.body_ids[k]
+                    if not self._is_vis(pos[:2], rot, self.data.xpos[tid][:2], sid, tid):
+                        continue
+
+                    # Determine color:
+                    # - If current agent `ak` is a Seeker and target `k` is a Hider,
+                    #   show a yellow line. Brightness differs so H1 and H2 are distinguishable.
+                    # - Otherwise keep previous semantics (Seeker->others red, Hider->others blue).
+                    if ak.startswith("s") and k.startswith("h"):
+                        # brightness by index in hider_keys (H1 brighter than H2)
+                        try:
+                            h_idx = self.hider_keys.index(k)
+                            brightness = 1.0 - 0.4 * h_idx
+                            if brightness < 0.2:
+                                brightness = 0.2
+                        except Exception:
+                            brightness = 0.8
+                        color = [brightness, brightness, 0.0, 1.0]
+                    else:
+                        if ak.startswith("s"):
+                            color = [1, 0, 0, 1]
+                        else:
+                            color = [0, 0, 1, 1]
+
+                    if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
+                        g = self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom]
+                        mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 2.0, pos, self.data.xpos[tid])
+                        g.rgba[:] = color
+                        self.viewer.user_scn.ngeom += 1
+            # runtime recolor: if any seeker sees a hider, recolor that hider's geoms to yellow
+            try:
+                # determine overrides per hider key
+                overrides = {}
+                for s in [k for k in self.agent_keys if k.startswith('s')]:
+                    s_sid = self.body_ids[s]
+                    s_pos = self.data.xpos[s_sid][:2]
+                    s_rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[s]['rot']]]
+                    for h in [k for k in self.agent_keys if k.startswith('h')]:
+                        h_tid = self.body_ids[h]
+                        if not self._is_vis(s_pos, s_rot, self.data.xpos[h_tid][:2], s_sid, h_tid):
+                            continue
+                        # compute brightness by hider index
+                        try:
+                            h_idx = self.hider_keys.index(h)
+                            brightness = 1.0 - 0.4 * h_idx
+                            if brightness < 0.2:
+                                brightness = 0.2
+                        except Exception:
+                            brightness = 0.8
+                        overrides[h] = [brightness, brightness, 0.0, 1.0]
+
+                # apply overrides or restore defaults
+                for ak in self.agent_keys:
+                    geom_ids = self.agent_geom_ids.get(ak, [])
+                    if ak in overrides:
+                        col = overrides[ak]
+                        for gid in geom_ids:
+                            try:
+                                self.model.geom_rgba[gid][:] = col
+                            except Exception:
+                                pass
+                    else:
+                        # restore defaults
+                        cols = self.agent_default_rgba.get(ak, [])
+                        for gid, defcol in zip(geom_ids, cols):
+                            try:
+                                self.model.geom_rgba[gid][:] = defcol
+                            except Exception:
+                                pass
+            except Exception:
+                # be resilient to any viewer/model issues
+                pass
+
         self.viewer.sync()
 
     def close(self):

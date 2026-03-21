@@ -6,6 +6,13 @@ import numpy as np
 # ensure project root on path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from experiments.run_signed_forward import main as run_one
+from experiments.utils import prepare_env
+import os
+
+def _noop_prepare_for_batch():
+    # ensure envs created by run_one will pick up config-based action_repeat
+    return
+
 
 def main(runs=10, steps=1000, out_dir='experiments'):
     os.makedirs(out_dir, exist_ok=True)

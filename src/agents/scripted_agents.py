@@ -3,7 +3,7 @@
 
 import numpy as np
 import math
-from src.core.constants import P_SCALE, L_SCALE, R_SCALE
+from core.constants import P_SCALE, L_SCALE, R_SCALE
 
 
 def _nearest_pushable(obs, idx):

@@ -9,10 +9,37 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.envs.hns_environment import TeamCosEnv
+from experiments.utils import prepare_env
+
+# load toml config safely
+try:
+    import tomllib as _tomlib
+except Exception:
+    try:
+        import tomli as _tomlib
+    except Exception:
+        _tomlib = None
+
+
+def _load_action_repeat_from_config():
+    cfg_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'hparams_main27.toml')
+    if _tomlib is None:
+        return 0
+    try:
+        with open(cfg_path, 'rb') as f:
+            cfg = _tomlib.load(f)
+        return int(cfg.get('runtime', {}).get('common', {}).get('action_repeat', 0) or 0)
+    except Exception:
+        return 0
 
 
 def main(steps=1000, out_path='experiments/signed_forward.json'):
-    env = TeamCosEnv(debug_mode=False)
+    env = TeamCosEnv(debug_mode=False, target="seeker")
+    ar = _load_action_repeat_from_config()
+    if ar:
+        env = prepare_env(env, action_repeat=ar, place_far=False)
+    else:
+        env = prepare_env(env, action_repeat=None, place_far=False)
     # warm-step to init internal state
     obs, reward, term, trunc, info = env.step(env.action_space.sample())
     records = []
