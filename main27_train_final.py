@@ -352,7 +352,7 @@ RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.15", float, RUNTIME_OVE
 RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("rw_hide_visible_near_penalty", "0.05", float, RUNTIME_OVERRIDES) # HiderがSeekerに近くて見えている場合のペナルティ（Hider専用、距離が近いほどペナルティ大）
 
 RW_HIDE_SEEKER_GAZE_PENALTY = _cfg("rw_hide_seeker_gaze_penalty", "0.03", float, RUNTIME_OVERRIDES) # HiderがSeekerの視界に入っている場合のペナルティ（Hider専用、Seekerの視界に入っているほどペナルティ大）
-RW_SEEK_GAZE_REWARD = _cfg("c", "0.03", float, RUNTIME_OVERRIDES) # SeekerがHiderを視界に捉えている場合の報酬（Seeker専用、視界に入っているほど報酬大）
+RW_SEEK_GAZE_REWARD = _cfg("c", "0.0", float, RUNTIME_OVERRIDES) # Seeker gaze reward disabled (gaze_cos moved to environment base reward)
 
 # --- 速度・回転の閾値（TOMLで設定可） ---
 IDLE_SPEED_THRESHOLD = _cfg("idle_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値

@@ -43,7 +43,7 @@ class AgentSchema:
         self.VEL_Y: Final = start + 3
         self.QUAT_0: Final = start + 4  # cos(rot)
         self.QUAT_1: Final = start + 5  # sin(rot)
-        self.IS_MOVING: Final = start + 6
+        self.BEING_HIT: Final = start + 6
         self.VISIBLE: Final = start + 7
 
 
