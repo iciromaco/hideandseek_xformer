@@ -26,7 +26,9 @@ def pretty_print(obs, env):
         for i,b in enumerate(idx.B):
             sl = b.SLICE
             vals = obs[sl]
-            # use relative indices within the slice
+            # Note: `IS_MOVING` here is an object-level flag (boxes/ramps).
+            # Agent-to-agent motion flag was removed and replaced by
+            # `BEING_HIT` in the agent schema; see `src/core/obs_indices.py`.
             print(f'box{i+1}: REL_X={vals[0]:.3f} REL_Y={vals[1]:.3f} VEL_X={vals[2]:.3f} IS_MOVING={vals[6]:.1f}')
 
     # RAMPS
@@ -35,6 +37,7 @@ def pretty_print(obs, env):
         for i,r in enumerate(idx.RAMP):
             sl = r.SLICE
             vals = obs[sl]
+            # `IS_MOVING` for ramps (object-level)
             print(f'ramp{i+1}: REL_X={vals[0]:.3f} REL_Y={vals[1]:.3f} IS_MOVING={vals[6]:.1f}')
 
     # OTHERS (agents)
@@ -43,7 +46,10 @@ def pretty_print(obs, env):
         for i,a in enumerate(idx.OTHERS):
             sl = a.SLICE
             vals = obs[sl]
-            print(f'agent[{i}]: REL_X={vals[0]:.3f} REL_Y={vals[1]:.3f} VEL_X={vals[2]:.3f} VISIBLE={int(vals[7])}')
+            # Agent schema fields: REL_X, REL_Y, VEL_X, VEL_Y, QUAT_0, QUAT_1, BEING_HIT, VISIBLE
+            being_hit = int(vals[6])
+            visible = int(vals[7])
+            print(f'agent[{i}]: REL_X={vals[0]:.3f} REL_Y={vals[1]:.3f} VEL_X={vals[2]:.3f} BEING_HIT={being_hit} VISIBLE={visible}')
 
 
 if __name__=='__main__':
