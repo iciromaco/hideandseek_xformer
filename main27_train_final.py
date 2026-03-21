@@ -8,7 +8,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from src.core.constants import P_SCALE
+from src.core.constants import P_SCALE, L_SCALE
 import gymnasium as gym
 from functools import partial
 from numba import njit, prange
@@ -354,6 +354,9 @@ RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("rw_hide_visible_near_penalty", "0.05", floa
 RW_HIDE_SEEKER_GAZE_PENALTY = _cfg("rw_hide_seeker_gaze_penalty", "0.03", float, RUNTIME_OVERRIDES) # HiderがSeekerの視界に入っている場合のペナルティ（Hider専用、Seekerの視界に入っているほどペナルティ大）
 RW_SEEK_GAZE_REWARD = _cfg("c", "0.0", float, RUNTIME_OVERRIDES) # Seeker gaze reward disabled (gaze_cos moved to environment base reward)
 
+# BEING_HIT（痛覚）に基づく離脱報酬係数（Hider用）
+RW_EVASION_BONUS = _cfg("rw_evasion_bonus_coeff", "0.05", float, RUNTIME_OVERRIDES)
+
 # --- 速度・回転の閾値（TOMLで設定可） ---
 IDLE_SPEED_THRESHOLD = _cfg("idle_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値
 MOVE_INCENTIVE_SPEED_THRESHOLD = _cfg("move_incentive_speed_threshold", "0.3", float, RUNTIME_OVERRIDES)  # インセンティブ速度閾値
@@ -457,6 +460,7 @@ def _build_reward_index_cache(idx):
         "enemy_rel_y": np.asarray([int(en.REL_Y) for en in idx.OTHERS], dtype=np.int32),
         "enemy_quat_0": np.asarray([int(en.QUAT_0) for en in idx.OTHERS], dtype=np.int32),
         "enemy_quat_1": np.asarray([int(en.QUAT_1) for en in idx.OTHERS], dtype=np.int32),
+        "enemy_being_hit": np.asarray([int(en.BEING_HIT) for en in idx.OTHERS], dtype=np.int32),
     }
 
 def _min_lidar_from_obs(obs, lidar_indices):
@@ -541,6 +545,7 @@ def _compute_custom_reward_batch_numba(
     enemy_rel_y_indices,
     enemy_quat_0_indices,
     enemy_quat_1_indices,
+    enemy_being_hit_indices,
     move_ctrl_cost,
     move_incentive,
     idle_penalty,
@@ -563,6 +568,7 @@ def _compute_custom_reward_batch_numba(
     rw_hide_seeker_gaze_penalty,
     rw_seek_gaze_reward,
     rw_seek_visible_bonus,
+    evasion_bonus_coeff,
     front_lidar_indices,
     agent_vz_batch
 ):
@@ -589,102 +595,74 @@ def _compute_custom_reward_batch_numba(
             bonus += move_incentive
             bonus -= move_sat_penalty * (next_speed - move_sat_threshold)
 
-        if np.abs(turn) > turn_sat_threshold:
-            bonus -= turn_sat_penalty
+        # --- 回転ペナルティ・インセンティブ（hider/seeker共通） ---
+        abs_turn = np.abs(turn)
+        
+        # 1. 飽和ペナルティ: 制御限界に近い回転にはブレーキをかける
+        if abs_turn > turn_sat_threshold:
+            bonus -= turn_sat_penalty * (abs_turn - turn_sat_threshold)
         else:
-            # 敵が見えていない場合は回転にインセンティブを与える
+            # 2. 探索インセンティブ: 敵が見えていない時だけ、周囲を見渡す動きを促す
             visible = False
             for j in range(enemy_visible_indices.shape[0]):
                 idx_vis = int(enemy_visible_indices[j])
                 if obs_batch[i, idx_vis] > 0.5:
                     visible = True
                     break
+            
             if not visible:
-                # rw_turn_incentive は小さな正の値を期待する（例: 0.01 程度）
-                bonus += rw_turn_incentive * np.abs(turn)
+                # 独楽回りを防ぐため、ここでも「低速な回転」に限定してボーナスを出す設計にする
+                # abs_turn が大きすぎない範囲で加点
+                bonus += rw_turn_incentive * abs_turn
 
-        # control_cost = -move_ctrl_cost * (move * move + turn * turn)
-        control_cost = 0.0 # 行動コストは一旦無効化（速度ペナルティと重複するため）
+        control_cost = -move_ctrl_cost * (move * move + turn * turn)
+        # control_cost = 0.0 # 行動コストは一旦無効化（速度ペナルティと重複するため）
 
-        # --- 壁張り付きペナルティ（hider/seeker共通, Python版に忠実に） ---
-        # 前方LiDAR最小値
-        lidar_min = 1.0
-        for idx_ in front_lidar_indices:
-            lidar_val = float(next_obs_batch[i, idx_])
-            if lidar_val < lidar_min:
-                lidar_min = lidar_val
-        # infoからz速度を取得し、正のz速度なら壁ペナルティをスキップ
-        skip_wall_penalty = False
-        if agent_vz_batch[i] > 0.02: # Z軸の速度が0.02以上なら上昇中とみなし、壁ペナルティをスキップ
-            skip_wall_penalty = True
 
-        if not skip_wall_penalty:
-            # --- 壁回避ペナルティ（hider/seeker共通, next_obsのwall_distance_batchに基づく） ---
-            wall_distance = wall_distance_batch[i] # infoから渡された壁距離（センサー先端までの距離）を使用
-            if wall_distance - agent_radius < wall_near_margin: # エージェント表面が壁近マージン内に入るとペナルティ開始、壁に近いほどペナルティ大
-                ratio = wall_distance / wall_near_margin # 壁近マージンに対する現在の距離の割合（0.0～1.0）
-                if ratio < 0.0:
-                    ratio = 0.0
-                elif ratio > 1.0:
-                    ratio = 1.0
-                bonus -= wall_avoid_penalty * (1.0 - ratio)  # 壁近マージン内に入るとペナルティが0からwall_avoid_penaltyまで線形に増加
-                # --- 壁張り付きペナルティ（hider/seeker共通） ---
-                # LiDAR値はセンサー先端までの距離なので、エージェント半径を引いて判定する 
+        # これにより、壁を乗り越えるための接近が「正解」として許容される
+        is_on_ramp_climbing = agent_vz_batch[i] > 0.02
 
-                TESTR = 2.0
+        if not is_on_ramp_climbing:
+            # wall_distance_batch: infoから渡される壁までの正確な距離
+            # agent_radius: エージェントの半径
+            dist_from_surface = wall_distance_batch[i] - agent_radius
+            wall_near_margin = 0.2  # ペナルティ開始境界
+
+            if dist_from_surface < wall_near_margin:
+                # 0.0（境界）から 1.0（接触）に向かって線形に増加する比率
+                ratio = 1.0 - (max(0.0, dist_from_surface) / wall_near_margin)
+                
+                # A. 基本の接近ペナルティ
+                bonus -= wall_avoid_penalty * ratio
+                
+                # B. 張り付き判定
+                # ジョイント修正により next_speed が正確なため、これだけでスタックを検知可能
                 if next_speed < still_speed_threshold:
-                    front_wall_near = ((lidar_min - agent_radius) < agent_head_clearance) # 前方が壁近で速度が遅い（張り付き状態）かどうか
-                    pr = TESTR if front_wall_near else 1.0
-                    bonus -= pr * wall_stick_penalty * (1.0 - ratio)  # 壁近マージン内で速度が遅いほどペナルティが増加（壁に張り付いている状態を強くペナルティ）
+                    bonus -= wall_stick_penalty * ratio
 
-            elif wall_distance < wall_safe:
-                bonus -= (
-                    wall_avoid_penalty
-                    * (wall_safe - wall_distance)
-                    / (wall_safe - (agent_radius + wall_near_margin))
-                    / 2.0
-                )            
+            # BEING_HIT ブロックはランプ登り中でも有効にするため、ここでは処理を行わない
 
+        # --- BEING_HIT (pain) based evasion reward for Hider ---
+        if target_is_hider:
             for j in range(enemy_visible_indices.shape[0]):
-                idx_vis = int(enemy_visible_indices[j]) # 敵の可視インデックス
-                if obs_batch[i, idx_vis] > 0.5: # 敵が可視な場合
-                    idx_x = int(enemy_rel_x_indices[j]) # 敵の相対Xインデックス
-                    idx_y = int(enemy_rel_y_indices[j]) # 敵の相対Yインデックス
-                    # 正規化値→ワールド座標スケールに変換
-                    dx = float(next_obs_batch[i, idx_x])  # Seekerから見た敵の相対X座標
-                    dy = float(next_obs_batch[i, idx_y])  # Seekerから見た敵の相対Y座標
-                    dist_norm = np.sqrt(dx * dx + dy * dy)  # ノーマライズされた値
-                    dist = dist_norm * P_SCALE  # 実際の距離
-                    nearness = max(0.0, (2.0 - dist) / 2.0) # dist > 2.0 の時は０、dist=0のときは1.0の近さスコア
-                    # 共通：Seekerから見たHiderの相対座標
-                    dist2 = dist_norm + 1e-6 # ゼロ割防止の微小値
-                    if target_is_hider: 
-                        bonus -= rw_hide_visible_near_penalty * nearness
-                        if dist > 0.1:
-                            idx_quat_0 = int(enemy_quat_0_indices[j])
-                            idx_quat_1 = int(enemy_quat_1_indices[j])
-                            cos_theta = float(next_obs_batch[i, idx_quat_0])
-                            sin_theta = float(next_obs_batch[i, idx_quat_1])
-                            dir_to_hider_x = -dx / dist2
-                            dir_to_hider_y = -dy / dist2
-                            gaze_cos = cos_theta * dir_to_hider_x + sin_theta * dir_to_hider_y
-                            gaze_sin = cos_theta * dir_to_hider_y - sin_theta * dir_to_hider_x
-                            bonus -= rw_hide_seeker_gaze_penalty * (gaze_cos - abs(gaze_sin))
-                    else: # seekerの報酬は近さに応じたボーナス
-                        bonus += rw_seek_visible_bonus * nearness
-                        # Seeker視点でHiderが正面にいるほど報酬、横や後ろなら報酬なし
-                        # dist > 0.1 の時のみ角度報酬を計算
-                        if dist > 0.1:
-                            # Seekerの視線方向は常にX軸（1,0）と仮定
-                            gaze_cos = dx / dist2  # X軸との内積
-                            gaze_sin = dy / dist2  # Y軸成分
-                            # 正面（cos>0）の時のみ報酬
-                            if gaze_cos > 0:
-                                bonus += rw_seek_gaze_reward * (gaze_cos - abs(gaze_sin))
-                        
+                idx_vis = int(enemy_visible_indices[j])
+                visible = next_obs_batch[i, idx_vis]
+                being_hit = next_obs_batch[i, int(enemy_being_hit_indices[j])]
+                if visible < 0.5 and being_hit > 0.5:
+                    idx_x = int(enemy_rel_x_indices[j])
+                    idx_y = int(enemy_rel_y_indices[j])
+                    cur_dx = float(next_obs_batch[i, idx_x])
+                    cur_dy = float(next_obs_batch[i, idx_y])
+                    current_dist = np.sqrt(cur_dx * cur_dx + cur_dy * cur_dy) * P_SCALE
+                    prev_dx = float(obs_batch[i, idx_x])
+                    prev_dy = float(obs_batch[i, idx_y])
+                    prev_dist = np.sqrt(prev_dx * prev_dx + prev_dy * prev_dy) * P_SCALE
+                    if prev_dist < (L_SCALE * 0.9):
+                        dist_delta = current_dist - prev_dist
+                        bonus += evasion_bonus_coeff * dist_delta
+
         rewards[i] = float(base_reward_batch[i]) + bonus + control_cost
     return rewards
-
 
 def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info, reward_idx_cache=None):
     # obs, next_obs, action, base_reward はバッチまたは単一観測で渡される可能性がある。
@@ -724,6 +702,7 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
     enemy_rel_y_indices = cache["enemy_rel_y"]
     enemy_quat_0_indices = cache["enemy_quat_0"]
     enemy_quat_1_indices = cache["enemy_quat_1"]
+    enemy_being_hit_indices = cache["enemy_being_hit"]
     # 共通処理: 可視な敵の相対位置から距離・正規化近接量を計算して返す
     def _enemy_proximity(i, j):
         idx_vis = int(enemy_visible_indices[j])
@@ -1387,6 +1366,7 @@ def run_train_vector(
                         np.array(reward_idx_cache["enemy_rel_y"], dtype=np.int32),
                         np.array(reward_idx_cache["enemy_quat_0"], dtype=np.int32),
                         np.array(reward_idx_cache["enemy_quat_1"], dtype=np.int32),
+                                        np.array(reward_idx_cache["enemy_being_hit"], dtype=np.int32),
                         float(RW_MOVE_CTRL_COST),
                         float(RW_MOVE_INCENTIVE),
                         float(RW_IDLE_PENALTY),
