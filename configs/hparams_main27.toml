@@ -121,7 +121,7 @@ train_other_seeker_policy = "rule"
 use_custom_reward = false
 npc_only_debug = false
 auto_tune_hparams = false
-total_timesteps = 100_000
+total_timesteps = 100_000_000
 wandb_run_name = "wall_only_confirm_100K"
 # rw_move_sat_penalty = 0.02
 
