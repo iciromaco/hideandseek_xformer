@@ -1,22 +1,22 @@
 # mathのimportを明示的に追加
 import math
-from core.constants import P_SCALE, L_SCALE, R_SCALE, V_SCALE
+
 # src/envs/hns_environment.py
 # hns_environment.py v4.5９
-
-import math
 import gymnasium as gym
 import mujoco
 import mujoco.viewer
 import numpy as np
 import torch
-from numba import njit
 from gymnasium import spaces
+from numba import njit
 
-from core.visibility_engine import VisibilityEngine
-from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
+from agents.scripted_agents import RuleBasedHider, RuleBasedSeeker
+from core.constants import L_SCALE, P_SCALE, R_SCALE, V_SCALE
 from core.obs_indices import ObsIdx
+from core.visibility_engine import VisibilityEngine
 from models.ppo_transformer_v2 import AgentV2
+
 
 # --- DebugLoggerクラス ---
 class DebugLogger:
@@ -40,6 +40,7 @@ class DebugLogger:
 
     def clear_policy_source_log(self):
         self._policy_source_logged.clear()
+
 
 def _euler_z_to_quat(yaw):
     """Z軸回転角からクォータニオン文字列を生成。"""
@@ -106,15 +107,15 @@ class TeamCosEnv(gym.Env):
         self._debug_hide_buffer = []
         self._debug_wall_distance_buffer = []
         self._debug_step_counter = 0
-        self._debug_log_interval = getattr(self, 'debug_logger', None) and getattr(self.debug_logger, 'log_interval_steps', 100) or 100
+        self._debug_log_interval = getattr(self, "debug_logger", None) and getattr(self.debug_logger, "log_interval_steps", 100) or 100
 
     def _debug_collect_stats(self, reward, info):
         if not self.debug_mode:
             return
         self._debug_reward_buffer.append(reward)
         # 隠れ率: is_detected==False なら隠れているとみなす
-        self._debug_hide_buffer.append(0 if info.get('is_detected', False) else 1)
-        wd = info.get('wall_distance', None)
+        self._debug_hide_buffer.append(0 if info.get("is_detected", False) else 1)
+        wd = info.get("wall_distance", None)
         if wd is not None:
             if isinstance(wd, (list, tuple, np.ndarray)):
                 self._debug_wall_distance_buffer.extend([float(v) for v in wd])
@@ -128,7 +129,6 @@ class TeamCosEnv(gym.Env):
     def _debug_print_stats(self):
         if not self.debug_mode:
             return
-        n = max(len(self._debug_reward_buffer), 1)
         avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
         hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
         wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
@@ -177,14 +177,24 @@ class TeamCosEnv(gym.Env):
     # tunable class attribute avoids editing code logic elsewhere.
     INFERENCE_FORWARD_SIGN = 1.0
 
-    def __init__(self, mode="initial", target="hider", n_seekers=1,
-                 n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None,
-                 inference_policies=None, show_turn_lines=True,
-                 policy_source_log=False, policy_source_log_each_reset=False,
-                 debug_log_interval_steps=200,
-                 mode4_sdf_cell_size=0.05,
-                 debug_mode=False,
-                 action_repeat=16):
+    def __init__(
+        self,
+        mode="initial",
+        target="hider",
+        n_seekers=1,
+        n_hiders=2,
+        n_boxes=2,
+        n_ramps=1,
+        render_mode=None,
+        inference_policies=None,
+        show_turn_lines=True,
+        policy_source_log=False,
+        policy_source_log_each_reset=False,
+        debug_log_interval_steps=200,
+        mode4_sdf_cell_size=0.05,
+        debug_mode=False,
+        action_repeat=16,
+    ):
         super().__init__()
         self.n_seekers = int(n_seekers)
         self.n_hiders = int(n_hiders)
@@ -208,9 +218,7 @@ class TeamCosEnv(gym.Env):
             self.seeker_keys = [f"s{i}" for i in range(1, self.n_seekers + 1)]
         self.hider_keys = [f"h{i}" for i in range(1, self.n_hiders + 1)]
         self.agent_keys = self.seeker_keys + self.hider_keys
-        self.learnable_agent_key = (
-            self.seeker_keys[0] if target == "seeker" else self.hider_keys[0]
-        )
+        self.learnable_agent_key = self.seeker_keys[0] if target == "seeker" else self.hider_keys[0]
         self.learnable_agent_index = self.agent_keys.index(self.learnable_agent_key)
         self.idx = ObsIdx(n_boxes, n_ramps, n_others=len(self.agent_keys) - 1)
 
@@ -234,30 +242,37 @@ class TeamCosEnv(gym.Env):
         self.override_learnable_policy = False
         self.model_policy_deterministic = True
         # デバッグ用ロガーに移譲
-        
-        self.last_debug_ctrl = {k: (0.0, 0.0) for k in self.agent_keys}
-        
+
+        self.last_debug_ctrl = dict.fromkeys(self.agent_keys, (0.0, 0.0))
+
         self.body_ids, self.qpos_indices, self.actuator_ids = {}, {}, {}
         self.obj_body_map = {}
         self.obj_geom_ids = {}
         self.obj_default_rgba = {}
-        self.maze_walls = [(3, 1.5, 1.5, 0.2), (-3, -1.5, 1.5, 0.2),
-                          (0, -3, 0.2, 1.5), (0, 3, 0.2, 1.5)]
+        self.maze_walls = [
+            (3, 1.5, 1.5, 0.2),
+            (-3, -1.5, 1.5, 0.2),
+            (0, -3, 0.2, 1.5),
+            (0, 3, 0.2, 1.5),
+        ]
         s = self.ARENA_HALF
-        self.static_wall_aabbs = np.asarray([
-            (0.0, 6.1, s + 0.15, 0.1),
-            (0.0, -6.1, s + 0.15, 0.1),
-            (6.1, 0.0, 0.1, s),
-            (-6.1, 0.0, 0.1, s),
-            *self.maze_walls,
-        ], dtype=np.float64)
+        self.static_wall_aabbs = np.asarray(
+            [
+                (0.0, 6.1, s + 0.15, 0.1),
+                (0.0, -6.1, s + 0.15, 0.1),
+                (6.1, 0.0, 0.1, s),
+                (-6.1, 0.0, 0.1, s),
+                *self.maze_walls,
+            ],
+            dtype=np.float64,
+        )
         self._analyze_structure()
         self._init_agent_intelligence()
         self._init_interaction_state()
-        
+
         # 観測空間
         self.observation_space = spaces.Box(-np.inf, np.inf, (self.idx.total_dim,), np.float32)
-        
+
         # 【修正】アクションスペースを 4 次元に固定。
         # 外部（学習アルゴリズム）からは常に 1 体分の入力を受け取る。
         self.action_space = spaces.Box(-1.0, 1.0, (4,), np.float32)
@@ -309,8 +324,6 @@ class TeamCosEnv(gym.Env):
         self.model_policy_deterministic = bool(enabled)
         return True
 
-    
-
     def _ensure_policy_history(self, agent_key, seq_len):
         sl = int(seq_len)
         obs_dim = int(self.observation_space.shape[0])
@@ -349,7 +362,7 @@ class TeamCosEnv(gym.Env):
             hist = self._ensure_policy_history(agent_key, seq_len)
         ptr = int(hist["ptr"])
         sl = int(seq_len)
-        return hist["buffer"][ptr:ptr + sl]
+        return hist["buffer"][ptr : ptr + sl]
 
     def _build_dynamic_xml(self):
         arena = self._xml_static_scene()
@@ -360,7 +373,7 @@ class TeamCosEnv(gym.Env):
                 ak,
                 [0, 0],
                 0,
-                (1.0, 0.35, 0.35) if ak == self.learnable_agent_key else (0.75, 0.10, 0.10),
+                ((1.0, 0.35, 0.35) if ak == self.learnable_agent_key else (0.75, 0.10, 0.10)),
             )
             for ak in self.seeker_keys
         )
@@ -369,19 +382,19 @@ class TeamCosEnv(gym.Env):
                 ak,
                 [0, 0],
                 0,
-                (0.35, 0.7, 1.0) if ak == self.learnable_agent_key else (0.1, 0.2 + 0.4 * (i % 2), 0.9),
+                ((0.35, 0.7, 1.0) if ak == self.learnable_agent_key else (0.1, 0.2 + 0.4 * (i % 2), 0.9)),
             )
             for i, ak in enumerate(self.hider_keys)
         )
         acts = "".join(self._xml_actuators(ak) for ak in self.agent_keys)
-        
+
         return f"""
 <mujoco>
   <option gravity="0 0 -9.81" timestep="0.005"/>
-  <asset>
+    <asset>
     <texture name="grid" type="2d" builtin="checker" rgb1=".1 .2 .3" rgb2=".2 .3 .4" width="300" height="300"/>
     <material name="grid" texture="grid" texrepeat="1 1" reflectance="0.2"/>
-    <mesh name="ramp_mesh" 
+    <mesh name="ramp_mesh"
           vertex="-0.6666 -0.5 0.0 0.6666 -0.5 0.0 0.6666 -0.5 1.0 -0.6666 0.5 0.0 0.6666 0.5 0.0 0.6666 0.5 1.0"
           face="0 1 2 3 5 4 0 3 4 0 4 1 1 4 5 1 5 2 2 5 3 2 3 0"/>
   </asset>
@@ -398,8 +411,8 @@ class TeamCosEnv(gym.Env):
         attr = 'friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"'
         return f"""
     <geom name="floor" type="plane" size="{s} {s} 0.1" material="grid" friction="1.1 0.15 0.003"/>
-    <geom name="wall_n" type="box" size="{s+0.15} 0.1 2.0" pos="0 6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
-    <geom name="wall_s" type="box" size="{s+0.15} 0.1 2.0" pos="0 -6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
+    <geom name="wall_n" type="box" size="{s + 0.15} 0.1 2.0" pos="0 6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
+    <geom name="wall_s" type="box" size="{s + 0.15} 0.1 2.0" pos="0 -6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
     <geom name="wall_e" type="box" size="0.1 {s} 2.0" pos="6.1 0 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
     <geom name="wall_w" type="box" size="0.1 {s} 2.0" pos="-6.1 0 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
     <geom name="maze_w0" type="box" size="1.5 0.2 0.5" pos="3.0 1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
@@ -456,10 +469,10 @@ class TeamCosEnv(gym.Env):
         for ak in self.agent_keys:
             self.body_ids[ak] = m.body(f"{ak}_body").id
             self.qpos_indices[ak] = {
-                'x': m.joint(f"{ak}_x").id,
-                'y': m.joint(f"{ak}_y").id,
-                'z': m.joint(f"{ak}_z").id,
-                'rot': m.joint(f"{ak}_rot").id,
+                "x": m.joint(f"{ak}_x").id,
+                "y": m.joint(f"{ak}_y").id,
+                "z": m.joint(f"{ak}_z").id,
+                "rot": m.joint(f"{ak}_rot").id,
             }
             self.actuator_ids[f"{ak}_fwd"] = m.actuator(f"{ak}_fwd").id
             self.actuator_ids[f"{ak}_turn"] = m.actuator(f"{ak}_turn").id
@@ -481,10 +494,7 @@ class TeamCosEnv(gym.Env):
             self.agent_geom_ids[ak] = ids
             # store per-geom default rgba array list
             self.agent_default_rgba[ak] = cols
-        self.ramp_ids = [
-            m.body(f"ramp{i}_body").id
-            for i in range(1, self.n_ramps + 1)
-        ]
+        self.ramp_ids = [m.body(f"ramp{i}_body").id for i in range(1, self.n_ramps + 1)]
         self.ramp_keys = [f"ramp{i}" for i in range(1, self.n_ramps + 1)]
         self.box_ids = [m.body(f"box{i}_body").id for i in range(1, self.n_boxes + 1)]
         self.obj_body_map = {f"b{i}": bid for i, bid in enumerate(self.box_ids, start=1)}
@@ -493,15 +503,10 @@ class TeamCosEnv(gym.Env):
         self.obj_geom_ids = {f"b{i}": [m.geom(f"box{i}_geom").id] for i in range(1, self.n_boxes + 1)}
         for i in range(1, self.n_ramps + 1):
             self.obj_geom_ids[f"ramp{i}"] = [m.geom(f"ramp{i}_geom").id]
-        self.obj_default_rgba = {
-            k: m.geom_rgba[v[0]].copy() for k, v in self.obj_geom_ids.items()
-        }
+        self.obj_default_rgba = {k: m.geom_rgba[v[0]].copy() for k, v in self.obj_geom_ids.items()}
 
     def _init_agent_intelligence(self):
-        self.npcs = {
-            ak: (RuleBasedSeeker() if ak.startswith("s") else RuleBasedHider())
-            for ak in self.agent_keys
-        }
+        self.npcs = {ak: (RuleBasedSeeker() if ak.startswith("s") else RuleBasedHider()) for ak in self.agent_keys}
 
     def _init_interaction_state(self):
         self.object_state = {
@@ -515,7 +520,7 @@ class TeamCosEnv(gym.Env):
             for tk in self.obj_body_map
         }
         self.prev_action_btns = {ak: np.zeros(2, dtype=np.float32) for ak in self.agent_keys}
-        self.btn_cooldown = {ak: 0 for ak in self.agent_keys}
+        self.btn_cooldown = dict.fromkeys(self.agent_keys, 0)
 
     def _cache_planar_object_pose(self):
         for tk in self.obj_body_map:
@@ -524,7 +529,7 @@ class TeamCosEnv(gym.Env):
                 self.object_state[tk]["planar_z"] = 0.0
             else:
                 self.object_state[tk]["planar_z"] = 0.5
-            self.object_state[tk]["planar_quat"] = self.data.qpos[qadr + 3:qadr + 7].copy()
+            self.object_state[tk]["planar_quat"] = self.data.qpos[qadr + 3 : qadr + 7].copy()
 
     def _obj_addr(self, obj_key):
         bid = self.obj_body_map[obj_key]
@@ -536,7 +541,7 @@ class TeamCosEnv(gym.Env):
         qlen = self.data.qvel.shape[0]
         vx = self.data.qvel[vadr] if vadr < qlen else 0.0
         vy = self.data.qvel[vadr + 1] if (vadr + 1) < qlen else 0.0
-        return math.sqrt(vx ** 2 + vy ** 2)
+        return math.sqrt(vx**2 + vy**2)
 
     def _ramp_uphill_dir(self, rid):
         quat = self.data.xquat[rid]
@@ -555,10 +560,7 @@ class TeamCosEnv(gym.Env):
             return False
         # 静止しているランプが壁・箱に背中を預けているかを簡易判定
         margin = 0.9
-        if (
-            abs(rpos[0]) > self.ARENA_HALF - margin
-            or abs(rpos[1]) > self.ARENA_HALF - margin
-        ):
+        if abs(rpos[0]) > self.ARENA_HALF - margin or abs(rpos[1]) > self.ARENA_HALF - margin:
             return True
         for bx in self.box_ids:
             if np.linalg.norm(self.data.xpos[bx][:2] - rpos) < 1.7:
@@ -570,7 +572,7 @@ class TeamCosEnv(gym.Env):
 
     def _ramp_boost_gain(self, ak):
         apos = self.data.xpos[self.body_ids[ak]][:2]
-        arot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]['rot']]]
+        arot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]]
         afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
         gain = 0.0
         for i, rid in enumerate(self.ramp_ids, start=1):
@@ -594,7 +596,7 @@ class TeamCosEnv(gym.Env):
 
     def _stabilize_agent_vertical_motion(self):
         for ak in self.agent_keys:
-            jz = self.qpos_indices[ak]['z']
+            jz = self.qpos_indices[ak]["z"]
             qz_adr = self.model.jnt_qposadr[jz]
             vz_adr = self.model.jnt_dofadr[jz]
             z = float(self.data.qpos[qz_adr])
@@ -615,18 +617,20 @@ class TeamCosEnv(gym.Env):
                     self.data.qvel[vz_adr] = -self.AGENT_MAX_VZ
 
     def _interaction_blocked_by_static_walls(self, p1, p2):
-        return bool(_blocked_by_static_walls_numba(
-            float(p1[0]),
-            float(p1[1]),
-            float(p2[0]),
-            float(p2[1]),
-            self.static_wall_aabbs,
-            float(self.INTERACT_OCCLUSION_MARGIN),
-        ))
+        return bool(
+            _blocked_by_static_walls_numba(
+                float(p1[0]),
+                float(p1[1]),
+                float(p2[0]),
+                float(p2[1]),
+                self.static_wall_aabbs,
+                float(self.INTERACT_OCCLUSION_MARGIN),
+            )
+        )
 
     def _select_target(self, ak, for_grab=False):
         apos = self.data.xpos[self.body_ids[ak]][:2]
-        rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]['rot']]]
+        rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]]
         fwd = np.array([math.cos(rot), math.sin(rot)], dtype=np.float32)
         aid = self.body_ids[ak]
         best_key, best_dist = None, 1e9
@@ -643,9 +647,7 @@ class TeamCosEnv(gym.Env):
                 continue
             if for_grab and float(np.dot(fwd, rel)) <= -0.2:
                 continue
-            if not self.vis_engine.is_visible(
-                apos, opos, body_exclude=aid, target_body_id=bid
-            ):
+            if not self.vis_engine.is_visible(apos, opos, body_exclude=aid, target_body_id=bid):
                 continue
             if dist < best_dist:
                 best_key, best_dist = tk, dist
@@ -669,7 +671,7 @@ class TeamCosEnv(gym.Env):
         if st["mode"] in ("free", "grabbed") and (st["owner"] is None or st["owner"] == ak):
             st["mode"] = "locked"
             st["owner"] = ak
-            st["locked_pose"] = self.data.qpos[qadr:qadr+7].copy()
+            st["locked_pose"] = self.data.qpos[qadr : qadr + 7].copy()
             return True
         return False
 
@@ -684,9 +686,7 @@ class TeamCosEnv(gym.Env):
             cpos = self.data.xpos[cid][:2]
             if self._interaction_blocked_by_static_walls(apos, cpos):
                 return False
-            if not self.vis_engine.is_visible(
-                apos, cpos, body_exclude=aid, target_body_id=cid
-            ):
+            if not self.vis_engine.is_visible(apos, cpos, body_exclude=aid, target_body_id=cid):
                 return False
 
         if cur is not None and (tk is None or tk == cur):
@@ -722,7 +722,6 @@ class TeamCosEnv(gym.Env):
             self.btn_cooldown[ak] = self.BTN_COOLDOWN
             return False, grab_evt
         return False, False
-
 
     # ---
     # 旧実装: 複雑なGrab/Lock拘束ロジック
@@ -793,7 +792,7 @@ class TeamCosEnv(gym.Env):
         """
         # --- 定数定義 ---
         POSE_SIZE = 7  # qposのpose成分長
-        VEL_SIZE = 6   # qvelの成分長
+        VEL_SIZE = 6  # qvelの成分長
         XY_START, XY_STOP = 0, 2  # x, y成分
         Z_IDX = 2
         QUAT_START, QUAT_STOP = 3, 7
@@ -807,31 +806,28 @@ class TeamCosEnv(gym.Env):
         for tk, st in self.object_state.items():
             qadr, vadr = self._obj_addr(tk)
             if st["mode"] == "locked" and st["locked_pose"] is not None:
-                self.data.qpos[qadr:qadr+POSE_SIZE] = st["locked_pose"]
-                self.data.qvel[vadr:vadr+VEL_SIZE] = 0.0
+                self.data.qpos[qadr : qadr + POSE_SIZE] = st["locked_pose"]
+                self.data.qvel[vadr : vadr + VEL_SIZE] = 0.0
             elif st["mode"] == "grabbed" and st["owner"] is not None:
                 owner = st["owner"]
                 opos = self.data.xpos[self.body_ids[owner]][XY_START:XY_STOP]
-                cur_xy = self.data.qpos[qadr:qadr+POSE_SIZE][XY_START:XY_STOP].copy()
+                cur_xy = self.data.qpos[qadr : qadr + POSE_SIZE][XY_START:XY_STOP].copy()
                 # --- 距離・壁判定によるgrab解除 ---
                 grab_dist = float(np.linalg.norm(cur_xy - opos))
-                if (
-                    grab_dist > self.GRAB_BREAK_DIST or
-                    self._interaction_blocked_by_static_walls(opos, cur_xy)
-                ):
+                if grab_dist > self.GRAB_BREAK_DIST or self._interaction_blocked_by_static_walls(opos, cur_xy):
                     st["mode"] = "free"
                     st["owner"] = None
-                    self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP] *= 0.5
+                    self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP] *= 0.5
                     continue
                 err_xy = opos - cur_xy
-                self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = err_xy  # 速度を直接目標方向に
-                self.data.qvel[vadr:vadr+VEL_SIZE][Z_VEL_IDX] = 0.0
-                self.data.qvel[vadr:vadr+VEL_SIZE][ANG_VEL_START:ANG_VEL_STOP] = 0.0
+                self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = err_xy  # 速度を直接目標方向に
+                self.data.qvel[vadr : vadr + VEL_SIZE][Z_VEL_IDX] = 0.0
+                self.data.qvel[vadr : vadr + VEL_SIZE][ANG_VEL_START:ANG_VEL_STOP] = 0.0
             else:
-                self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP] *= 0.9
-                speed_xy = float(np.linalg.norm(self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP]))
+                self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP] *= 0.9
+                speed_xy = float(np.linalg.norm(self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP]))
                 if speed_xy < 1e-3:
-                    self.data.qvel[vadr:vadr+VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = 0.0
+                    self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = 0.0
             # Planar lock
             if self.OBJECT_PLANAR_LOCK and st.get("planar_z") is not None:
                 self.data.qpos[qadr + Z_IDX] = st["planar_z"]
@@ -881,12 +877,7 @@ class TeamCosEnv(gym.Env):
             except Exception:
                 pass
 
-        if (
-            self.shared_team_policy
-            and self.shared_policy_model is not None
-            and agent_key != self.learnable_agent_key
-            and agent_key.startswith(self.shared_team_prefix)
-        ):
+        if self.shared_team_policy and self.shared_policy_model is not None and agent_key != self.learnable_agent_key and agent_key.startswith(self.shared_team_prefix):
             self._log_policy_source(agent_key, "shared_model")
             seq_np = self._get_policy_history_seq(agent_key, self.shared_policy_seq_len, norm_obs)
             seq_t = torch.as_tensor(seq_np[None, :, :], dtype=torch.float32)
@@ -907,7 +898,6 @@ class TeamCosEnv(gym.Env):
             return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
         return float(arr[0]), float(arr[1]), 0.0, 0.0
 
-
     def _log_policy_source(self, agent_key, source):
         if not self.debug_mode:
             return
@@ -927,7 +917,7 @@ class TeamCosEnv(gym.Env):
             if abs(px - wx) <= (sx + radius + margin) and abs(py - wy) <= (sy + radius + margin):
                 return False
         # static_wall_aabbs（外壁・内壁）との重なりチェック
-        for cx, cy, hx, hy in getattr(self, 'static_wall_aabbs', []):
+        for cx, cy, hx, hy in getattr(self, "static_wall_aabbs", []):
             if abs(px - cx) <= (hx + radius + margin) and abs(py - cy) <= (hy + radius + margin):
                 return False
         for pp, pr in placed:
@@ -953,7 +943,7 @@ class TeamCosEnv(gym.Env):
                 p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
                 if self._is_spawn_position_valid(p, rad, placed, margin=0.2):
                     adr = self.model.jnt_qposadr[self.model.body_jntadr[bid]]
-                    self.data.qpos[adr:adr+7] = [p[0], p[1], z, 1, 0, 0, 0]
+                    self.data.qpos[adr : adr + 7] = [p[0], p[1], z, 1, 0, 0, 0]
                     placed.append((p, rad))
                     # ランプのみx, y出力とqpos値も出力
                     # if (bid, rad, z) in ramp_specs:
@@ -962,17 +952,19 @@ class TeamCosEnv(gym.Env):
                     break
         for ak in self.agent_keys:
             for _ in range(500):
-                p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2); rot = np.random.uniform(-np.pi, np.pi)
+                p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
+                rot = np.random.uniform(-np.pi, np.pi)
                 if self._is_spawn_position_valid(p, self.R_AGENT, placed, margin=0.3):
-                    jx = self.qpos_indices[ak]['x']
-                    jy = self.qpos_indices[ak]['y']
-                    jz = self.qpos_indices[ak]['z']
-                    jr = self.qpos_indices[ak]['rot']
+                    jx = self.qpos_indices[ak]["x"]
+                    jy = self.qpos_indices[ak]["y"]
+                    jz = self.qpos_indices[ak]["z"]
+                    jr = self.qpos_indices[ak]["rot"]
                     self.data.qpos[self.model.jnt_qposadr[jx]] = p[0]
                     self.data.qpos[self.model.jnt_qposadr[jy]] = p[1]
                     self.data.qpos[self.model.jnt_qposadr[jz]] = 0.5
                     self.data.qpos[self.model.jnt_qposadr[jr]] = rot
-                    placed.append((p, self.R_AGENT)); break
+                    placed.append((p, self.R_AGENT))
+                    break
         mujoco.mj_forward(self.model, self.data)
         self._cache_planar_object_pose()
 
@@ -986,11 +978,7 @@ class TeamCosEnv(gym.Env):
                     int(self._inference_seq_lens.get(ak, 8)),
                     norm_obs,
                 )
-            if (
-                self.shared_team_policy
-                and self.shared_policy_model is not None
-                and ak.startswith(self.shared_team_prefix)
-            ):
+            if self.shared_team_policy and self.shared_policy_model is not None and ak.startswith(self.shared_team_prefix):
                 self._prime_policy_history(ak, self.shared_policy_seq_len, norm_obs)
 
         idx_to_obs = self.learnable_agent_index
@@ -998,11 +986,11 @@ class TeamCosEnv(gym.Env):
         # wall_distance を計算
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
         learnable_agent_pos = self.data.xpos[learnable_agent_body_id]
-        wall_dist = self.vis_engine.wall_distance(
-            learnable_agent_pos[0], 
-            learnable_agent_pos[1]
-        )
-        return self._normalize_obs(self._get_obs(idx_to_obs)), {"is_detected": False, "wall_distance": wall_dist}
+        wall_dist = self.vis_engine.wall_distance(learnable_agent_pos[0], learnable_agent_pos[1])
+        return self._normalize_obs(self._get_obs(idx_to_obs)), {
+            "is_detected": False,
+            "wall_distance": wall_dist,
+        }
 
     def step(self, action):
         self.current_step += 1
@@ -1016,11 +1004,10 @@ class TeamCosEnv(gym.Env):
         max_lock_btn = 0.0
         max_grab_btn = 0.0
         boosted_agents = 0
-        applied_forward_learnable = 0.0
         # keep both the raw model forward and the actual applied forward (after any inference-only transform)
         applied_forward_model = 0.0
         applied_forward_env = 0.0
-        
+
         for i, ak in enumerate(self.agent_keys):
             is_seeker = ak.startswith("s")
             if ak == self.learnable_agent_key:
@@ -1066,7 +1053,7 @@ class TeamCosEnv(gym.Env):
             lock_evt, grab_evt = self._handle_buttons(ak, lck, grb)
             any_lock_event = any_lock_event or lock_evt
             any_grab_event = any_grab_event or grab_evt
-            
+
             # For inference-only compatibility: some checkpoints were trained with the
             # opposite sign convention for the forward channel. Apply a runtime-only
             # transform controlled by `INFERENCE_FORWARD_SIGN` so this behavior can be
@@ -1077,9 +1064,12 @@ class TeamCosEnv(gym.Env):
                 f_env = float(f)
 
             applied_forward_env = f_env
-            cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = f_env, t
+            cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = (
+                f_env,
+                t,
+            )
             self.last_debug_ctrl[ak] = (f_env, t)
-            
+
         self.data.ctrl[:] = cv
         for _ in range(self.action_repeat):
             mujoco.mj_step(self.model, self.data)
@@ -1091,14 +1081,8 @@ class TeamCosEnv(gym.Env):
         ramp_speeds = [self._body_speed_xy(rid) for rid in self.ramp_ids]
         moving_box_count = int(sum(1 for v in box_speeds if v > 0.06))
         moving_ramp_count = int(sum(1 for v in ramp_speeds if v > 0.06))
-        blocked_ramp_count = int(
-            sum(
-                1
-                for i, rid in enumerate(self.ramp_ids, start=1)
-                if self._is_ramp_blocked_or_locked(f"ramp{i}", rid)
-            )
-        )
-        
+        blocked_ramp_count = int(sum(1 for i, rid in enumerate(self.ramp_ids, start=1) if self._is_ramp_blocked_or_locked(f"ramp{i}", rid)))
+
         rb, find, gaze_cos_front_max, gaze_dist_max, learnable_hider_seen = self._compute_team_reward()
 
         for i, ak in enumerate(self.agent_keys):
@@ -1111,11 +1095,7 @@ class TeamCosEnv(gym.Env):
                     int(self._inference_seq_lens.get(ak, 8)),
                     norm_obs_next,
                 )
-            if (
-                self.shared_team_policy
-                and self.shared_policy_model is not None
-                and ak.startswith(self.shared_team_prefix)
-            ):
+            if self.shared_team_policy and self.shared_policy_model is not None and ak.startswith(self.shared_team_prefix):
                 self._update_policy_history(ak, self.shared_policy_seq_len, norm_obs_next)
 
         # 学習対象に合わせて観測を生成
@@ -1124,20 +1104,17 @@ class TeamCosEnv(gym.Env):
         # 壁までの最短距離を計算
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
         learnable_agent_pos = self.data.xpos[learnable_agent_body_id]
-        wall_dist = self.vis_engine.wall_distance(
-               learnable_agent_pos[0], 
-               learnable_agent_pos[1]
-        )
-        
+        wall_dist = self.vis_engine.wall_distance(learnable_agent_pos[0], learnable_agent_pos[1])
+
         # z方向速度をinfoに追加
-        jz = self.qpos_indices[self.learnable_agent_key]['z']
+        jz = self.qpos_indices[self.learnable_agent_key]["z"]
         vz_idx = self.model.jnt_dofadr[jz]
         agent_vz = float(self.data.qvel[vz_idx])
         # xy 速度と直近コントロールも取得して info に含める
         # Use stored joint indices for the learnable agent (joints live on the
         # "{agent}_anchor" body). Avoid using model.body_jntadr on the child
         # body, which can yield the next body's joint adr.
-        jx = self.qpos_indices[self.learnable_agent_key]['x']
+        jx = self.qpos_indices[self.learnable_agent_key]["x"]
         vadr = self.model.jnt_dofadr[jx]
         qlen = self.data.qvel.shape[0]
         agent_vx = float(self.data.qvel[vadr]) if vadr < qlen else 0.0
@@ -1183,7 +1160,7 @@ class TeamCosEnv(gym.Env):
             "applied_forward": applied_forward_env,
         }
         self._debug_collect_stats(reward, info)
-        
+
         return obs, reward, False, done, info
 
     def _compute_team_reward(self):
@@ -1194,7 +1171,7 @@ class TeamCosEnv(gym.Env):
         """
         if self.current_step <= self.prep_steps:
             return 0.0, False, 0.0, 0.0, False
-        
+
         total_hider_reward = 0.0
         any_hider_seen = False
         gaze_cos_front_max = 0.0
@@ -1205,16 +1182,16 @@ class TeamCosEnv(gym.Env):
             hid = self.body_ids[hk]
             hpos = self.data.xpos[hid][:2]
             h_reward = 0.05  # 基本生存ボーナス
-            
+
             for sk in self.seeker_keys:
                 sid = self.body_ids[sk]
                 spos = self.data.xpos[sid][:2]
-                srot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[sk]['rot']]]
+                srot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[sk]["rot"]]]
 
                 dx, dy = float(hpos[0] - spos[0]), float(hpos[1] - spos[1])
                 dist = math.sqrt(dx * dx + dy * dy)
                 dist_m = dist + 1e-8
-                
+
                 # 正面度 (gaze_cos)
                 cos_align = (math.cos(srot) * (dx / dist_m)) + (math.sin(srot) * (dy / dist_m))
                 frontness = max(float(cos_align), 0.0)
@@ -1223,52 +1200,79 @@ class TeamCosEnv(gym.Env):
                 if self._is_vis(spos, srot, hpos, sid, hid):
                     any_hider_seen = True
                     # 捕捉の質に基づく報酬 (Seeker:+, Hider:-)
-                    capture_reward = frontness / (dist + 0.5) 
+                    capture_reward = frontness / (dist + 0.5)
                     h_reward -= capture_reward
 
                     if sk == self.learnable_agent_key or hk == self.learnable_agent_key:
                         learnable_hider_seen_flag = True
-                    
+
                     gaze_cos_front_max = max(gaze_cos_front_max, frontness)
                     gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, capture_reward)
 
             total_hider_reward += h_reward
 
-        return total_hider_reward / len(self.hider_keys), any_hider_seen, gaze_cos_front_max, gaze_cos_front_dist_max, learnable_hider_seen_flag   
+        return (
+            total_hider_reward / len(self.hider_keys),
+            any_hider_seen,
+            gaze_cos_front_max,
+            gaze_cos_front_dist_max,
+            learnable_hider_seen_flag,
+        )
 
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
-        rel = t_pos - pos; dist = math.sqrt(np.sum(rel**2)) + 1e-8
-        if dist > L_SCALE or (math.cos(rot)*(rel[0]/dist) + math.sin(rot)*(rel[1]/dist)) < 0.38: return False
+        rel = t_pos - pos
+        dist = math.sqrt(np.sum(rel**2)) + 1e-8
+        if dist > L_SCALE or (math.cos(rot) * (rel[0] / dist) + math.sin(rot) * (rel[1] / dist)) < 0.38:
+            return False
         return self.vis_engine.is_visible(pos, t_pos, body_exclude=my_id, target_body_id=t_id)
 
     def _normalize_obs(self, o):
-        v = o.copy(); idx = self.idx
-        v[idx.SELF.VEL_X] /= V_SCALE; v[idx.SELF.VEL_Y] /= V_SCALE; v[idx.SELF.ROT] /= R_SCALE; v[idx.LIDAR] /= L_SCALE
-        for b in idx.B: v[b.REL_X] /= P_SCALE; v[b.REL_Y] /= P_SCALE; v[b.VEL_X] /= V_SCALE; v[b.VEL_Y] /= V_SCALE
-        for r in idx.RAMP: v[r.REL_X] /= P_SCALE; v[r.REL_Y] /= P_SCALE; v[r.VEL_X] /= V_SCALE; v[r.VEL_Y] /= V_SCALE
-        for en in idx.OTHERS: v[en.REL_X] /= P_SCALE; v[en.REL_Y] /= P_SCALE; v[en.VEL_X] /= V_SCALE; v[en.VEL_Y] /= V_SCALE
+        v = o.copy()
+        idx = self.idx
+        v[idx.SELF.VEL_X] /= V_SCALE
+        v[idx.SELF.VEL_Y] /= V_SCALE
+        v[idx.SELF.ROT] /= R_SCALE
+        v[idx.LIDAR] /= L_SCALE
+        for b in idx.B:
+            v[b.REL_X] /= P_SCALE
+            v[b.REL_Y] /= P_SCALE
+            v[b.VEL_X] /= V_SCALE
+            v[b.VEL_Y] /= V_SCALE
+        for r in idx.RAMP:
+            v[r.REL_X] /= P_SCALE
+            v[r.REL_Y] /= P_SCALE
+            v[r.VEL_X] /= V_SCALE
+            v[r.VEL_Y] /= V_SCALE
+        for en in idx.OTHERS:
+            v[en.REL_X] /= P_SCALE
+            v[en.REL_Y] /= P_SCALE
+            v[en.VEL_X] /= V_SCALE
+            v[en.VEL_Y] /= V_SCALE
         return v
 
     def _get_obs(self, idx):
         """
-        観測情報の生成: 
+        観測情報の生成:
         名前ベースの絶対インデックス参照により、情報の取り違えとIndexErrorを完全に排除。
         """
         o = np.zeros(self.idx.total_dim, dtype=np.float32)
         ak, m, d = self.agent_keys[idx], self.model, self.data
-        ps, rv = d.xpos[self.body_ids[ak]], float(d.qpos[m.jnt_qposadr[self.qpos_indices[ak]['rot']]])
-        
+        ps, rv = (
+            d.xpos[self.body_ids[ak]],
+            float(d.qpos[m.jnt_qposadr[self.qpos_indices[ak]["rot"]]]),
+        )
+
         # 自己情報の速度 (名前から正確な位置を特定)
-        vax_self = m.jnt_dofadr[self.qpos_indices[ak]['x']]
-        vay_self = m.jnt_dofadr[self.qpos_indices[ak]['y']]
+        vax_self = m.jnt_dofadr[self.qpos_indices[ak]["x"]]
+        vay_self = m.jnt_dofadr[self.qpos_indices[ak]["y"]]
         cos_r, sin_r = math.cos(-rv), math.sin(-rv)
-        
+
         si = self.idx.SELF
         o[si.VEL_X] = d.qvel[vax_self] * cos_r - d.qvel[vay_self] * sin_r
         o[si.VEL_Y] = d.qvel[vax_self] * sin_r + d.qvel[vay_self] * cos_r
         o[si.ROT] = rv
         o[si.COS_ROT], o[si.SIN_ROT] = math.cos(rv), math.sin(rv)
-        
+
         # LiDAR
         gb = self._current_grabbed_by(ak)
         ignore_id = self.obj_body_map[gb] if gb else -1
@@ -1278,45 +1282,52 @@ class TeamCosEnv(gym.Env):
 
         # オブジェクト情報 (Box, Ramp) - 境界チェックを追加
         for i, tid in enumerate(self.box_ids):
-            b_idx = self.idx.B[i]; d_w = d.xpos[tid][:2] - ps[:2]
+            b_idx = self.idx.B[i]
+            d_w = d.xpos[tid][:2] - ps[:2]
             o[b_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r
             o[b_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r
             b_vadr = m.jnt_dofadr[m.body_jntadr[tid]]
             if b_vadr >= 0 and b_vadr + 1 < qvel_limit:
-                o[b_idx.IS_MOVING] = 1.0 if math.sqrt(d.qvel[b_vadr]**2 + d.qvel[b_vadr+1]**2) > 0.05 else 0.0
-            o[b_idx.IS_LOCKED] = 1.0 if self.object_state[f"b{i+1}"]["mode"] == "locked" else 0.0
+                o[b_idx.IS_MOVING] = 1.0 if math.sqrt(d.qvel[b_vadr] ** 2 + d.qvel[b_vadr + 1] ** 2) > 0.05 else 0.0
+            o[b_idx.IS_LOCKED] = 1.0 if self.object_state[f"b{i + 1}"]["mode"] == "locked" else 0.0
             q = d.xquat[tid]
-            yaw = math.atan2(2.0*(q[0]*q[3]+q[1]*q[2]), 1.0-2.0*(q[2]**2+q[3]**2))
+            yaw = math.atan2(2.0 * (q[0] * q[3] + q[1] * q[2]), 1.0 - 2.0 * (q[2] ** 2 + q[3] ** 2))
             o[b_idx.QUAT_0], o[b_idx.QUAT_1] = math.cos(yaw - rv), math.sin(yaw - rv)
 
         for i, rid in enumerate(self.ramp_ids):
-            r_idx = self.idx.RAMP[i]; d_w_r = d.xpos[rid][:2] - ps[:2]
+            r_idx = self.idx.RAMP[i]
+            d_w_r = d.xpos[rid][:2] - ps[:2]
             o[r_idx.REL_X] = d_w_r[0] * cos_r - d_w_r[1] * sin_r
             o[r_idx.REL_Y] = d_w_r[0] * sin_r + d_w_r[1] * cos_r
             r_vadr = m.jnt_dofadr[m.body_jntadr[rid]]
             if r_vadr >= 0 and r_vadr + 1 < qvel_limit:
-                o[r_idx.IS_MOVING] = 1.0 if math.sqrt(d.qvel[r_vadr]**2 + d.qvel[r_vadr+1]**2) > 0.05 else 0.0
-            o[r_idx.IS_LOCKED] = 1.0 if self.object_state[f"ramp{i+1}"]["mode"] == "locked" else 0.0
+                o[r_idx.IS_MOVING] = 1.0 if math.sqrt(d.qvel[r_vadr] ** 2 + d.qvel[r_vadr + 1] ** 2) > 0.05 else 0.0
+            o[r_idx.IS_LOCKED] = 1.0 if self.object_state[f"ramp{i + 1}"]["mode"] == "locked" else 0.0
             q = d.xquat[rid]
-            yaw = math.atan2(2.0*(q[0]*q[3]+q[1]*q[2]), 1.0-2.0*(q[2]**2+q[3]**2))
+            yaw = math.atan2(2.0 * (q[0] * q[3] + q[1] * q[2]), 1.0 - 2.0 * (q[2] ** 2 + q[3] ** 2))
             o[r_idx.QUAT_0], o[r_idx.QUAT_1] = math.cos(yaw - rv), math.sin(yaw - rv)
 
         # 他エージェント情報 (痛覚メタファー & 名前ベース参照)
         ens = [k for k in self.agent_keys if k != ak]
-        ens.sort(key=lambda k: (0 if k.startswith("s" if ak.startswith("h") else "h") else 1, k))
+        ens.sort(
+            key=lambda k: (
+                0 if k.startswith("s" if ak.startswith("h") else "h") else 1,
+                k,
+            )
+        )
 
-        for i, enm in enumerate(ens[:len(self.idx.OTHERS)]):
+        for i, enm in enumerate(ens[: len(self.idx.OTHERS)]):
             en_idx = self.idx.OTHERS[i]
             eid = self.body_ids[enm]
             e_pos = d.xpos[eid][:2]
-            
+
             # 1. 視界判定 (自分が相手を見ているか)
             visible = self._is_vis(ps[:2], rv, e_pos, self.body_ids[ak], eid)
-            
+
             # 2. 被弾判定 (自分がHider、相手がSeeker、かつ相手が自分を見ているか)
             being_hit_flag = 0.0
             if ak.startswith("h") and enm.startswith("s"):
-                s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]['rot']]])
+                s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]["rot"]]])
                 if self._is_vis(e_pos, s_rot, ps[:2], eid, self.body_ids[ak]):
                     being_hit_flag = 1.0
 
@@ -1326,27 +1337,27 @@ class TeamCosEnv(gym.Env):
                 d_w = e_pos - ps[:2]
                 o[en_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r
                 o[en_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r
-                
-                vax_en = m.jnt_dofadr[self.qpos_indices[enm]['x']]
-                vay_en = m.jnt_dofadr[self.qpos_indices[enm]['y']]
+
+                vax_en = m.jnt_dofadr[self.qpos_indices[enm]["x"]]
+                vay_en = m.jnt_dofadr[self.qpos_indices[enm]["y"]]
                 o[en_idx.VEL_X] = d.qvel[vax_en] * cos_r - d.qvel[vay_en] * sin_r
                 o[en_idx.VEL_Y] = d.qvel[vax_en] * sin_r + d.qvel[vay_en] * cos_r
-                
-                e_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]['rot']]])
+
+                e_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]["rot"]]])
                 o[en_idx.QUAT_0], o[en_idx.QUAT_1] = math.cos(e_rot - rv), math.sin(e_rot - rv)
                 # エージェント間の IS_MOVING は廃止し、0.0 固定（または別の用途）へ
-                o[en_idx.BEING_HIT] = being_hit_flag 
+                o[en_idx.BEING_HIT] = being_hit_flag
 
             elif being_hit_flag > 0.5:
                 # 【痛覚情報】視界外だが撃たれている
                 o[en_idx.VISIBLE] = 0.0
-                o[en_idx.BEING_HIT] = 1.0 # 明示的に「被弾中」を示す
-                
+                o[en_idx.BEING_HIT] = 1.0  # 明示的に「被弾中」を示す
+
                 d_w = e_pos - ps[:2]
                 rel_x = d_w[0] * cos_r - d_w[1] * sin_r
                 rel_y = d_w[0] * sin_r + d_w[1] * cos_r
                 o[en_idx.REL_X], o[en_idx.REL_Y] = rel_x, rel_y
-                
+
                 # 向きは位置から逆算（自分を狙っていると仮定）
                 dist = math.sqrt(rel_x**2 + rel_y**2) + 1e-8
                 o[en_idx.QUAT_0], o[en_idx.QUAT_1] = -rel_x / dist, -rel_y / dist
@@ -1358,7 +1369,7 @@ class TeamCosEnv(gym.Env):
                 o[en_idx.BEING_HIT] = 0.0
         return o
 
-    def render(self):
+    def render(self):  # noqa: C901
         if self.viewer is None:
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
             with self.viewer.lock():
@@ -1371,7 +1382,7 @@ class TeamCosEnv(gym.Env):
             for ak in self.agent_keys:
                 sid = self.body_ids[ak]
                 pos = self.data.xpos[sid]
-                rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]['rot']]]
+                rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]]
                 t_val = self.last_debug_ctrl[ak][1]
                 # デバッグ可視化はdebug_logger.enabledで制御
                 if self.debug_logger.enabled and self.show_turn_lines and abs(t_val) > 0.005:
@@ -1385,7 +1396,13 @@ class TeamCosEnv(gym.Env):
                     p_end[1] += math.cos(rot) * t_val * 2.0
                     if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
                         g = self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom]
-                        mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 8.0 + abs(t_val)*25, p_start, p_end)
+                        mujoco.mjv_connector(
+                            g,
+                            mujoco.mjtGeom.mjGEOM_LINE,
+                            8.0 + abs(t_val) * 25,
+                            p_start,
+                            p_end,
+                        )
                         g.rgba[:] = color
                         self.viewer.user_scn.ngeom += 1
                 for k in self.agent_keys:
@@ -1424,11 +1441,11 @@ class TeamCosEnv(gym.Env):
             try:
                 # determine overrides per hider key
                 overrides = {}
-                for s in [k for k in self.agent_keys if k.startswith('s')]:
+                for s in [k for k in self.agent_keys if k.startswith("s")]:
                     s_sid = self.body_ids[s]
                     s_pos = self.data.xpos[s_sid][:2]
-                    s_rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[s]['rot']]]
-                    for h in [k for k in self.agent_keys if k.startswith('h')]:
+                    s_rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[s]["rot"]]]
+                    for h in [k for k in self.agent_keys if k.startswith("h")]:
                         h_tid = self.body_ids[h]
                         if not self._is_vis(s_pos, s_rot, self.data.xpos[h_tid][:2], s_sid, h_tid):
                             continue
@@ -1455,7 +1472,7 @@ class TeamCosEnv(gym.Env):
                     else:
                         # restore defaults
                         cols = self.agent_default_rgba.get(ak, [])
-                        for gid, defcol in zip(geom_ids, cols):
+                        for gid, defcol in zip(geom_ids, cols, strict=True):
                             try:
                                 self.model.geom_rgba[gid][:] = defcol
                             except Exception:
@@ -1467,5 +1484,5 @@ class TeamCosEnv(gym.Env):
         self.viewer.sync()
 
     def close(self):
-        if self.viewer: self.viewer.close()
-
+        if self.viewer:
+            self.viewer.close()

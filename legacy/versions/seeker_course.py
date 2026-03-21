@@ -25,44 +25,43 @@ from hide_and_seek_env import HideAndSeekEnv
 # コース定義  (x, y, arrive_radius)
 # ---------------------------------------------------------------------------
 WAYPOINTS = [
-    (-5.0,  5.5, 0.6),   # A  NW スタート
-    ( 0.5,  5.5, 0.18), # B  ランプ上側まで進んでから次へ
-    ( 0.0,  0.8, 0.8),   # C  中央縦壁を避けて南下
-    ( 0.2,  1.5, 0.7),   # D  隘路通過中
-    ( 2.8, -3.2, 0.8),   # E  隘路抜け
-    ( 4.5, -4.8, 0.8),   # F  SE コーナー → 右旋回(西)
-    (-4.8, -4.8, 0.8),   # G  SW コーナー → 北東へ
-    ( 0.0, -1.0, 0.9),   # H  NE エリア  → 右旋回(西)
-    (-5.0,  5.2, 0.8),   # I  帰還
+    (-5.0, 5.5, 0.6),  # A  NW スタート
+    (0.5, 5.5, 0.18),  # B  ランプ上側まで進んでから次へ
+    (0.0, 0.8, 0.8),  # C  中央縦壁を避けて南下
+    (0.2, 1.5, 0.7),  # D  隘路通過中
+    (2.8, -3.2, 0.8),  # E  隘路抜け
+    (4.5, -4.8, 0.8),  # F  SE コーナー → 右旋回(西)
+    (-4.8, -4.8, 0.8),  # G  SW コーナー → 北東へ
+    (0.0, -1.0, 0.9),  # H  NE エリア  → 右旋回(西)
+    (-5.0, 5.2, 0.8),  # I  帰還
 ]
+
 
 # ---------------------------------------------------------------------------
 # ウェイポイント追従コントローラー
 # ---------------------------------------------------------------------------
 class WaypointController:
-    TURN_GAIN    = 2.2
+    TURN_GAIN = 2.2
     ALIGN_THRESH = np.deg2rad(20)
-    SLOW_THRESH  = np.deg2rad(65)
-    NEAR_GAIN    = 2.5
+    SLOW_THRESH = np.deg2rad(65)
+    NEAR_GAIN = 2.5
     MIN_FWD_NEAR = 0.15
     MIN_TURN_NEAR = 0.45
 
     def __init__(self, model, data, speed_scale: float = 1.0):
-        self.model       = model
-        self.data        = data
+        self.model = model
+        self.data = data
         self.speed_scale = speed_scale
-        self.wp_idx      = 1  # WP 0 はスタート位置なのでスキップ
+        self.wp_idx = 1  # WP 0 はスタート位置なのでスキップ
 
         # 関節 qpos アドレス
-        self._qadr_x   = _jnt_qposadr(model, "seeker_0_x")
-        self._qadr_y   = _jnt_qposadr(model, "seeker_0_y")
+        self._qadr_x = _jnt_qposadr(model, "seeker_0_x")
+        self._qadr_y = _jnt_qposadr(model, "seeker_0_y")
         self._qadr_rot = _jnt_qposadr(model, "seeker_0_rot")
 
         # アクチュエータ ID
-        self._act_fwd  = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_ACTUATOR, "seeker_0_fwd")
-        self._act_turn = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_ACTUATOR, "seeker_0_turn")
+        self._act_fwd = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "seeker_0_fwd")
+        self._act_turn = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "seeker_0_turn")
 
         # anchor の XML 基準座標 (= seeker_specs で指定した値)
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "seeker_0_anchor")
@@ -83,13 +82,13 @@ class WaypointController:
 
     def step(self) -> bool:
         if self.wp_idx >= len(WAYPOINTS):
-            self.data.ctrl[self._act_fwd]  = 0.0
+            self.data.ctrl[self._act_fwd] = 0.0
             self.data.ctrl[self._act_turn] = 0.0
             return False
 
         tx, ty, arrive_r = WAYPOINTS[self.wp_idx]
         dx, dy = tx - self.world_x, ty - self.world_y
-        dist   = np.hypot(dx, dy)
+        dist = np.hypot(dx, dy)
 
         if dist < arrive_r:
             print(f"  WP {self.wp_idx} 到達: ({self.world_x:.2f}, {self.world_y:.2f})")
@@ -97,14 +96,14 @@ class WaypointController:
             return self.wp_idx < len(WAYPOINTS)
 
         target_angle = np.arctan2(dy, dx)
-        err          = _angle_diff(target_angle, self.heading)
-        ctrl_turn    = float(np.clip(err * self.TURN_GAIN, -1.0, 1.0))
+        err = _angle_diff(target_angle, self.heading)
+        ctrl_turn = float(np.clip(err * self.TURN_GAIN, -1.0, 1.0))
 
         abs_err = abs(err)
         if abs_err < self.ALIGN_THRESH:
             ctrl_fwd = 1.0
         elif abs_err < self.SLOW_THRESH:
-            t        = (abs_err - self.ALIGN_THRESH) / (self.SLOW_THRESH - self.ALIGN_THRESH)
+            t = (abs_err - self.ALIGN_THRESH) / (self.SLOW_THRESH - self.ALIGN_THRESH)
             ctrl_fwd = 1.0 - 0.85 * t
         else:
             ctrl_fwd = 0.0
@@ -121,7 +120,7 @@ class WaypointController:
             ctrl_fwd *= fwd_scale
             ctrl_turn *= turn_scale
 
-        self.data.ctrl[self._act_fwd]  = float(np.clip(ctrl_fwd * self.speed_scale, -1.0, 1.0))
+        self.data.ctrl[self._act_fwd] = float(np.clip(ctrl_fwd * self.speed_scale, -1.0, 1.0))
         self.data.ctrl[self._act_turn] = ctrl_turn
         return True
 
@@ -156,13 +155,13 @@ def main():
     # ---- 開始位置を seeker_specs で指定 ------------------------------------
     #   make_spec(x, y, rot_deg)  ← 度単位で向きを指定できる便利メソッド
     env = HideAndSeekEnv(
-        n_seekers    = 1,
-        n_hiders     = 0,
-        n_boxes      = 1,
-        n_ramps      = 1,
-        seeker_specs = [HideAndSeekEnv.make_spec(-5.0, 4.8, rot_deg=0.0)],  # NW, 東向き
-        box_specs    = [HideAndSeekEnv.make_spec(3.0, 5.2, rot_deg=0.0)],   # Ramp右側に離して配置
-        ramp_specs   = [HideAndSeekEnv.make_spec(0.0, 5.2, rot_deg=0.0)],   # 低い側を -X 向き
+        n_seekers=1,
+        n_hiders=0,
+        n_boxes=1,
+        n_ramps=1,
+        seeker_specs=[HideAndSeekEnv.make_spec(-5.0, 4.8, rot_deg=0.0)],  # NW, 東向き
+        box_specs=[HideAndSeekEnv.make_spec(3.0, 5.2, rot_deg=0.0)],  # Ramp右側に離して配置
+        ramp_specs=[HideAndSeekEnv.make_spec(0.0, 5.2, rot_deg=0.0)],  # 低い側を -X 向き
     )
     model, data = env.model, env.data
     ctrl = WaypointController(model, data, speed_scale=args.speed)
@@ -221,10 +220,10 @@ def main():
     viewer = mujoco.viewer.launch_passive(model, data)
     print(f"[DBG] launch_passive 完了  is_running={viewer.is_running()}")
 
-    viewer.cam.lookat[:]  = [0.0, 0.0, 0.0]
-    viewer.cam.distance   = 19.0
-    viewer.cam.elevation  = -65.0
-    viewer.cam.azimuth    = 90.0
+    viewer.cam.lookat[:] = [0.0, 0.0, 0.0]
+    viewer.cam.distance = 19.0
+    viewer.cam.elevation = -65.0
+    viewer.cam.azimuth = 90.0
 
     print("[DBG] sync 呼び出し前")
     viewer.sync()
@@ -233,9 +232,9 @@ def main():
     time.sleep(0.2)
     print(f"[DBG] 0.2s sleep 後  is_running={viewer.is_running()}")
 
-    sim_time   = 0.0
+    sim_time = 0.0
     wall_start = time.perf_counter()
-    ctrl_done  = False
+    ctrl_done = False
     loop_count = 0
     was_on_ramp = False
     was_assist_on = False
@@ -250,8 +249,16 @@ def main():
                 wy = ctrl.world_y
                 hd = ctrl.heading
                 tx, ty, _ = WAYPOINTS[ctrl.wp_idx] if ctrl.wp_idx < len(WAYPOINTS) else (0, 0, 0)
-                dist = (wx-tx)**2 + (wy-ty)**2
-                print(f"[DBG] loop={loop_count}  sim={sim_time:.3f}  "                      f"pos=({wx:.2f},{wy:.2f})  heading={hd:.2f}rad  "                      f"wp={ctrl.wp_idx} target=({tx},{ty})  dist2={dist:.2f}  "                      f"ctrl_fwd={ctrl.data.ctrl[ctrl._act_fwd]:.2f}  "                      f"ctrl_turn={ctrl.data.ctrl[ctrl._act_turn]:.2f}  "                      f"assist_on={int(was_assist_on)}  "                      f"assist_latched={int(assist_latched)}")
+                dist = (wx - tx) ** 2 + (wy - ty) ** 2
+                print(
+                    f"[DBG] loop={loop_count}  sim={sim_time:.3f}  "
+                    f"pos=({wx:.2f},{wy:.2f})  heading={hd:.2f}rad  "
+                    f"wp={ctrl.wp_idx} target=({tx},{ty})  dist2={dist:.2f}  "
+                    f"ctrl_fwd={ctrl.data.ctrl[ctrl._act_fwd]:.2f}  "
+                    f"ctrl_turn={ctrl.data.ctrl[ctrl._act_turn]:.2f}  "
+                    f"assist_on={int(was_assist_on)}  "
+                    f"assist_latched={int(assist_latched)}"
+                )
             # リアルタイム制御のためスリープ
             time.sleep(0.001)
 
@@ -282,30 +289,18 @@ def main():
                         best_ramp_pos = ramp_pos.copy()
                         best_ramp_rot = ramp_rot.copy()
                         best_rel_local = rel_local.copy()
-                    if (
-                        d_top <= slope_top_dist_thresh
-                        and abs(rel_local[1]) <= slope_top_y_abs
-                        and slope_top_z_min <= rel_local[2] <= slope_top_z_max
-                    ):
+                    if d_top <= slope_top_dist_thresh and abs(rel_local[1]) <= slope_top_y_abs and slope_top_z_min <= rel_local[2] <= slope_top_z_max:
                         on_slope_top = True
                         top_local_x = float(rel_local[0])
                         break
 
-                    if (
-                        lower_entry_x_min <= rel_local[0] <= lower_entry_x_max
-                        and abs(rel_local[1]) <= lower_entry_y_abs
-                        and lower_entry_z_min <= rel_local[2] <= lower_entry_z_max
-                    ):
+                    if lower_entry_x_min <= rel_local[0] <= lower_entry_x_max and abs(rel_local[1]) <= lower_entry_y_abs and lower_entry_z_min <= rel_local[2] <= lower_entry_z_max:
                         in_lower_entry = True
 
                 climb_hold = z_rel > assist_z_hold
                 in_ramp_envelope = False
                 if best_rel_local is not None:
-                    in_ramp_envelope = (
-                        ramp_env_x_min <= best_rel_local[0] <= ramp_env_x_max
-                        and abs(best_rel_local[1]) <= ramp_env_y_abs
-                        and ramp_env_z_min <= best_rel_local[2] <= ramp_env_z_max
-                    )
+                    in_ramp_envelope = ramp_env_x_min <= best_rel_local[0] <= ramp_env_x_max and abs(best_rel_local[1]) <= ramp_env_y_abs and ramp_env_z_min <= best_rel_local[2] <= ramp_env_z_max
                 ramp_region = on_slope_top or in_lower_entry or in_ramp_envelope
                 target_local_dx = 0.0
                 local_vx = 0.0
@@ -336,12 +331,13 @@ def main():
                 vxy = float(np.hypot(data.qvel[dadr_x], data.qvel[dadr_y]))
 
                 if on_slope_top:
-                    crest_alpha = float(np.clip(
-                        (top_local_x - crest_taper_start_x)
-                        / (crest_taper_end_x - crest_taper_start_x + 1e-8),
-                        0.0,
-                        1.0,
-                    ))
+                    crest_alpha = float(
+                        np.clip(
+                            (top_local_x - crest_taper_start_x) / (crest_taper_end_x - crest_taper_start_x + 1e-8),
+                            0.0,
+                            1.0,
+                        )
+                    )
                     crest_ctrl_cap = 1.0 - (1.0 - crest_ctrl_min) * crest_alpha
                     if data.ctrl[ctrl._act_fwd] > crest_ctrl_cap:
                         data.ctrl[ctrl._act_fwd] = crest_ctrl_cap
@@ -420,11 +416,7 @@ def main():
                 z_rel_after = float(data.qpos[qadr_z])
                 is_on_ramp = on_slope_top and (z_rel_after > z_climb_thresh)
                 if is_on_ramp and not was_on_ramp:
-                    print(
-                        f"[LOG] Ramp乗上げ 検知 sim={sim_time:.3f} "
-                        f"z_rel={z_rel_after:.4f} "
-                        f"pos=({ctrl.world_x:.2f},{ctrl.world_y:.2f}) wp={ctrl.wp_idx}"
-                    )
+                    print(f"[LOG] Ramp乗上げ 検知 sim={sim_time:.3f} " f"z_rel={z_rel_after:.4f} " f"pos=({ctrl.world_x:.2f},{ctrl.world_y:.2f}) wp={ctrl.wp_idx}")
                 was_on_ramp = is_on_ramp
                 sim_time += model.opt.timestep
 
@@ -438,6 +430,7 @@ def main():
         print("[DBG] KeyboardInterrupt で停止")
     except Exception as e:
         import traceback
+
         print(f"[DBG] 例外発生: {e}")
         traceback.print_exc()
     finally:

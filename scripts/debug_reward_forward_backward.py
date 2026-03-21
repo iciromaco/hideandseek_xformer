@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """短い調査スクリプト: Seeker で +1/-1 前進入力を投げ、位置差と報酬列を比較する。"""
-import sys
+
 import os
+import sys
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import numpy as np
+
 from src.envs.hns_environment import TeamCosEnv
 
 
 def test_action(action, steps=10):
-    env = TeamCosEnv(mode="initial", target="seeker", n_seekers=1, n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None)
+    env = TeamCosEnv(
+        mode="initial",
+        target="seeker",
+        n_seekers=1,
+        n_hiders=2,
+        n_boxes=2,
+        n_ramps=1,
+        render_mode=None,
+    )
     obs, info = env.reset()
     seeker_key = env.seeker_keys[0]
     bid = env.body_ids[seeker_key]

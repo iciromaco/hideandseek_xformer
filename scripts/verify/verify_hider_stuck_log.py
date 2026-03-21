@@ -49,7 +49,7 @@ def build_stuck_segments(rows, stuck_key: str):
                     "start_step": row["step"],
                     "end_step": row["step"],
                     "count": 1,
-                    "max_still": row["still_h1"] if stuck_key == "stuck_h1" else row["still_h2"],
+                    "max_still": (row["still_h1"] if stuck_key == "stuck_h1" else row["still_h2"]),
                 }
             else:
                 same_episode_progress = prev_row is not None and row["step"] >= prev_row["step"]
@@ -65,7 +65,7 @@ def build_stuck_segments(rows, stuck_key: str):
                         "start_step": row["step"],
                         "end_step": row["step"],
                         "count": 1,
-                        "max_still": row["still_h1"] if stuck_key == "stuck_h1" else row["still_h2"],
+                        "max_still": (row["still_h1"] if stuck_key == "stuck_h1" else row["still_h2"]),
                     }
         else:
             if active is not None:
@@ -152,12 +152,7 @@ def print_context_before(rows, stuck_key: str, still_key: str, before_steps: int
 
         print(f"-- segment_start_step={start['step']} key={stuck_key} --")
         for row in window:
-            print(
-                f"{row['step']:4d} {row['prep']:4d} "
-                f"{row['dpos_h1']:.4f} {row['dpos_h2']:.4f} "
-                f"{row['still_h1']:8d} {row['still_h2']:8d} "
-                f"{row['stuck_h1']:8d} {row['stuck_h2']:8d}"
-            )
+            print(f"{row['step']:4d} {row['prep']:4d} " f"{row['dpos_h1']:.4f} {row['dpos_h2']:.4f} " f"{row['still_h1']:8d} {row['still_h2']:8d} " f"{row['stuck_h1']:8d} {row['stuck_h2']:8d}")
         shown += 1
 
 
@@ -165,12 +160,34 @@ def main():
     parser = argparse.ArgumentParser(description="Extract stuck/still debug info from HNS logs")
     parser.add_argument("log_path", type=Path, help="Path to captured terminal log file")
     parser.add_argument("--max", type=int, default=40, dest="max_rows", help="Max rows to print")
-    parser.add_argument("--all", action="store_true", help="Print all parsed debug rows (not only stuck ones)")
-    parser.add_argument("--segments", action="store_true", help="Print contiguous stuck segments summary")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Print all parsed debug rows (not only stuck ones)",
+    )
+    parser.add_argument(
+        "--segments",
+        action="store_true",
+        help="Print contiguous stuck segments summary",
+    )
     parser.add_argument("--segments-max", type=int, default=20, help="Max segment rows per agent")
-    parser.add_argument("--context-before", type=int, default=0, help="Print N steps before each stuck segment start")
-    parser.add_argument("--context-max-segments", type=int, default=10, help="Max segment contexts per agent")
-    parser.add_argument("--events", action="store_true", help="Print one-line transition summary at stuck starts")
+    parser.add_argument(
+        "--context-before",
+        type=int,
+        default=0,
+        help="Print N steps before each stuck segment start",
+    )
+    parser.add_argument(
+        "--context-max-segments",
+        type=int,
+        default=10,
+        help="Max segment contexts per agent",
+    )
+    parser.add_argument(
+        "--events",
+        action="store_true",
+        help="Print one-line transition summary at stuck starts",
+    )
     parser.add_argument("--events-max", type=int, default=20, help="Max stuck-start events per agent")
     args = parser.parse_args()
 
@@ -196,18 +213,12 @@ def main():
         if h1_segments:
             print("segments_h1: start_step end_step count max_still")
             for seg in h1_segments[: args.segments_max]:
-                print(
-                    f"{seg['start_step']:9d} {seg['end_step']:8d} "
-                    f"{seg['count']:5d} {seg['max_still']:9d}"
-                )
+                print(f"{seg['start_step']:9d} {seg['end_step']:8d} " f"{seg['count']:5d} {seg['max_still']:9d}")
 
         if h2_segments:
             print("segments_h2: start_step end_step count max_still")
             for seg in h2_segments[: args.segments_max]:
-                print(
-                    f"{seg['start_step']:9d} {seg['end_step']:8d} "
-                    f"{seg['count']:5d} {seg['max_still']:9d}"
-                )
+                print(f"{seg['start_step']:9d} {seg['end_step']:8d} " f"{seg['count']:5d} {seg['max_still']:9d}")
 
     if args.context_before > 0:
         print_context_before(
@@ -235,12 +246,7 @@ def main():
 
     print("step prep dpos_h1 dpos_h2 still_h1 still_h2 stuck_h1 stuck_h2")
     for row in display_rows[: args.max_rows]:
-        print(
-            f"{row['step']:4d} {row['prep']:4d} "
-            f"{row['dpos_h1']:.4f} {row['dpos_h2']:.4f} "
-            f"{row['still_h1']:8d} {row['still_h2']:8d} "
-            f"{row['stuck_h1']:8d} {row['stuck_h2']:8d}"
-        )
+        print(f"{row['step']:4d} {row['prep']:4d} " f"{row['dpos_h1']:.4f} {row['dpos_h2']:.4f} " f"{row['still_h1']:8d} {row['still_h2']:8d} " f"{row['stuck_h1']:8d} {row['stuck_h2']:8d}")
 
 
 if __name__ == "__main__":

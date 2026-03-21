@@ -1,15 +1,20 @@
-
-import numpy as np
+import os
 import pickle
 import sys
-import os
+
+import numpy as np
 
 if __name__ == "__main__":
     # コマンドライン引数でpklファイル指定。なければsrc/envs内の最新pklを自動選択
     if len(sys.argv) < 2:
         envs_dir = os.path.join(os.path.dirname(__file__), "../src/envs")
         import glob
-        pkls = sorted(glob.glob(os.path.join(envs_dir, "sdfgrid_mode4_*.pkl")), key=os.path.getmtime, reverse=True)
+
+        pkls = sorted(
+            glob.glob(os.path.join(envs_dir, "sdfgrid_mode4_*.pkl")),
+            key=os.path.getmtime,
+            reverse=True,
+        )
         if not pkls:
             print("No SDF pkl found in src/envs. Please generate one or specify a path.")
             sys.exit(1)
@@ -45,22 +50,22 @@ if __name__ == "__main__":
 
     # --- SDFグリッドの異常値のみ出力 ---
 
-
     # AABB内判定・walls_xpos関連は除去
 
     # --- 可視化機能追加 ---
     import matplotlib.pyplot as plt
+
     plt.figure(figsize=(8, 6))
-    im = plt.imshow(sdf_grid, origin='lower', cmap='viridis')
-    plt.colorbar(im, label='SDF value')
-    plt.title('SDF Grid Visualization')
+    im = plt.imshow(sdf_grid, origin="lower", cmap="viridis")
+    plt.colorbar(im, label="SDF value")
+    plt.title("SDF Grid Visualization")
     # -0.1未満の点を赤丸で重ねて表示
     if np.any(mask):
         idxs = np.argwhere(mask)
         ys, xs = idxs[:, 0], idxs[:, 1]
-        plt.scatter(xs, ys, color='red', s=10, label='SDF < -0.1')
+        plt.scatter(xs, ys, color="red", s=10, label="SDF < -0.1")
         plt.legend()
-    plt.xlabel('Grid X')
-    plt.ylabel('Grid Y')
+    plt.xlabel("Grid X")
+    plt.ylabel("Grid Y")
     plt.tight_layout()
     plt.show()

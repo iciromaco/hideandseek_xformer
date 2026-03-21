@@ -1,0 +1,131 @@
+warning: The top-level linter settings are deprecated in favour of their counterparts in the `lint` section. Please update the following options in `pyproject.toml`:
+  - 'ignore' -> 'lint.ignore'
+  - 'select' -> 'lint.select'
+C901 `_interaction_buttons` is too complex (11 > 10)
+  --> src/agents/scripted_agents.py:25:5
+   |
+25 | def _interaction_buttons(
+   |     ^^^^^^^^^^^^^^^^^^^^
+26 |     obs, idx, interact_cooldown, interact_focus_steps, suppress=False
+27 | ):
+   |
+
+C901 `get_action` is too complex (12 > 10)
+  --> src/agents/scripted_agents.py:86:9
+   |
+84 |         self.interact_focus_steps = 0
+85 |
+86 |     def get_action(self, obs, idx):
+   |         ^^^^^^^^^^
+87 |         p_scale = P_SCALE
+88 |         lidar_raw = obs[idx.LIDAR] * L_SCALE
+   |
+
+C901 `get_action` is too complex (13 > 10)
+   --> src/agents/scripted_agents.py:189:9
+    |
+187 |         self.interact_focus_steps = 0
+188 |
+189 |     def get_action(self, obs, idx):
+    |         ^^^^^^^^^^
+190 |         p_scale = P_SCALE
+191 |         lidar_raw = obs[idx.LIDAR] * L_SCALE
+    |
+
+C901 `_get_sdf_scalar` is too complex (13 > 10)
+   --> src/core/visibility_engine.py:149:5
+    |
+148 | @njit(cache=True)
+149 | def _get_sdf_scalar(
+    |     ^^^^^^^^^^^^^^^
+150 |     px,
+151 |     py,
+    |
+
+C901 `_compute_lidar_jit_core` is too complex (39 > 10)
+   --> src/core/visibility_engine.py:234:5
+    |
+233 | @njit(cache=True)
+234 | def _compute_lidar_jit_core(
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+235 |     pos_x,
+236 |     pos_y,
+    |
+
+C901 `is_visible` is too complex (25 > 10)
+   --> src/core/visibility_engine.py:649:9
+    |
+647 |         )
+648 |
+649 |     def is_visible(self, p1, p2, mode=1, body_exclude=-1, target_body_id=-1):
+    |         ^^^^^^^^^^
+650 |         diff_v = p2[:2] - p1[:2]
+651 |         dist_full = np.linalg.norm(diff_v)
+    |
+
+C901 `_blocked_by_static_walls_numba` is too complex (12 > 10)
+  --> src/envs/hns_environment.py:52:5
+   |
+51 | @njit(cache=True)
+52 | def _blocked_by_static_walls_numba(p1x, p1y, p2x, p2y, walls, margin):
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+53 |     dx = p2x - p1x
+54 |     dy = p2y - p1y
+   |
+
+C901 `_apply_object_constraints` is too complex (13 > 10)
+   --> src/envs/hns_environment.py:845:9
+    |
+843 |     #             self.model.geom_rgba[gid] = rgba
+844 |
+845 |     def _apply_object_constraints(self):
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+846 |         """
+847 |         より単純なGrab/Lock拘束ロジック。
+    |
+
+C901 `_policy_action` is too complex (14 > 10)
+   --> src/envs/hns_environment.py:923:9
+    |
+921 |                 self.model.geom_rgba[gid] = rgba
+922 |
+923 |     def _policy_action(self, agent_key, norm_obs):
+    |         ^^^^^^^^^^^^^^
+924 |         """モデルが設定されている場合は必ずそのモデルを使う。"""
+925 |         model = self._inference_models.get(agent_key)
+    |
+
+C901 `reset` is too complex (12 > 10)
+    --> src/envs/hns_environment.py:1043:9
+     |
+1041 |         return True
+1042 |
+1043 |     def reset(self, seed=None, options=None):
+     |         ^^^^^
+1044 |         super().reset(seed=seed)
+1045 |         self.current_step = 0
+     |
+
+C901 `step` is too complex (16 > 10)
+    --> src/envs/hns_environment.py:1116:9
+     |
+1114 |         }
+1115 |
+1116 |     def step(self, action):
+     |         ^^^^
+1117 |         self.current_step += 1
+1118 |         af, cv = np.ravel(action), np.zeros(self.model.nu)
+     |
+
+C901 `render` is too complex (25 > 10)
+    --> src/envs/hns_environment.py:1544:9
+     |
+1542 |         return o
+1543 |
+1544 |     def render(self):
+     |         ^^^^^^
+1545 |         if self.viewer is None:
+1546 |             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+     |
+
+Found 12 errors.

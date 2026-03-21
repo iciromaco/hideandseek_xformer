@@ -1,8 +1,9 @@
-import numpy as np
-import sys
-from pathlib import Path
 import argparse
 import csv
+import sys
+from pathlib import Path
+
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -46,9 +47,7 @@ def main():
         ag_spikes = 0
 
         for _ in range(steps):
-            obs, reward, terminated, truncated, info = env.step(
-                np.array([0, 0, 0, 0], dtype=np.float32)
-            )
+            obs, reward, terminated, truncated, info = env.step(np.array([0, 0, 0, 0], dtype=np.float32))
 
             owners = {v for v in env.lock_owners.values() if v is not None}
             h_lock = "h" in owners

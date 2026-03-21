@@ -1,11 +1,11 @@
 # optuna_wall_stick_search_forM27.py
 
 import os
-import subprocess
 import re
 import shutil
-import optuna
+import subprocess
 
+import optuna
 
 TOML_PATH = "configs/hparams_main27.toml"
 BACKUP_PATH = "configs/hparams_main27.toml.bak"
@@ -19,6 +19,7 @@ RESULTS_PATH = "optuna_wall_stick_results.txt"
 
 # [runtime.optuna]セクション内だけを書き換える
 
+
 def set_toml_param_in_section(section, param, value):
     with open(TOML_PATH, "r", encoding="utf-8") as f:
         lines = f.readlines()
@@ -28,11 +29,7 @@ def set_toml_param_in_section(section, param, value):
             in_section = True
             continue
         # セクション終端検出
-        if (
-            in_section
-            and line.strip().startswith("[")
-            and not line.strip().startswith(f"[{section}]")
-        ):
+        if in_section and line.strip().startswith("[") and not line.strip().startswith(f"[{section}]"):
             in_section = False
         if in_section and line.strip().startswith(f"{param} ="):
             lines[i] = f"{param} = {value}\n"
@@ -46,26 +43,20 @@ def restore_toml():
 
 
 def objective(trial):
-    penalty = trial.suggest_float(
-        "rw_hide_wall_stick_penalty", 0.01, 0.5
-    )
+    penalty = trial.suggest_float("rw_hide_wall_stick_penalty", 0.01, 0.5)
     print(f"[Trial {trial.number}] penalty={penalty:.4f} 開始")
     if not os.path.exists(BACKUP_PATH):
         shutil.copy(TOML_PATH, BACKUP_PATH)
-    set_toml_param_in_section(
-        "runtime.optuna", "rw_hide_wall_stick_penalty", penalty
-    )
+    set_toml_param_in_section("runtime.optuna", "rw_hide_wall_stick_penalty", penalty)
     try:
-        print(
-            f"[Trial {trial.number}] サブプロセス実行: uv run python {TARGET_SCRIPT} --profile optuna"
-        )
+        print(f"[Trial {trial.number}] サブプロセス実行: uv run python {TARGET_SCRIPT} --profile optuna")
         result = subprocess.run(
             ["uv", "run", "python", TARGET_SCRIPT, "--profile", "optuna"],
-            capture_output=True, text=True, timeout=TIMEOUT_PER_TRIAL
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_PER_TRIAL,
         )
-        print(
-            f"[Trial {trial.number}] サブプロセス終了 (returncode={result.returncode})"
-        )
+        print(f"[Trial {trial.number}] サブプロセス終了 (returncode={result.returncode})")
         hide_rates = []
         for line in result.stdout.splitlines():
             m = re.search(r"HideRate=([0-9.]+)", line)

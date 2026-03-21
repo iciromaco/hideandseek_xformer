@@ -7,33 +7,34 @@
 # 5. PEP 8 準拠: 79文字制限、物理行展開を維持。
 
 import os
-import sys
-import time
 import platform
 import signal
+import sys
+import time
+from collections import deque
+from datetime import datetime
+
+import mujoco
+import mujoco.viewer
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import mujoco
-import mujoco.viewer
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from datetime import datetime
-from collections import deque
+
+from core.obs_indices import H1, H2, RAMP, SELF
 
 # 自作モジュール
 from envs.hns_environment import TeamCosEnv
 from models.ppo_transformer_v2 import AgentV2
-
-from core.obs_indices import SELF, H1, H2, RAMP
 
 # ==========================================
 # 0. 実行環境・基盤設定
 # ==========================================
 p_info_v = platform.processor()
 
-if p_info_v != 'arm':
+if p_info_v != "arm":
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -74,7 +75,7 @@ def draw_vision_lines(env):
         env.ramp_id,
         env.body_ids["s"],
         env.body_ids["h1"],
-        env.body_ids["h2"]
+        env.body_ids["h2"],
     ]
 
     src_keys_v = ["s", "h1", "h2"]
@@ -83,7 +84,7 @@ def draw_vision_lines(env):
     for k_src_v in src_keys_v:
         bid_s_v = env.body_ids[k_src_v]
         pos_s_v = env.data.xpos[bid_s_v]
-        rj_idx_v = env.qpos_indices[k_src_v]['rot']
+        rj_idx_v = env.qpos_indices[k_src_v]["rot"]
         rot_s_val_v = env.data.qpos[env.model.jnt_qposadr[rj_idx_v]]
 
         if k_src_v == "s":
@@ -96,8 +97,7 @@ def draw_vision_lines(env):
                 continue
             pos_d_v = env.data.xpos[bid_d_v]
 
-            if env._is_within_fov_and_visible(pos_s_v[:2], rot_s_val_v,
-                                              pos_d_v[:2], bid_s_v, bid_d_v):
+            if env._is_within_fov_and_visible(pos_s_v[:2], rot_s_val_v, pos_d_v[:2], bid_s_v, bid_d_v):
                 gn_v = env.viewer.user_scn.ngeom
                 if gn_v < 100:
                     gs_v = env.viewer.user_scn.geoms[gn_v]
@@ -107,15 +107,9 @@ def draw_vision_lines(env):
                         [0.005, 0, 0],
                         pos_s_v,
                         identity_v,
-                        rgba_v
+                        rgba_v,
                     )
-                    mujoco.mjv_connector(
-                        gs_v,
-                        mujoco.mjtGeom.mjGEOM_LINE,
-                        0.005,
-                        pos_s_v,
-                        pos_d_v
-                    )
+                    mujoco.mjv_connector(gs_v, mujoco.mjtGeom.mjGEOM_LINE, 0.005, pos_s_v, pos_d_v)
                     env.viewer.user_scn.ngeom = gn_v + 1
 
 
@@ -157,36 +151,38 @@ SAVE_FREQ = 20
 LOG_FREQ = 1
 NDR_WINDOW = 100
 
+
 def compute_custom_reward(obs, action, base_reward):
     """
     観測インデックス定数とアクションを利用した、読みやすい報酬シェイピング。
     """
     # 敵が視界にいる場合の追加報酬
-    enemy_visible = (obs[H1.VISIBLE] > 0.5 or obs[H2.VISIBLE] > 0.5)
-    
+    enemy_visible = obs[H1.VISIBLE] > 0.5 or obs[H2.VISIBLE] > 0.5
+
     # Seekerの場合、敵との距離が縮まったら報酬 (報酬シェイピング)
-    dist_to_h1 = math.sqrt(obs[H1.REL_X]**2 + obs[H1.REL_Y]**2)
-    
+    dist_to_h1 = math.sqrt(obs[H1.REL_X] ** 2 + obs[H1.REL_Y] ** 2)
+
     # 道具(Ramp)に近いことへのボーナス
-    dist_to_ramp = math.sqrt(obs[RAMP.REL_X]**2 + obs[RAMP.REL_Y]**2)
-    
+    dist_to_ramp = math.sqrt(obs[RAMP.REL_X] ** 2 + obs[RAMP.REL_Y] ** 2)
+
     # 速度が出ていることへのボーナス (スタック/停止防止)
-    speed = math.sqrt(obs[SELF.VEL_X]**2 + obs[SELF.VEL_Y]**2)
-    
+    speed = math.sqrt(obs[SELF.VEL_X] ** 2 + obs[SELF.VEL_Y] ** 2)
+
     # --- 報酬の加算 ---
     bonus = 0.0
     if enemy_visible:
         bonus += 0.1
-    
+
     # 距離が近いほど報酬を与える
     bonus += 0.01 / (dist_to_h1 + 0.1)
-    
+
     # --- アクションに基づくペナルティ (制御コスト) ---
     # アクションベクトル [fwd, trn, lck, grb] の二乗和に比例したペナルティ
     # これにより、無駄に激しい回転やボタン連打を抑制し、効率的な動きを促す
     action_penalty = -0.01 * np.sum(np.square(action))
-    
+
     return base_reward + bonus + action_penalty
+
 
 # ==========================================
 # 3. 履歴管理 (ObsHistory)
@@ -209,8 +205,7 @@ class ObsHistory:
             self.buffer[i].zero_()
 
     def prime(self, o, i):
-        f_t_v = torch.as_tensor(o, dtype=torch.float32,
-                                device=self.dev).reshape(self.od)
+        f_t_v = torch.as_tensor(o, dtype=torch.float32, device=self.dev).reshape(self.od)
         for idx in range(self.capacity):
             self.buffer[i, idx] = f_t_v
 
@@ -222,8 +217,7 @@ class ObsHistory:
         self.ptr = (p_v + 1) % self.sl
 
     def update_single(self, o, i):
-        rv_v = torch.as_tensor(o, dtype=torch.float32,
-                               device=self.dev).reshape(self.od)
+        rv_v = torch.as_tensor(o, dtype=torch.float32, device=self.dev).reshape(self.od)
         p_v = self.ptr
         self.buffer[i, p_v] = rv_v
         self.buffer[i, p_v + self.sl] = rv_v
@@ -231,7 +225,7 @@ class ObsHistory:
     def get(self):
         s_v = self.ptr
         e_v = self.ptr + self.sl
-        return self.buffer[:, s_v: e_v].contiguous()
+        return self.buffer[:, s_v:e_v].contiguous()
 
 
 def apply_camera_slanted(env):
@@ -251,8 +245,7 @@ def run():
         act_dim = 8
 
     agent = AgentV2(obs_dim, act_dim, HIDDEN_DIM, SEQ_LEN).to(device)
-    m_path_v = HIDER_MODEL_PATH if TRAINING_TARGET == "hider" else \
-        SEEKER_MODEL_PATH
+    m_path_v = HIDER_MODEL_PATH if TRAINING_TARGET == "hider" else SEEKER_MODEL_PATH
 
     if os.path.exists(m_path_v):
         agent.load_state_dict(torch.load(m_path_v, map_location=device))
@@ -261,7 +254,8 @@ def run():
 
     if TRAIN_MODE and TRACK_WANDB:
         import wandb
-        dt_v = datetime.now().strftime('%m%d_%H%M')
+
+        dt_v = datetime.now().strftime("%m%d_%H%M")
         r_name = f"main26_{TRAINING_TARGET}_{dt_v}"
         wandb.init(project=WANDB_PROJECT, name=r_name)
 
@@ -294,11 +288,13 @@ def run():
                 pbar_v.update(1)
                 elapsed_v = time.time() - s_time_v
                 sps_curr_v = int(st_t_v / (elapsed_v + 1e-6))
-                pbar_v.set_postfix({
-                    "SPS": sps_curr_v,
-                    "Rew": f"{cum_r_v/st_t_v:.4f}",
-                    "NDR": f"{n_ndr_v/st_t_v:.2f}"
-                })
+                pbar_v.set_postfix(
+                    {
+                        "SPS": sps_curr_v,
+                        "Rew": f"{cum_r_v/st_t_v:.4f}",
+                        "NDR": f"{n_ndr_v/st_t_v:.2f}",
+                    }
+                )
                 draw_vision_lines(env_pb)
                 env_pb.render()
                 if not cam_done_v:
@@ -318,7 +314,7 @@ def run():
         print(f"🚀 Training: {NUM_ENVS} envs | Target: {TRAINING_TARGET}")
         envs_list_v = [make_env_internal() for _ in range(NUM_ENVS)]
         optimizer = optim.Adam(agent.parameters(), lr=LEARNING_RATE, eps=1e-5)
-        dt_str_v = datetime.now().strftime('%m%d_%H%M')
+        dt_str_v = datetime.now().strftime("%m%d_%H%M")
         writer = SummaryWriter(f"runs/main26_{TRAINING_TARGET}_{dt_str_v}")
         obs_st_v = torch.zeros((ROLLOUT_STEPS, NUM_ENVS, SEQ_LEN, obs_dim), device=device)
         act_st_v = torch.zeros((ROLLOUT_STEPS, NUM_ENVS, act_dim), device=device)
@@ -328,11 +324,19 @@ def run():
         val_st_v = torch.zeros((ROLLOUT_STEPS, NUM_ENVS), device=device)
         obs_norm_batch_v = np.zeros((NUM_ENVS, obs_dim))
         h_tr_v = ObsHistory(NUM_ENVS, SEQ_LEN, obs_dim, device)
-        ndr_q_v, hold_q_v, lock_q_v = deque(maxlen=NDR_WINDOW), deque(maxlen=NDR_WINDOW), deque(maxlen=NDR_WINDOW)
+        ndr_q_v, hold_q_v, lock_q_v = (
+            deque(maxlen=NDR_WINDOW),
+            deque(maxlen=NDR_WINDOW),
+            deque(maxlen=NDR_WINDOW),
+        )
         for i in range(NUM_ENVS):
             oi_norm_v, _ = envs_list_v[i].reset()
             h_tr_v.prime(oi_norm_v, i)
-        n_dn_v, global_step_v, start_time_tr_v = torch.zeros(NUM_ENVS, device=device), 0, time.time()
+        n_dn_v, global_step_v, start_time_tr_v = (
+            torch.zeros(NUM_ENVS, device=device),
+            0,
+            time.time(),
+        )
         cam_tr_done_v = False
         u_total_v = TOTAL_STEPS // (NUM_ENVS * ROLLOUT_STEPS)
         try:
@@ -390,7 +394,12 @@ def run():
                     ret_v = adv_v + val_st_v
                 agent.train()
                 b_obs_v, b_lp_v = obs_st_v.reshape(-1, SEQ_LEN, obs_dim), logp_st_v.reshape(-1)
-                b_act_v, b_adv_v, b_ret_v, b_val_v = act_st_v.reshape(-1, act_dim), adv_v.reshape(-1), ret_v.reshape(-1), val_st_v.reshape(-1)
+                b_act_v, b_adv_v, b_ret_v, b_val_v = (
+                    act_st_v.reshape(-1, act_dim),
+                    adv_v.reshape(-1),
+                    ret_v.reshape(-1),
+                    val_st_v.reshape(-1),
+                )
                 acc_pg_v, acc_vl_v, acc_et_v, acc_kl_v, bt_cnt_v = 0.0, 0.0, 0.0, 0.0, 0
                 idx_l_v = np.arange(NUM_ENVS * ROLLOUT_STEPS)
                 for epoch_i_v in range(UPDATE_EPOCHS):
@@ -407,9 +416,20 @@ def run():
                             kl_v = (ratio_v - 1.0 - log_diff_v).mean().item()
                             acc_kl_v += kl_v
                         m_adv_v = (b_adv_v[mb_v] - b_adv_v[mb_v].mean()) / (b_adv_v[mb_v].std() + 1e-8) if NORM_ADV else b_adv_v[mb_v]
-                        pg_l_v = torch.max(-m_adv_v * ratio_v, -m_adv_v * torch.clamp(ratio_v, 1-CLIP_COEF, 1+CLIP_COEF)).mean()
+                        pg_l_v = torch.max(
+                            -m_adv_v * ratio_v,
+                            -m_adv_v * torch.clamp(ratio_v, 1 - CLIP_COEF, 1 + CLIP_COEF),
+                        ).mean()
                         nv_f_v = n_vl_v.flatten()
-                        v_l_v = 0.5 * torch.max((nv_f_v - b_ret_v[mb_v])**2, (b_val_v[mb_v] + torch.clamp(nv_f_v - b_val_v[mb_v], -CLIP_COEF, CLIP_COEF) - b_ret_v[mb_v])**2).mean() if CLIP_VALUE_LOSS else 0.5 * ((nv_f_v - b_ret_v[mb_v])**2).mean()
+                        v_l_v = (
+                            0.5
+                            * torch.max(
+                                (nv_f_v - b_ret_v[mb_v]) ** 2,
+                                (b_val_v[mb_v] + torch.clamp(nv_f_v - b_val_v[mb_v], -CLIP_COEF, CLIP_COEF) - b_ret_v[mb_v]) ** 2,
+                            ).mean()
+                            if CLIP_VALUE_LOSS
+                            else 0.5 * ((nv_f_v - b_ret_v[mb_v]) ** 2).mean()
+                        )
                         total_l_v = pg_l_v - ENTROPY_COEF * n_et_v.mean() + v_l_v * VF_COEF
                         acc_pg_v += pg_l_v.item()
                         acc_vl_v += v_l_v.item()
@@ -424,15 +444,19 @@ def run():
                 if u_idx_v % LOG_FREQ == 0:
                     elapsed_v = time.time() - start_time_tr_v
                     sps_v = int(global_step_v / (elapsed_v + 1e-6))
-                    ndr_v, hr_v, lr_v = np.mean(ndr_q_v) if ndr_q_v else 0.0, np.mean(hold_q_v) if hold_q_v else 0.0, np.mean(lock_q_v) if lock_q_v else 0.0
+                    ndr_v, hr_v, lr_v = (
+                        np.mean(ndr_q_v) if ndr_q_v else 0.0,
+                        np.mean(hold_q_v) if hold_q_v else 0.0,
+                        np.mean(lock_q_v) if lock_q_v else 0.0,
+                    )
                     div_f_v = bt_cnt_v + 1e-6
                     m_rew_v = rew_st_v.mean().item()
                     print(f"Upd {u_idx_v:4d} | SPS {sps_v:5d} | Rew {m_rew_v:7.4f} | NDR {ndr_v:.2f} | Hold {hr_v:.2f} | Lock {lr_v:.2f} | P-L {acc_pg_v/div_f_v:6.4f} | V-L {acc_vl_v/div_f_v:6.4f}")
                     writer.add_scalar("charts/SPS", sps_v, global_step_v)
                     writer.add_scalar("charts/reward", m_rew_v, global_step_v)
                     writer.add_scalar("charts/ndr", ndr_v, global_step_v)
-                    writer.add_scalar("losses/policy_loss", acc_pg_v/div_f_v, global_step_v)
-                    writer.add_scalar("losses/value_loss", acc_vl_v/div_f_v, global_step_v)
+                    writer.add_scalar("losses/policy_loss", acc_pg_v / div_f_v, global_step_v)
+                    writer.add_scalar("losses/value_loss", acc_vl_v / div_f_v, global_step_v)
                 if u_idx_v % SAVE_FREQ == 0:
                     torch.save(agent.state_dict(), m_path_v)
         finally:

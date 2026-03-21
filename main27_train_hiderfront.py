@@ -1,17 +1,9 @@
-import sys
-import os
-import time
 import argparse
-import traceback
-import numpy as np
 import math
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from src.core.constants import P_SCALE
-import gymnasium as gym
-from functools import partial
-from numba import njit, prange
+import os
+import sys
+
+import numpy as np
 
 try:
     import tomllib  # Python 3.11+
@@ -24,16 +16,10 @@ except Exception as exc:
     print(f"Exception in wandb import: {exc}")
     wandb = None
 
-sys.path.append(
-    os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "src")
-    )
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
-from envs.hns_environment import TeamCosEnv
-from models.ppo_transformer_v2 import AgentV2
-from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
 from experiments.online_update_untrained import set_hider_pos_fixed
+
 # =====================
 # main27_train_final.pyのグローバル設定・CLIパース・プロファイル切り替え
 # =====================
@@ -42,6 +28,7 @@ POLICY_RULE = "rule"
 
 CONFIG_PATH = "configs/hparams_main27.toml"
 WORKER_SHUTDOWN_ERRORS = (EOFError, BrokenPipeError, ConnectionResetError)
+
 
 def _cli_profile_override_from_argv(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
@@ -52,6 +39,7 @@ def _cli_profile_override_from_argv(argv=None):
             if i + 1 < len(args):
                 return args[i + 1]
     return None
+
 
 def _cli_compare_profiles_from_argv(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
@@ -66,6 +54,7 @@ def _cli_compare_profiles_from_argv(argv=None):
     if not raw:
         return []
     return [p.strip().lower() for p in str(raw).split(",") if p.strip()]
+
 
 def _get_available_runtime_profiles(path):
     try:
@@ -84,15 +73,14 @@ def _get_available_runtime_profiles(path):
         print(f"Exception in _get_available_runtime_profiles: {exc}")
         return ["train", "debug"]
 
+
 def _normalize_profile_name(value, available_profiles):
     text = str(value).strip().lower()
     if text in available_profiles:
         return text
-    print(
-        f"Invalid runtime.active_profile={value}. "
-        f"Fallback to train. available={available_profiles}"
-    )
+    print(f"Invalid runtime.active_profile={value}. " f"Fallback to train. available={available_profiles}")
     return "train"
+
 
 def _load_runtime_config(path, profile_override=None, available_profiles=None):
     if available_profiles is None:
@@ -103,18 +91,10 @@ def _load_runtime_config(path, profile_override=None, available_profiles=None):
         runtime_cfg = raw.get("runtime", {}) if isinstance(raw, dict) else {}
         if not isinstance(runtime_cfg, dict):
             runtime_cfg = {}
-        profile_value = (
-            profile_override
-            if profile_override is not None
-            else runtime_cfg.get("active_profile", "train")
-        )
-        profile_origin = (
-            "cli(--profile)" if profile_override is not None else "toml(runtime.active_profile)"
-        )
+        profile_value = profile_override if profile_override is not None else runtime_cfg.get("active_profile", "train")
+        profile_origin = "cli(--profile)" if profile_override is not None else "toml(runtime.active_profile)"
         profile_lower = _normalize_profile_name(profile_value, available_profiles)
-        common = (
-            runtime_cfg.get("common", {}) if isinstance(runtime_cfg, dict) else {}
-        )
+        common = runtime_cfg.get("common", {}) if isinstance(runtime_cfg, dict) else {}
         profile_key = None
         if isinstance(runtime_cfg, dict):
             for k in runtime_cfg.keys():
@@ -125,9 +105,7 @@ def _load_runtime_config(path, profile_override=None, available_profiles=None):
                     break
         if profile_key is None:
             profile_key = profile_lower
-        profile_cfg = (
-            runtime_cfg.get(profile_key, {}) if isinstance(runtime_cfg, dict) else {}
-        )
+        profile_cfg = runtime_cfg.get(profile_key, {}) if isinstance(runtime_cfg, dict) else {}
         profile = profile_key
         if not isinstance(common, dict):
             common = {}
@@ -137,10 +115,8 @@ def _load_runtime_config(path, profile_override=None, available_profiles=None):
         merged.update(profile_cfg)
         return merged, profile, profile_origin
     except Exception as exc:
-        raise SystemExit(
-            f"runtime config load failed: {path} ({exc}). "
-            "Fix the TOML and retry."
-        ) from exc
+        raise SystemExit(f"runtime config load failed: {path} ({exc}). " "Fix the TOML and retry.") from exc
+
 
 def _parse_cli_args(argv=None):
     cli_examples = (
@@ -172,10 +148,7 @@ def _parse_cli_args(argv=None):
     )
     parser.add_argument(
         "--compare-profiles",
-        help=(
-            "カンマ区切りで複数 profile を順次実行（例: "
-            "train_wall_only,train_no_wall_stick,train_base_reward）"
-        ),
+        help=("カンマ区切りで複数 profile を順次実行（例: " "train_wall_only,train_no_wall_stick,train_base_reward）"),
     )
     parser.add_argument(
         "--examples",
@@ -187,10 +160,12 @@ def _parse_cli_args(argv=None):
         print(cli_examples)
         raise SystemExit(0)
 
+
 def _to_bool(value):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _cfg(name, default, cast=None, overrides=None):
     if overrides is None:
@@ -203,15 +178,14 @@ def _cfg(name, default, cast=None, overrides=None):
         return raw
     return cast(raw)
 
+
 # =====================
 # グローバル設定の初期化
 # =====================
 CLI_PROFILE_OVERRIDE = _cli_profile_override_from_argv()
 CLI_COMPARE_PROFILES = _cli_compare_profiles_from_argv()
 AVAILABLE_RUNTIME_PROFILES = _get_available_runtime_profiles(CONFIG_PATH)
-RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(
-    CONFIG_PATH, CLI_PROFILE_OVERRIDE, AVAILABLE_RUNTIME_PROFILES
-)
+RUNTIME_OVERRIDES, RUN_PROFILE, RUN_PROFILE_SOURCE = _load_runtime_config(CONFIG_PATH, CLI_PROFILE_OVERRIDE, AVAILABLE_RUNTIME_PROFILES)
 with open(CONFIG_PATH, "rb") as f:
     config = tomllib.load(f)
 hp = dict(config.get("base", {}))
@@ -231,10 +205,30 @@ USE_CUSTOM_REWARD = _cfg("use_custom_reward", hp.get("use_custom_reward", "1"), 
 AUTO_TUNE_HPARAMS = _cfg("auto_tune_hparams", hp.get("auto_tune_hparams", "1"), _to_bool, RUNTIME_OVERRIDES)
 DEBUG_HIDER_POLICY = _cfg("debug_hider_policy", hp.get("debug_hider_policy", "rule"), str, RUNTIME_OVERRIDES)
 DEBUG_SEEKER_POLICY = _cfg("debug_seeker_policy", hp.get("debug_seeker_policy", "rule"), str, RUNTIME_OVERRIDES)
-MODEL_POLICY_DETERMINISTIC = _cfg("model_policy_deterministic", hp.get("model_policy_deterministic", "0"), _to_bool, RUNTIME_OVERRIDES)
-DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("debug_symmetric_hider_policy", hp.get("debug_symmetric_hider_policy", "0"), _to_bool, RUNTIME_OVERRIDES)
-TRAIN_OTHER_HIDER_POLICY = _cfg("train_other_hider_policy", hp.get("train_other_hider_policy", "rule"), str, RUNTIME_OVERRIDES)
-TRAIN_OTHER_SEEKER_POLICY = _cfg("train_other_seeker_policy", hp.get("train_other_seeker_policy", "rule"), str, RUNTIME_OVERRIDES)
+MODEL_POLICY_DETERMINISTIC = _cfg(
+    "model_policy_deterministic",
+    hp.get("model_policy_deterministic", "0"),
+    _to_bool,
+    RUNTIME_OVERRIDES,
+)
+DEBUG_SYMMETRIC_HIDER_POLICY = _cfg(
+    "debug_symmetric_hider_policy",
+    hp.get("debug_symmetric_hider_policy", "0"),
+    _to_bool,
+    RUNTIME_OVERRIDES,
+)
+TRAIN_OTHER_HIDER_POLICY = _cfg(
+    "train_other_hider_policy",
+    hp.get("train_other_hider_policy", "rule"),
+    str,
+    RUNTIME_OVERRIDES,
+)
+TRAIN_OTHER_SEEKER_POLICY = _cfg(
+    "train_other_seeker_policy",
+    hp.get("train_other_seeker_policy", "rule"),
+    str,
+    RUNTIME_OVERRIDES,
+)
 if not TRAIN_MODE:
     if RUN_PROFILE == "debug":
         USE_VIEWER = True
@@ -260,13 +254,14 @@ ENV_CONFIG = {
 
 # ...existing code (設定・定数・関数定義などはmain27_train_final.pyと同じ)...
 
+
 def reset_env_with_hider_front(env):
     obs, info = env.reset()
     s_key = env.learnable_agent_key
     s_bid = env.body_ids[s_key]
     s_pos = env.data.xpos[s_bid][:2].copy()
     try:
-        rot_jid = env.qpos_indices[s_key]['rot']
+        rot_jid = env.qpos_indices[s_key]["rot"]
         qadr = env.model.jnt_qposadr[rot_jid]
         yaw = float(env.data.qpos[qadr])
     except Exception:
@@ -282,10 +277,12 @@ def reset_env_with_hider_front(env):
     set_hider_pos_fixed(env, h_key, hx, hy, z=0.8)
     try:
         import mujoco
+
         mujoco.mj_forward(env.model, env.data)
     except Exception:
         pass
     return obs, info
+
 
 ############################################################
 # main27_train_final.py からのコア関数・クラス・定数移植

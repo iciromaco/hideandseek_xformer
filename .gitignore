@@ -8,6 +8,7 @@ optuna_temp/
 trial_initial_???/
 tiial_refinement_???/
 trial???/
+experiments/
 optuna_results/trial_*/*
 *.pt
 *.json
@@ -16,4 +17,12 @@ optuna_results/trial_*/*
 temp*.*
 uv.lock
 .DS_Store
+*.npz
+plots/
+plots_new/
+plots_old/
+checkpoints/
+logs/
+legacy/
+wandb/
 

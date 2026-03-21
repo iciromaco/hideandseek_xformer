@@ -1,11 +1,13 @@
-import pickle
-import numpy as np
-import matplotlib.pyplot as plt
-import sys
 import os
+import pickle
+import sys
+
+import matplotlib.pyplot as plt
+import numpy as np
 
 # --- 使い方 ---
 # python scripts/visualize_sdf_from_checkpoint.py checkpoints/sdfgrid_mode4_xxxxx.pkl
+
 
 def main(pkl_path):
     if not os.path.exists(pkl_path):
@@ -21,15 +23,24 @@ def main(pkl_path):
     print(f"SDF min: {np.min(grid)}, max: {np.max(grid)}")
 
     plt.figure(figsize=(8, 6))
-    im = plt.imshow(grid, origin='lower', cmap='viridis',
-                   extent=[min_x, min_x + grid.shape[1]*cell_size,
-                           min_y, min_y + grid.shape[0]*cell_size])
-    plt.colorbar(im, label='SDF value')
-    plt.title(f'SDF Grid Visualization\n{os.path.basename(pkl_path)}')
-    plt.xlabel('World X')
-    plt.ylabel('World Y')
+    im = plt.imshow(
+        grid,
+        origin="lower",
+        cmap="viridis",
+        extent=[
+            min_x,
+            min_x + grid.shape[1] * cell_size,
+            min_y,
+            min_y + grid.shape[0] * cell_size,
+        ],
+    )
+    plt.colorbar(im, label="SDF value")
+    plt.title(f"SDF Grid Visualization\n{os.path.basename(pkl_path)}")
+    plt.xlabel("World X")
+    plt.ylabel("World Y")
     plt.tight_layout()
     plt.show()
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

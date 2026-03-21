@@ -5,57 +5,76 @@ compare model output vs env.data.ctrl and resulting vel/pos/reward.
 Usage:
   uv run mjpython scripts/debug_apply_checkpoint_to_env.py [--no-objects] [--ckpt PATH]
 """
-import sys, os, torch, time
+
+import os
+import sys
+
+import torch
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import numpy as np
+
 from src.envs.hns_environment import TeamCosEnv
 
+
 def main():
-    no_objects = '--no-objects' in sys.argv
+    no_objects = "--no-objects" in sys.argv
     ckpt_arg = None
     for i, a in enumerate(sys.argv):
-        if a == '--ckpt' and i + 1 < len(sys.argv):
-            ckpt_arg = sys.argv[i+1]
+        if a == "--ckpt" and i + 1 < len(sys.argv):
+            ckpt_arg = sys.argv[i + 1]
 
     n_boxes = 0 if no_objects else 2
     n_ramps = 0 if no_objects else 1
 
-    env = TeamCosEnv(mode='initial', target='seeker', n_seekers=1, n_hiders=2, n_boxes=n_boxes, n_ramps=n_ramps, render_mode=None)
+    env = TeamCosEnv(
+        mode="initial",
+        target="seeker",
+        n_seekers=1,
+        n_hiders=2,
+        n_boxes=n_boxes,
+        n_ramps=n_ramps,
+        render_mode=None,
+    )
     ak = env.seeker_keys[0]
     bid = env.body_ids[ak]
     ctrl_len = env.action_space.shape[0]
-    print('env created. actuator_ids:', env.actuator_ids)
+    print("env created. actuator_ids:", env.actuator_ids)
 
     # checkpoint path default same naming as other scripts
     if ckpt_arg is None:
-        path = os.path.join('checkpoints', f"HNS_V27_seeker_s{env.n_seekers}_h{env.n_hiders}_b{env.n_boxes}_r{env.n_ramps}.pt")
+        path = os.path.join(
+            "checkpoints",
+            f"HNS_V27_seeker_s{env.n_seekers}_h{env.n_hiders}_b{env.n_boxes}_r{env.n_ramps}.pt",
+        )
     else:
         path = ckpt_arg
-    print('requested checkpoint path:', path)
+    print("requested checkpoint path:", path)
     if not os.path.exists(path):
         # fallback: search for any matching seeker checkpoint in checkpoints/
-        ck_dir = os.path.join(os.getcwd(), 'checkpoints')
+        ck_dir = os.path.join(os.getcwd(), "checkpoints")
         found = []
         if os.path.isdir(ck_dir):
             for fn in os.listdir(ck_dir):
-                if fn.startswith('HNS_V27_seeker_') and fn.endswith('.pt'):
+                if fn.startswith("HNS_V27_seeker_") and fn.endswith(".pt"):
                     found.append(os.path.join(ck_dir, fn))
         if found:
             # pick newest
             found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
             path = found[0]
-            print('requested checkpoint not found; falling back to', path)
+            print("requested checkpoint not found; falling back to", path)
         else:
-            print('checkpoint not found and no fallback available; aborting')
-            env.close();
+            print("checkpoint not found and no fallback available; aborting")
+            env.close()
             return
 
-    state_dict = torch.load(path, map_location='cpu')
+    state_dict = torch.load(path, map_location="cpu")
     # If checkpoint was trained with different env (obs dim), try to recreate env
     # by parsing b{n}_r{m} from filename pattern.
     import re
+
     m = re.search(r"_b(\d+)_r(\d+)\.pt$", path)
     if m:
         ck_b = int(m.group(1))
@@ -64,14 +83,22 @@ def main():
             print(f"checkpoint expects b={ck_b}, r={ck_r} but env has b={env.n_boxes}, r={env.n_ramps}; recreating env to match checkpoint")
             env.close()
             # recreate env with matching object counts
-            env = TeamCosEnv(mode='initial', target='seeker', n_seekers=1, n_hiders=2, n_boxes=ck_b, n_ramps=ck_r, render_mode=None)
+            env = TeamCosEnv(
+                mode="initial",
+                target="seeker",
+                n_seekers=1,
+                n_hiders=2,
+                n_boxes=ck_b,
+                n_ramps=ck_r,
+                render_mode=None,
+            )
             ak = env.seeker_keys[0]
             bid = env.body_ids[ak]
             ctrl_len = env.action_space.shape[0]
-            print('recreated env. actuator_ids:', env.actuator_ids)
+            print("recreated env. actuator_ids:", env.actuator_ids)
     # set into env
     ok = env.set_inference_policy_state([ak], state_dict, seq_len=16, hidden_dim=256)
-    print('set_inference_policy_state ok=', ok)
+    print("set_inference_policy_state ok=", ok)
 
     # prime policy history for learnable agent
     obs, _ = env.reset()
@@ -80,8 +107,8 @@ def main():
     env._prime_policy_history(ak, seq_len, norm_obs)
 
     # warmup
-    warmup = getattr(env, 'prep_steps', 80)
-    print('warming up for', warmup)
+    warmup = getattr(env, "prep_steps", 80)
+    print("warming up for", warmup)
     zero_a = np.zeros(ctrl_len, dtype=np.float32)
     for _ in range(warmup):
         env.step(zero_a)
@@ -89,17 +116,17 @@ def main():
     # get model directly
     model = env._inference_models.get(ak)
     if model is None:
-        print('no inference model found in env._inference_models')
+        print("no inference model found in env._inference_models")
     else:
         hist = env._get_policy_history_seq(ak, seq_len, env._normalize_obs(env._get_obs(env.learnable_agent_index)))
         inp = torch.as_tensor(hist[None, :, :], dtype=torch.float32)
         with torch.no_grad():
             out = model.get_action_and_value(inp)[0].cpu().numpy().reshape(-1)
-        print('model output (first 8):', out[:8])
+        print("model output (first 8):", out[:8])
 
     # run multiple frames comparing model->env behavior
     n_steps = 32
-    print(f'Running {n_steps} model-driven environment steps (override learnable policy) and dumping observations.')
+    print(f"Running {n_steps} model-driven environment steps (override learnable policy) and dumping observations.")
     obs_hist_list = []
     model_out_list = []
     ctrl_list = []
@@ -141,7 +168,13 @@ def main():
         try:
             rb, seen_bool, gaze_max, gaze_dist_max, learnable_seen = env._compute_team_reward()
         except Exception:
-            rb, seen_bool, gaze_max, gaze_dist_max, learnable_seen = (float('nan'), False, 0.0, 0.0, False)
+            rb, seen_bool, gaze_max, gaze_dist_max, learnable_seen = (
+                float("nan"),
+                False,
+                0.0,
+                0.0,
+                False,
+            )
 
         # compute min_seeker_dist and seen_count locally to capture numeric count
         min_seeker_dist = 9999.0
@@ -153,12 +186,19 @@ def main():
             for sk in env.seeker_keys:
                 sid = env.body_ids[sk]
                 spos = env.data.xpos[sid][:2]
-                dx = float(hpos[0] - spos[0]); dy = float(hpos[1] - spos[1])
-                dist = (dx*dx + dy*dy) ** 0.5
+                dx = float(hpos[0] - spos[0])
+                dy = float(hpos[1] - spos[1])
+                dist = (dx * dx + dy * dy) ** 0.5
                 min_seeker_dist = min(min_seeker_dist, dist)
                 # use env._is_vis to match environment visibility logic
                 try:
-                    if env._is_vis(spos, env.data.qpos[env.model.jnt_qposadr[env.qpos_indices[sk]['rot']]], hpos, sid, hid):
+                    if env._is_vis(
+                        spos,
+                        env.data.qpos[env.model.jnt_qposadr[env.qpos_indices[sk]["rot"]]],
+                        hpos,
+                        sid,
+                        hid,
+                    ):
                         this_seen = True
                         break
                 except Exception:
@@ -172,12 +212,12 @@ def main():
         team_gaze_max_list.append(float(gaze_max))
         team_gaze_dist_max_list.append(float(gaze_dist_max))
         team_learnable_hider_seen_list.append(bool(learnable_seen))
-        team_min_seeker_dist_list.append(float(min_seeker_dist if min_seeker_dist < 9998.0 else float('nan')))
+        team_min_seeker_dist_list.append(float(min_seeker_dist if min_seeker_dist < 9998.0 else float("nan")))
 
-        print(f'FRAME {i}: model_out[:4]={out[:4]} -> env.ctrl[first4]={ctrl[:4]} vel={vel:.3f} reward={reward:.3f}')
+        print(f"FRAME {i}: model_out[:4]={out[:4]} -> env.ctrl[first4]={ctrl[:4]} vel={vel:.3f} reward={reward:.3f}")
 
     # save dump
-    dump_path = 'debug_model_env_dump_ext.npz'
+    dump_path = "debug_model_env_dump_ext.npz"
     np.savez_compressed(
         dump_path,
         obs_hist=np.asarray(obs_hist_list),
@@ -194,10 +234,11 @@ def main():
         team_learnable_hider_seen=np.asarray(team_learnable_hider_seen_list),
         team_min_seeker_dist=np.asarray(team_min_seeker_dist_list),
     )
-    print('wrote extended dump to', dump_path)
+    print("wrote extended dump to", dump_path)
     env.set_override_learnable_policy(False)
 
     env.close()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

@@ -1,9 +1,11 @@
 # src/agents/scripted_agents.py
-# scripted_agents.py v5.44 
+# scripted_agents.py v5.44
+
+import math
 
 import numpy as np
-import math
-from core.constants import P_SCALE, L_SCALE, R_SCALE
+
+from core.constants import L_SCALE, P_SCALE, R_SCALE
 
 
 def _nearest_pushable(obs, idx):
@@ -83,15 +85,17 @@ class RuleBasedSeeker:
         p_scale = P_SCALE
         lidar_raw = obs[idx.LIDAR] * L_SCALE
         cur_rot = obs[idx.SELF.ROT] * R_SCALE
-        
+
         front_min = np.min(lidar_raw[idx.LIDAR_FRONT_IDX])
         back_min = np.min(lidar_raw[idx.LIDAR_BACK_IDX])
         l_gap = np.sum(lidar_raw[idx.LIDAR_LEFT_IDX])
         r_gap = np.sum(lidar_raw[idx.LIDAR_RIGHT_IDX])
-        
-        norm_speed = np.linalg.norm(obs[idx.SELF.VEL_X:idx.SELF.VEL_Y+1])
-        if 0.001 < norm_speed < 0.015: self.stuck_counter += 1
-        else: self.stuck_counter = 0
+
+        norm_speed = np.linalg.norm(obs[idx.SELF.VEL_X : idx.SELF.VEL_Y + 1])
+        if 0.001 < norm_speed < 0.015:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
 
         push_candidate = _nearest_pushable(obs, idx)
         if push_candidate is not None and push_candidate[0] < 1.4 and push_candidate[1] > 0.15:
@@ -107,8 +111,10 @@ class RuleBasedSeeker:
 
         if self.reflex_timer > 0:
             self.reflex_timer -= 1
-            if self.reflex_timer > 8: fwd, trn = 0.6 * self.escape_fwd_dir, 0.0
-            else: fwd, trn = 0.2 * self.escape_fwd_dir, 0.85 * self.escape_turn_dir
+            if self.reflex_timer > 8:
+                fwd, trn = 0.6 * self.escape_fwd_dir, 0.0
+            else:
+                fwd, trn = 0.2 * self.escape_fwd_dir, 0.85 * self.escape_turn_dir
         elif self.stuck_counter > 40 or front_min < 0.42:
             self.reflex_timer, self.stuck_counter = 14, 0
             self.escape_fwd_dir = -1.0 if front_min < back_min else 1.0
@@ -127,19 +133,26 @@ class RuleBasedSeeker:
                 fwd = 0.55 * max(0.1, math.cos(target_angle)) * speed_scale
             else:
                 self.wander_timer -= 1
-                if avoid_w > 0.5: self.wander_timer = 0
+                if avoid_w > 0.5:
+                    self.wander_timer = 0
                 if self.wander_timer <= 0:
-                    if l_gap > r_gap: self.wander_angle = cur_rot + np.random.uniform(0.3, np.pi)
-                    else: self.wander_angle = cur_rot + np.random.uniform(-np.pi, -0.3)
+                    if l_gap > r_gap:
+                        self.wander_angle = cur_rot + np.random.uniform(0.3, np.pi)
+                    else:
+                        self.wander_angle = cur_rot + np.random.uniform(-np.pi, -0.3)
                     self.wander_timer = np.random.randint(150, 400)
-                target_angle = (self.wander_angle - cur_rot + np.pi) % (2*np.pi) - np.pi
+                target_angle = (self.wander_angle - cur_rot + np.pi) % (2 * np.pi) - np.pi
                 fwd = 0.45 * speed_scale
 
             trn = np.clip(target_angle * 2.8 + avoid_torque * avoid_w, -0.9, 0.9)
 
         chase_priority = len(visible_enemies) > 0
         lck, grb, self.interact_cooldown, self.interact_focus_steps = _interaction_buttons(
-            obs, idx, self.interact_cooldown, self.interact_focus_steps, suppress=chase_priority
+            obs,
+            idx,
+            self.interact_cooldown,
+            self.interact_focus_steps,
+            suppress=chase_priority,
         )
         return np.array([fwd, trn, lck, grb])
 
@@ -161,15 +174,17 @@ class RuleBasedHider:
         p_scale = P_SCALE
         lidar_raw = obs[idx.LIDAR] * L_SCALE
         cur_rot = obs[idx.SELF.ROT] * R_SCALE
-        
+
         front_min = np.min(lidar_raw[idx.LIDAR_FRONT_IDX])
         back_min = np.min(lidar_raw[idx.LIDAR_BACK_IDX])
         l_gap = np.sum(lidar_raw[idx.LIDAR_LEFT_IDX])
         r_gap = np.sum(lidar_raw[idx.LIDAR_RIGHT_IDX])
-        
-        norm_speed = np.linalg.norm(obs[idx.SELF.VEL_X:idx.SELF.VEL_Y+1])
-        if 0.001 < norm_speed < 0.015: self.stuck_counter += 1
-        else: self.stuck_counter = 0
+
+        norm_speed = np.linalg.norm(obs[idx.SELF.VEL_X : idx.SELF.VEL_Y + 1])
+        if 0.001 < norm_speed < 0.015:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
 
         push_candidate = _nearest_pushable(obs, idx)
         if push_candidate is not None and push_candidate[0] < 1.4 and push_candidate[1] > 0.15:
@@ -185,31 +200,41 @@ class RuleBasedHider:
 
         if self.reflex_timer > 0:
             self.reflex_timer -= 1
-            if self.reflex_timer > 8: fwd, trn = 0.6 * self.escape_fwd_dir, 0.0
-            else: fwd, trn = 0.2 * self.escape_fwd_dir, 0.85 * self.escape_turn_dir
+            if self.reflex_timer > 8:
+                fwd, trn = 0.6 * self.escape_fwd_dir, 0.0
+            else:
+                fwd, trn = 0.2 * self.escape_fwd_dir, 0.85 * self.escape_turn_dir
         elif self.stuck_counter > 40 or front_min < 0.42:
             self.reflex_timer, self.stuck_counter = 14, 0
             self.escape_fwd_dir = -1.0 if front_min < back_min else 1.0
             self.escape_turn_dir = 1.0 if l_gap >= r_gap else -1.0
         else:
             if seeker_vis:
-                tx, ty = obs[idx.OTHERS[0].REL_X] * p_scale, obs[idx.OTHERS[0].REL_Y] * p_scale
+                tx, ty = (
+                    obs[idx.OTHERS[0].REL_X] * p_scale,
+                    obs[idx.OTHERS[0].REL_Y] * p_scale,
+                )
                 angle_to_seeker = math.atan2(ty, tx)
-                escape_base = (angle_to_seeker + np.pi + np.pi) % (2*np.pi) - np.pi
+                escape_base = (angle_to_seeker + np.pi + np.pi) % (2 * np.pi) - np.pi
                 side_bias = 1.2 if l_gap > r_gap else -1.2
-                target_angle = (escape_base + side_bias + np.pi) % (2*np.pi) - np.pi
-                
+                target_angle = (escape_base + side_bias + np.pi) % (2 * np.pi) - np.pi
+
                 fwd_val = math.cos(target_angle)
-                if fwd_val < 0 and back_min < 0.5: fwd = 0.0
-                else: fwd = 0.8 * fwd_val * speed_scale
+                if fwd_val < 0 and back_min < 0.5:
+                    fwd = 0.0
+                else:
+                    fwd = 0.8 * fwd_val * speed_scale
             else:
                 self.wander_timer -= 1
-                if avoid_w > 0.5: self.wander_timer = 0
+                if avoid_w > 0.5:
+                    self.wander_timer = 0
                 if self.wander_timer <= 0:
-                    if l_gap > r_gap: self.wander_angle = cur_rot + np.random.uniform(0.3, np.pi)
-                    else: self.wander_angle = cur_rot + np.random.uniform(-np.pi, -0.3)
+                    if l_gap > r_gap:
+                        self.wander_angle = cur_rot + np.random.uniform(0.3, np.pi)
+                    else:
+                        self.wander_angle = cur_rot + np.random.uniform(-np.pi, -0.3)
                     self.wander_timer = np.random.randint(200, 500)
-                target_angle = (self.wander_angle - cur_rot + np.pi) % (2*np.pi) - np.pi
+                target_angle = (self.wander_angle - cur_rot + np.pi) % (2 * np.pi) - np.pi
                 fwd = 0.45 * speed_scale
 
             trn = np.clip(target_angle * 2.8 + avoid_torque * avoid_w, -0.9, 0.9)
@@ -221,6 +246,10 @@ class RuleBasedHider:
             seeker_dist = math.hypot(sx, sy)
         escape_priority = seeker_vis and seeker_dist < 7.0
         lck, grb, self.interact_cooldown, self.interact_focus_steps = _interaction_buttons(
-            obs, idx, self.interact_cooldown, self.interact_focus_steps, suppress=escape_priority
+            obs,
+            idx,
+            self.interact_cooldown,
+            self.interact_focus_steps,
+            suppress=escape_priority,
         )
         return np.array([fwd, trn, lck, grb])

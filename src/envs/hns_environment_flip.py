@@ -9,7 +9,9 @@
 このクラスは `step()` をオーバーライドして、渡された action の先頭要素 (forward)
 だけを反転して親の `step()` に渡します。その他の振る舞いは完全に継承されます。
 """
+
 from typing import Any
+
 import numpy as np
 
 from .hns_environment import TeamCosEnv

@@ -1,18 +1,19 @@
 # visibility_engine.py v2.03
 # 演習第26回：【不連続性根絶版】近距離での15mジャンプを廃止し、物理的誠実さを復元
-# 
+#
 # 修正内容:
 # 1. 跳ね上がりバグの解消: レイが極至近距離でヒットした際に max_dist を返していたロジックを削除。
 #    - これにより、エージェントが壁に密着しても正確に 0.45m 付近の値を返し続けます。
 # 2. SKIP_THRESHOLDの適正化: 数値安定性のための 0.001m まで縮小し、実質的に全距離を有効化。
 # 3. 1行1命令の遵守: Numba JIT 内の全ステップを詳細に記述。
 
-import numpy as np
-import mujoco
 import math
+
+import mujoco
+import numpy as np
 from numba import njit
 
-SDF_CELL_SIZE = 0.02 # 2cm セルサイズで静的SDFグリッドを構築
+SDF_CELL_SIZE = 0.02  # 2cm セルサイズで静的SDFグリッドを構築
 
 
 def _compute_wall_sdf_grid_jit(min_x, min_y, cell_size, n_x, n_y, walls_xpos, walls_size, max_dist):
@@ -40,9 +41,12 @@ def _compute_wall_sdf_grid_jit(min_x, min_y, cell_size, n_x, n_y, walls_xpos, wa
                 wall_idx = np.argmin(sdf_vals)
                 wall_pos = obstacles[wall_idx, :2]
                 wall_size = obstacles[wall_idx, 2:]
-                print(f"[SDF DEBUG] mode=static_grid, grid=({ix},{iy}), world=({px:.3f},{py:.3f}), SDF={d_min:.4f}, wall_center=({wall_pos[0]:.3f},{wall_pos[1]:.3f}), wall_size=({wall_size[0]:.3f},{wall_size[1]:.3f})")
+                print(
+                    f"[SDF DEBUG] mode=static_grid, grid=({ix},{iy}), world=({px:.3f},{py:.3f}), SDF={d_min:.4f}, wall_center=({wall_pos[0]:.3f},{wall_pos[1]:.3f}), wall_size=({wall_size[0]:.3f},{wall_size[1]:.3f})"
+                )
                 debug_printed = True
     return grid
+
 
 @njit(cache=True)
 def _sample_sdf_grid_bilinear(px, py, sdf_grid, min_x, min_y, cell_size, max_dist):
@@ -77,7 +81,20 @@ def _sample_sdf_grid_bilinear(px, py, sdf_grid, min_x, min_y, cell_size, max_dis
 
 
 @njit(cache=True)
-def _get_dynamic_sdf_scalar(px, py, ag_pos, ag_radii, ag_b_ids, box_pos, box_size, box_quats, box_b_ids, ex1, ignore_id, max_dist):
+def _get_dynamic_sdf_scalar(
+    px,
+    py,
+    ag_pos,
+    ag_radii,
+    ag_b_ids,
+    box_pos,
+    box_size,
+    box_quats,
+    box_b_ids,
+    ex1,
+    ignore_id,
+    max_dist,
+):
     d_min = max_dist
 
     num_ags = len(ag_pos)
@@ -123,21 +140,37 @@ def _get_dynamic_sdf_scalar(px, py, ag_pos, ag_radii, ag_b_ids, box_pos, box_siz
 
     return d_min
 
+
 @njit(cache=True)
-def _get_sdf_scalar(px, py, walls_xpos, walls_size, ag_pos, ag_radii, ag_b_ids, box_pos, box_size, box_quats, box_b_ids, ex1, ex2, ignore_id):
+def _get_sdf_scalar(
+    px,
+    py,
+    walls_xpos,
+    walls_size,
+    ag_pos,
+    ag_radii,
+    ag_b_ids,
+    box_pos,
+    box_size,
+    box_quats,
+    box_b_ids,
+    ex1,
+    ex2,
+    ignore_id,
+):
     """SDF演算コア：スカラー変数による最短距離算出"""
     d_min = 15.0
-    
+
     # 1. 静的な壁 (AABB)
     num_walls = len(walls_xpos)
     for i in range(num_walls):
         dx = abs(px - walls_xpos[i, 0]) - walls_size[i, 0]
         dy = abs(py - walls_xpos[i, 1]) - walls_size[i, 1]
-        
-        d_box = math.sqrt(max(dx, 0.0)**2 + max(dy, 0.0)**2) + min(max(dx, dy), 0.0)
+
+        d_box = math.sqrt(max(dx, 0.0) ** 2 + max(dy, 0.0) ** 2) + min(max(dx, dy), 0.0)
         if d_box < d_min:
             d_min = d_box
-            
+
     # 2. 他エージェント (Circle)
     num_ags = len(ag_pos)
     for i in range(num_ags):
@@ -148,12 +181,12 @@ def _get_sdf_scalar(px, py, walls_xpos, walls_size, ag_pos, ag_radii, ag_b_ids, 
             continue
         if bid == ignore_id:
             continue
-            
-        dist_c = math.sqrt((px - ag_pos[i, 0])**2 + (py - ag_pos[i, 1])**2)
+
+        dist_c = math.sqrt((px - ag_pos[i, 0]) ** 2 + (py - ag_pos[i, 1]) ** 2)
         d_agent = dist_c - ag_radii[i]
         if d_agent < d_min:
             d_min = d_agent
-            
+
     # 3. 箱 / Ramp (OBB)
     num_boxes = len(box_pos)
     for i in range(num_boxes):
@@ -164,51 +197,72 @@ def _get_sdf_scalar(px, py, walls_xpos, walls_size, ag_pos, ag_radii, ag_b_ids, 
             continue
         if bid == ignore_id:
             continue
-            
+
         q = box_quats[i]
         y_sq = q[2] * q[2]
         z_sq = q[3] * q[3]
         term1 = 2.0 * (q[0] * q[3] + q[1] * q[2])
         term2 = 1.0 - 2.0 * (y_sq + z_sq)
         yaw = math.atan2(term1, term2)
-        
+
         cs = math.cos(-yaw)
         sn = math.sin(-yaw)
-        
+
         rx = px - box_pos[i, 0]
         ry = py - box_pos[i, 1]
-        
+
         lx = rx * cs - ry * sn
         ly = rx * sn + ry * cs
-        
+
         dx_b = abs(lx) - box_size[i, 0]
         dy_b = abs(ly) - box_size[i, 1]
-        
-        d_obb = math.sqrt(max(dx_b, 0.0)**2 + max(dy_b, 0.0)**2) + min(max(dx_b, dy_b), 0.0)
+
+        d_obb = math.sqrt(max(dx_b, 0.0) ** 2 + max(dy_b, 0.0) ** 2) + min(max(dx_b, dy_b), 0.0)
         if d_obb < d_min:
             d_min = d_obb
-            
+
     return d_min
 
+
 @njit(cache=True)
-def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin, 
-                             walls_xpos, walls_size, ag_pos, ag_radii, ag_b_ids, 
-                             box_pos, box_size, box_quats, box_b_ids,
-                             mode, exclude_body_id, ignore_id, max_dist,
-                             static_sdf_grid, static_min_x, static_min_y, static_cell_size):
+def _compute_lidar_jit_core(
+    pos_x,
+    pos_y,
+    h_cos,
+    h_sin,
+    base_cos,
+    base_sin,
+    walls_xpos,
+    walls_size,
+    ag_pos,
+    ag_radii,
+    ag_b_ids,
+    box_pos,
+    box_size,
+    box_quats,
+    box_b_ids,
+    mode,
+    exclude_body_id,
+    ignore_id,
+    max_dist,
+    static_sdf_grid,
+    static_min_x,
+    static_min_y,
+    static_cell_size,
+):
     """Lidar 演算コア：近距離死角を完全に排除"""
     res = np.full(12, max_dist, dtype=np.float32)
-    
+
     # 💡 0.45m 以前の跳ね上がりを許さないため、最小マージン(1mm)のみを設定
-    SAFE_MARGIN = 0.001 
+    SAFE_MARGIN = 0.001
 
     for i in range(12):
         vx = base_cos[i] * h_cos - base_sin[i] * h_sin
         vy = base_sin[i] * h_cos + base_cos[i] * h_sin
-        
-        if mode == 1: # Geometric Intersection
+
+        if mode == 1:  # Geometric Intersection
             d_hit_min = max_dist
-            
+
             # A. 壁
             for j in range(len(walls_xpos)):
                 bx = walls_xpos[j, 0]
@@ -217,7 +271,7 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
                 sy = walls_size[j, 1]
                 tn = -1e10
                 tf = 1e10
-                
+
                 if abs(vx) > 1e-12:
                     inv_vx = 1.0 / vx
                     t1 = (bx - sx - pos_x) * inv_vx
@@ -226,7 +280,7 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
                     tf = min(tf, max(t1, t2))
                 elif abs(pos_x - bx) > sx:
                     continue
-                
+
                 if abs(vy) > 1e-12:
                     inv_vy = 1.0 / vy
                     t1 = (by - sy - pos_y) * inv_vy
@@ -235,7 +289,7 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
                     tf = min(tf, max(t1, t2))
                 elif abs(pos_y - by) > sy:
                     continue
-                
+
                 if tf >= tn:
                     # 💡 修正：小さな tn も有効なヒットとして扱う
                     if tf > SAFE_MARGIN:
@@ -244,22 +298,22 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
                             hit_t = tf
                         if hit_t < d_hit_min:
                             d_hit_min = hit_t
-            
+
             # B. 他エージェント
             for k in range(len(ag_pos)):
                 if ag_b_ids[k] == exclude_body_id:
                     continue
                 if ag_b_ids[k] == ignore_id:
                     continue
-                    
+
                 ox = pos_x - ag_pos[k, 0]
                 oy = pos_y - ag_pos[k, 1]
                 radius = ag_radii[k]
-                
+
                 b_val = 2.0 * (ox * vx + oy * vy)
                 c_val = ox * ox + oy * oy - radius**2
                 det = b_val * b_val - 4.0 * c_val
-                
+
                 if det >= 0:
                     sqrt_det = math.sqrt(det)
                     t1_c = (-b_val - sqrt_det) / 2.0
@@ -277,14 +331,14 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
                     continue
                 if box_b_ids[k] == ignore_id:
                     continue
-                
+
                 q_b = box_quats[k]
                 y_b_sq = q_b[2] * q_b[2]
                 z_b_sq = q_b[3] * q_b[3]
                 y_term1 = 2.0 * (q_b[0] * q_b[3] + q_b[1] * q_b[2])
                 y_term2 = 1.0 - 2.0 * (y_b_sq + z_b_sq)
                 yaw_b = math.atan2(y_term1, y_term2)
-                
+
                 cs_b = math.cos(yaw_b)
                 sn_b = math.sin(yaw_b)
                 dx_rel = pos_x - box_pos[k, 0]
@@ -297,7 +351,7 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
                 sy_b = box_size[k, 1]
                 tn_l = -1e10
                 tf_l = 1e10
-                
+
                 if abs(vrx) > 1e-12:
                     inv_vrx = 1.0 / vrx
                     t1_l = (-sx_b - prx) * inv_vrx
@@ -321,23 +375,38 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
                             hit_t_l = tf_l
                         if hit_t_l < d_hit_min:
                             d_hit_min = hit_t_l
-                            
+
             res[i] = d_hit_min
 
-        elif mode == 2: # Sphere Tracing
+        elif mode == 2:  # Sphere Tracing
             curr_t = SAFE_MARGIN
             for _step in range(40):
                 cx = pos_x + vx * curr_t
                 cy = pos_y + vy * curr_t
-                dist_sdf = _get_sdf_scalar(cx, cy, walls_xpos, walls_size, ag_pos, ag_radii, ag_b_ids, box_pos, box_size, box_quats, box_b_ids, exclude_body_id, -1, ignore_id)
-                if dist_sdf < 0.005: 
+                dist_sdf = _get_sdf_scalar(
+                    cx,
+                    cy,
+                    walls_xpos,
+                    walls_size,
+                    ag_pos,
+                    ag_radii,
+                    ag_b_ids,
+                    box_pos,
+                    box_size,
+                    box_quats,
+                    box_b_ids,
+                    exclude_body_id,
+                    -1,
+                    ignore_id,
+                )
+                if dist_sdf < 0.005:
                     res[i] = curr_t
                     break
                 curr_t = curr_t + dist_sdf
                 if curr_t >= max_dist:
                     res[i] = max_dist
                     break
-        elif mode == 4: # Hybrid Sphere Tracing (precomputed static SDF + dynamic correction)
+        elif mode == 4:  # Hybrid Sphere Tracing (precomputed static SDF + dynamic correction)
             curr_t = SAFE_MARGIN
             for _step in range(40):
                 cx = pos_x + vx * curr_t
@@ -378,7 +447,6 @@ def _compute_lidar_jit_core(pos_x, pos_y, h_cos, h_sin, base_cos, base_sin,
     return res
 
 
-
 class VisibilityEngine:
     def wall_distance(self, px, py):
         """
@@ -387,14 +455,15 @@ class VisibilityEngine:
         """
         self._ensure_mode4_sdf()
         return _sample_sdf_grid_bilinear(
-            px, py,
+            px,
+            py,
             self._mode4_sdf_grid,
             self._mode4_min_x,
             self._mode4_min_y,
             self._mode4_cell_size,
-            self.max_dist
+            self.max_dist,
         )
-    
+
     def __init__(self, m, d, mode4_sdf_cell_size=SDF_CELL_SIZE):
         self.m = m
         self.d = d
@@ -420,6 +489,7 @@ class VisibilityEngine:
             return
         import os
         import pickle
+
         walls = self.d.geom_xpos[self.idx_wall_geom]
         wall_sizes = self.m.geom_size[self.idx_wall_geom]
 
@@ -439,7 +509,13 @@ class VisibilityEngine:
         n_y = max(2, int(math.ceil((max_y - min_y) / cell)) + 1)
 
         # ファイル名を壁配置・サイズ・cell_sizeで一意に決定
-        wall_hash = hash((tuple(np.round(walls.flatten(), 4)), tuple(np.round(wall_sizes.flatten(), 4)), round(cell, 4)))
+        wall_hash = hash(
+            (
+                tuple(np.round(walls.flatten(), 4)),
+                tuple(np.round(wall_sizes.flatten(), 4)),
+                round(cell, 4),
+            )
+        )
         sdf_dir = os.path.join(os.path.dirname(__file__), "../envs")
         os.makedirs(sdf_dir, exist_ok=True)
         sdf_path = os.path.join(sdf_dir, f"sdfgrid_mode4_{wall_hash}.pkl")
@@ -467,12 +543,15 @@ class VisibilityEngine:
             self._mode4_cell_size = float(cell)
             # 保存
             with open(sdf_path, "wb") as f:
-                pickle.dump({
-                    "grid": self._mode4_sdf_grid,
-                    "min_x": self._mode4_min_x,
-                    "min_y": self._mode4_min_y,
-                    "cell_size": self._mode4_cell_size,
-                }, f)
+                pickle.dump(
+                    {
+                        "grid": self._mode4_sdf_grid,
+                        "min_x": self._mode4_min_x,
+                        "min_y": self._mode4_min_y,
+                        "cell_size": self._mode4_cell_size,
+                    },
+                    f,
+                )
         self._mode4_ready = True
 
     def _extract_indices(self):
@@ -517,7 +596,16 @@ class VisibilityEngine:
                 vx = self.base_cos[i] * h_cos - self.base_sin[i] * h_sin
                 vy = self.base_sin[i] * h_cos + self.base_cos[i] * h_sin
                 v_dir = np.array([vx, vy, 0.0])
-                dist = mujoco.mj_ray(self.m, self.d, p_origin, v_dir, self.group_mask, 1, int(body_exclude), self._geomid_out)
+                dist = mujoco.mj_ray(
+                    self.m,
+                    self.d,
+                    p_origin,
+                    v_dir,
+                    self.group_mask,
+                    1,
+                    int(body_exclude),
+                    self._geomid_out,
+                )
                 # 💡 修正：ヒットがあればそのまま返す（15mへのジャンプを削除）
                 if dist >= 0:
                     res_native[i] = dist
@@ -560,7 +648,16 @@ class VisibilityEngine:
         if mode == 0:
             p_start = np.array([p1[0], p1[1], 0.4], dtype=np.float64)
             v_ray = np.array([vx, vy, 0.0])
-            hit = mujoco.mj_ray(self.m, self.d, p_start, v_ray, self.group_mask, 1, int(body_exclude), self._geomid_out)
+            hit = mujoco.mj_ray(
+                self.m,
+                self.d,
+                p_start,
+                v_ray,
+                self.group_mask,
+                1,
+                int(body_exclude),
+                self._geomid_out,
+            )
             if hit < 0:
                 return True
             hit_body = self.m.geom_bodyid[self._geomid_out[0]]
@@ -577,13 +674,21 @@ class VisibilityEngine:
                 sx, sy = geom_size[0], geom_size[1]
                 tn, tf = -1e10, 1e10
                 if abs(vx) > 1e-12:
-                    iv=1.0/vx; t1=(bx-sx-p1[0])*iv; t2=(bx+sx-p1[0])*iv
-                    tn=max(tn,min(t1,t2)); tf=min(tf,max(t1,t2))
-                elif abs(p1[0]-bx)>sx: continue
+                    iv = 1.0 / vx
+                    t1 = (bx - sx - p1[0]) * iv
+                    t2 = (bx + sx - p1[0]) * iv
+                    tn = max(tn, min(t1, t2))
+                    tf = min(tf, max(t1, t2))
+                elif abs(p1[0] - bx) > sx:
+                    continue
                 if abs(vy) > 1e-12:
-                    iv=1.0/vy; t1=(by-sy-p1[1])*iv; t2=(by+sy-p1[1])*iv
-                    tn=max(tn,min(t1,t2)); tf=min(tf,max(t1,t2))
-                elif abs(p1[1]-by)>sy: continue
+                    iv = 1.0 / vy
+                    t1 = (by - sy - p1[1]) * iv
+                    t2 = (by + sy - p1[1]) * iv
+                    tn = max(tn, min(t1, t2))
+                    tf = min(tf, max(t1, t2))
+                elif abs(p1[1] - by) > sy:
+                    continue
                 if tf >= tn:
                     if MIN_T < tn < dist_full - 0.05:
                         return False
@@ -609,24 +714,34 @@ class VisibilityEngine:
                 if bid == body_exclude or bid == target_body_id:
                     continue
                 q_box = self.d.xquat[bid]
-                y_box_sq, z_box_sq = q_box[2]**2, q_box[3]**2
-                term1, term2 = 2.0*(q_box[0]*q_box[3]+q_box[1]*q_box[2]), 1.0-2.0*(y_box_sq+z_box_sq)
+                y_box_sq, z_box_sq = q_box[2] ** 2, q_box[3] ** 2
+                term1, term2 = (
+                    2.0 * (q_box[0] * q_box[3] + q_box[1] * q_box[2]),
+                    1.0 - 2.0 * (y_box_sq + z_box_sq),
+                )
                 yaw_box = math.atan2(term1, term2)
                 cs_box, sn_box = math.cos(yaw_box), math.sin(yaw_box)
-                g_pos, g_size = self.d.geom_xpos[self.idx_box_geom[k]], self.m.geom_size[self.idx_box_geom[k]]
-                dx, dy = p1[0]-g_pos[0], p1[1]-g_pos[1]
-                vrx, vry = vx*cs_box+vy*sn_box, -vx*sn_box+vy*cs_box
-                prx, pry = dx*cs_box+dy*sn_box, -dx*sn_box+dy*cs_box
+                g_pos, g_size = (
+                    self.d.geom_xpos[self.idx_box_geom[k]],
+                    self.m.geom_size[self.idx_box_geom[k]],
+                )
+                dx, dy = p1[0] - g_pos[0], p1[1] - g_pos[1]
+                vrx, vry = vx * cs_box + vy * sn_box, -vx * sn_box + vy * cs_box
+                prx, pry = dx * cs_box + dy * sn_box, -dx * sn_box + dy * cs_box
                 sx_box, sy_box = g_size[0], g_size[1]
                 tn_l, tf_l = -1e10, 1e10
                 if abs(vrx) > 1e-12:
-                    iv=1.0/vrx; t1_l, t2_l = (-sx_box-prx)*iv, (sx_box-prx)*iv
+                    iv = 1.0 / vrx
+                    t1_l, t2_l = (-sx_box - prx) * iv, (sx_box - prx) * iv
                     tn_l, tf_l = max(tn_l, min(t1_l, t2_l)), min(tf_l, max(t1_l, t2_l))
-                elif abs(prx) > sx_box: continue
+                elif abs(prx) > sx_box:
+                    continue
                 if abs(vry) > 1e-12:
-                    iv=1.0/vry; t1_l, t2_l = (-sy_box-pry)*iv, (sy_box-pry)*iv
+                    iv = 1.0 / vry
+                    t1_l, t2_l = (-sy_box - pry) * iv, (sy_box - pry) * iv
                     tn_l, tf_l = max(tn_l, min(t1_l, t2_l)), min(tf_l, max(t1_l, t2_l))
-                elif abs(pry) > sy_box: continue
+                elif abs(pry) > sy_box:
+                    continue
                 if tf_l >= tn_l:
                     if MIN_T < tn_l < dist_full - 0.05:
                         return False
