@@ -1134,8 +1134,11 @@ class TeamCosEnv(gym.Env):
         vz_idx = self.model.jnt_dofadr[jz]
         agent_vz = float(self.data.qvel[vz_idx])
         # xy 速度と直近コントロールも取得して info に含める
-        learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
-        vadr = self.model.jnt_dofadr[self.model.body_jntadr[learnable_agent_body_id]]
+        # Use stored joint indices for the learnable agent (joints live on the
+        # "{agent}_anchor" body). Avoid using model.body_jntadr on the child
+        # body, which can yield the next body's joint adr.
+        jx = self.qpos_indices[self.learnable_agent_key]['x']
+        vadr = self.model.jnt_dofadr[jx]
         qlen = self.data.qvel.shape[0]
         agent_vx = float(self.data.qvel[vadr]) if vadr < qlen else 0.0
         agent_vy = float(self.data.qvel[vadr + 1]) if (vadr + 1) < qlen else 0.0
@@ -1184,93 +1187,74 @@ class TeamCosEnv(gym.Env):
         return obs, reward, False, done, info
 
     def _compute_team_reward(self):
+        """
+        基本報酬の再定義:
+        - Seeker: 視野内かつ正面・近距離で捉えるほど高報酬。視野外は 0。
+        - Hider: 生存ボーナス + 被弾ペナルティ（Seeker報酬の裏返し）。
+        """
         if self.current_step <= self.prep_steps:
             return 0.0, False, 0.0, 0.0, False
         
-        seen_count = 0
-        min_seeker_dist = 13.0  # ← 追加
+        total_hider_reward = 0.0
+        any_hider_seen = False
         gaze_cos_front_max = 0.0
-        gaze_dist_max = 0.0
-        learnable_hider_seen = False
+        gaze_cos_front_dist_max = 0.0
+        learnable_hider_seen_flag = False
 
+        # Hiderごとの生存・被弾判定
         for hk in self.hider_keys:
             hid = self.body_ids[hk]
             hpos = self.data.xpos[hid][:2]
-            seen = False
+            h_reward = 0.05  # 基本生存ボーナス (Stepごとに加算)
+            is_this_hider_seen = False
 
             for sk in self.seeker_keys:
                 sid = self.body_ids[sk]
                 spos = self.data.xpos[sid][:2]
                 srot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[sk]['rot']]]
 
-                # ← 距離計算を追加
+                # 相対距離と方向の計算
                 dx = float(hpos[0] - spos[0])
                 dy = float(hpos[1] - spos[1])
                 dist = math.sqrt(dx * dx + dy * dy)
-                min_seeker_dist = min(min_seeker_dist, dist)
-
-                # gaze_cos 計算:
-                # - 学習対象がハイダーの場合 (learnable_agent_key が h... ),
-                #   そのハイダーに対する各シーカーの frontness を集計する。
-                # - 学習対象がシーカーの場合 (learnable_agent_key が s... ),
-                #   学習シーカーが各ハイダーを見ている度合いを集計する。
-                # 両方のケースをサポートし、どちらか該当する場合に frontness を反映する。
-                dist_with_margin = dist + 1e-8
-                cos_align = (math.cos(srot) * (dx / dist_with_margin)) + (math.sin(srot) * (dy / dist_with_margin))
+                
+                # シーカーの視線方向ベクトル
+                s_fwd_x = math.cos(srot)
+                s_fwd_y = math.sin(srot)
+                # ターゲットへの単位ベクトル
+                dist_m = dist + 1e-8
+                to_h_x = dx / dist_m
+                to_h_y = dy / dist_m
+                
+                # 正面度 (gaze_cos)
+                cos_align = s_fwd_x * to_h_x + s_fwd_y * to_h_y
                 frontness = max(float(cos_align), 0.0)
-                if hk == self.learnable_agent_key:
-                    # learnable がハイダー: シーカー側から見た frontness を計上
-                    gaze_cos_front_max = max(gaze_cos_front_max, frontness)
-                    gaze_dist_max = max(gaze_dist_max, frontness / (dist + 0.2))
-                if sk == self.learnable_agent_key:
-                    # learnable がシーカー: 学習シーカーの視線（この seeker が見ている frontness）を計上
-                    gaze_cos_front_max = max(gaze_cos_front_max, frontness)
-                    gaze_dist_max = max(gaze_dist_max, frontness / (dist + 0.2))
- 
+
+                # 視界判定
                 if self._is_vis(spos, srot, hpos, sid, hid):
-                    seen = True
-                    # 学習対象がシーカーの場合、学習シーカーがこのハイダーを見ていればフラグを立てる
+                    is_this_hider_seen = True
+                    any_hider_seen = True
                     if sk == self.learnable_agent_key:
-                        learnable_hider_seen = True
-                    break
-            if seen:
-                seen_count += 1
+                        learnable_hider_seen_flag = True
+                    if hk == self.learnable_agent_key:
+                        learnable_hider_seen_flag = True
 
-            if hk == self.learnable_agent_key:
-                learnable_hider_seen = bool(seen)
+                    # 捕捉の質に基づく報酬 (捕捉報酬)
+                    # 距離に反比例し、正面であるほど高い
+                    capture_reward = frontness / (dist + 0.5) 
+                    h_reward -= capture_reward # Hiderにとってはペナルティ
 
-        # === 報酬計算（現行実装の説明） ===
-        # 以前の単純実装（削除済み）は `team_reward = 1.0 if seen_count == 0 else -1.0` でしたが、
-        # 現在は以下のように可視数と最短シーカー距離に基づく base/dist_bonus を組み合わせた
-        # ロジックが採用されています（ゼロサム化はしているが、後段のカスタム報酬で非対称項が加わります）。
+                    # 統計用
+                    gaze_cos_front_max = max(gaze_cos_front_max, frontness)
+                    gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, capture_reward)
+
+            total_hider_reward += h_reward
+
+        # チーム報酬として平均化（または合計）
+        team_reward = total_hider_reward / len(self.hider_keys)
         
-        # 新しいロジック（修正）:
-        # ハイダーが1体でも見つかっていればハイダー側へ明確な負のペナルティを与える。
-        # 具体的には:
-        # - seen_count == 0 -> base = 1.0 (+ dist bonus)
-        # - seen_count >= 1 -> base = -1.0 (明確なペナルティ)
-        # これにより、学習対象（ハイダー）視点で「1体でも見られているときに中立(0)」
-        # となる挙動を避けられます（n_hiders==2 の場合に見られた1体で base==0 になっていた問題を解消）。
-        
-        dist_ratio = min(min_seeker_dist / 12.0, 1.0)
-        if seen_count == 0:
-            base = 1.0
-            # 敵から遠いほど+ボーナス
-            dist_bonus = dist_ratio  # 0.0 (近い) ~ 1.0 (遠い)
-        else:
-            # seen_count が 1 のときも負の報酬を与えるが、段階的にする。
-            # 例: n_hiders=2 の場合 seen_count=1 -> base=-0.5, seen_count=2 -> base=-1.0
-            base = -float(seen_count) / float(len(self.hider_keys))
-            # シーカーが見つけたハイダーに近づくほどハイダー側の報酬をさらに下げる
-            dist_bonus = dist_ratio - 1.0  # 0.0 (遠い) ~ -1.0 (近い)
-        
-        WR_OF_DIST_BONUS = 1.0  # 距離ボーナスの重み（0.0なら距離無視、1.0なら完全に距離で評価）
-        team_reward = (1 - WR_OF_DIST_BONUS) * base \
-                        + WR_OF_DIST_BONUS * dist_bonus
-        # debug storage removed
-
-        return team_reward, bool(seen_count > 0), gaze_cos_front_max, gaze_dist_max, bool(learnable_hider_seen)
-
+        return team_reward, any_hider_seen, gaze_cos_front_max, gaze_cos_front_dist_max, learnable_hider_seen_flag
+    
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
         rel = t_pos - pos; dist = math.sqrt(np.sum(rel**2)) + 1e-8
         if dist > L_SCALE or (math.cos(rot)*(rel[0]/dist) + math.sin(rot)*(rel[1]/dist)) < 0.38: return False
@@ -1285,89 +1269,109 @@ class TeamCosEnv(gym.Env):
         return v
 
     def _get_obs(self, idx):
-        o = np.zeros(self.idx.total_dim, dtype=np.float32); ak, m, d = self.agent_keys[idx], self.model, self.data
+        """
+        観測情報の生成:
+        - 視界外であっても、攻撃（ペナルティ）を受けている間は痛覚メタファーにより
+          敵の相対位置 (REL_X, REL_Y) と推定向き (QUAT) を提供する。
+        """
+        o = np.zeros(self.idx.total_dim, dtype=np.float32)
+        ak, m, d = self.agent_keys[idx], self.model, self.data
         ps, rv = d.xpos[self.body_ids[ak]], float(d.qpos[m.jnt_qposadr[self.qpos_indices[ak]['rot']]])
         vax, vay = m.jnt_dofadr[self.qpos_indices[ak]['x']], m.jnt_dofadr[self.qpos_indices[ak]['y']]
         cos_r, sin_r = math.cos(-rv), math.sin(-rv)
+        
+        # 自己情報
         si = self.idx.SELF
         o[si.VEL_X] = d.qvel[vax] * cos_r - d.qvel[vay] * sin_r
         o[si.VEL_Y] = d.qvel[vax] * sin_r + d.qvel[vay] * cos_r
-        o[si.ROT] = rv; o[si.COS_ROT], o[si.SIN_ROT] = math.cos(rv), math.sin(rv)
+        o[si.ROT] = rv
+        o[si.COS_ROT], o[si.SIN_ROT] = math.cos(rv), math.sin(rv)
+        
+        # LiDAR
         ignore_body_id = -1
         grabbed_key = self._current_grabbed_by(ak)
         if grabbed_key is not None:
             ignore_body_id = self.obj_body_map[grabbed_key]
-        lidar_raw = self.vis_engine.cast_lidar(
-            ps[:2], rv, 1, self.body_ids[ak], ignore_body_id
-        )
-        if grabbed_key is not None:
-            carry_rel = self.data.xpos[ignore_body_id][:2] - ps[:2]
-            h_cos = math.cos(rv)
-            h_sin = math.sin(rv)
-            for i in range(lidar_raw.shape[0]):
-                vx = self.vis_engine.base_cos[i] * h_cos - self.vis_engine.base_sin[i] * h_sin
-                vy = self.vis_engine.base_sin[i] * h_cos + self.vis_engine.base_cos[i] * h_sin
-                proj = carry_rel[0] * vx + carry_rel[1] * vy
-                if proj > 0.0:
-                    lidar_raw[i] = max(0.02, float(lidar_raw[i] - proj))
-        o[self.idx.LIDAR] = lidar_raw
+        o[self.idx.LIDAR] = self.vis_engine.cast_lidar(ps[:2], rv, 1, self.body_ids[ak], ignore_body_id)
+
+        # オブジェクト情報 (Box, Ramp) - 既存ロジック維持
         for i, tid in enumerate(self.box_ids):
             b_idx = self.idx.B[i]; d_w = d.xpos[tid][:2] - ps[:2]
             o[b_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r
             o[b_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r
             b_vadr = m.jnt_dofadr[m.body_jntadr[tid]]
-            b_speed = math.sqrt(d.qvel[b_vadr] ** 2 + d.qvel[b_vadr + 1] ** 2)
-            o[b_idx.IS_MOVING] = 1.0 if b_speed > 0.05 else 0.0
+            o[b_idx.IS_MOVING] = 1.0 if math.sqrt(d.qvel[b_vadr]**2 + d.qvel[b_vadr+1]**2) > 0.05 else 0.0
             o[b_idx.IS_LOCKED] = 1.0 if self.object_state[f"b{i+1}"]["mode"] == "locked" else 0.0
-            # 箱の向き情報（自分基準の相対yaw角）を観測にセット
             box_quat = d.xquat[tid]
-            box_yaw = math.atan2(
-                2.0 * (box_quat[0] * box_quat[3] + box_quat[1] * box_quat[2]),
-                1.0 - 2.0 * (box_quat[2] ** 2 + box_quat[3] ** 2)
-            )
-            rel_box_yaw = box_yaw - rv
-            o[b_idx.QUAT_0] = math.cos(rel_box_yaw)
-            o[b_idx.QUAT_1] = math.sin(rel_box_yaw)
+            box_yaw = math.atan2(2.0*(box_quat[0]*box_quat[3]+box_quat[1]*box_quat[2]), 1.0-2.0*(box_quat[2]**2+box_quat[3]**2))
+            o[b_idx.QUAT_0], o[b_idx.QUAT_1] = math.cos(box_yaw - rv), math.sin(box_yaw - rv)
+
         for i, rid in enumerate(self.ramp_ids):
-            r_idx = self.idx.RAMP[i]
-            d_w_r = d.xpos[rid][:2] - ps[:2]
+            r_idx = self.idx.RAMP[i]; d_w_r = d.xpos[rid][:2] - ps[:2]
             o[r_idx.REL_X] = d_w_r[0] * cos_r - d_w_r[1] * sin_r
             o[r_idx.REL_Y] = d_w_r[0] * sin_r + d_w_r[1] * cos_r
             r_vadr = m.jnt_dofadr[m.body_jntadr[rid]]
-            r_speed = math.sqrt(d.qvel[r_vadr] ** 2 + d.qvel[r_vadr + 1] ** 2)
-            o[r_idx.IS_MOVING] = 1.0 if r_speed > 0.05 else 0.0
+            o[r_idx.IS_MOVING] = 1.0 if math.sqrt(d.qvel[r_vadr]**2 + d.qvel[r_vadr+1]**2) > 0.05 else 0.0
             o[r_idx.IS_LOCKED] = 1.0 if self.object_state[f"ramp{i+1}"]["mode"] == "locked" else 0.0
-            # スロープの向き情報（自分基準の相対yaw角）を観測にセット
             ramp_quat = d.xquat[rid]
-            ramp_yaw = math.atan2(
-                2.0 * (ramp_quat[0] * ramp_quat[3] + ramp_quat[1] * ramp_quat[2]),
-                1.0 - 2.0 * (ramp_quat[2] ** 2 + ramp_quat[3] ** 2)
-            )
-            rel_ramp_yaw = ramp_yaw - rv
-            o[r_idx.QUAT_0] = math.cos(rel_ramp_yaw)
-            o[r_idx.QUAT_1] = math.sin(rel_ramp_yaw)
+            ramp_yaw = math.atan2(2.0*(ramp_quat[0]*ramp_quat[3]+ramp_quat[1]*ramp_quat[2]), 1.0-2.0*(ramp_quat[2]**2+ramp_quat[3]**2))
+            o[r_idx.QUAT_0], o[r_idx.QUAT_1] = math.cos(ramp_yaw - rv), math.sin(ramp_yaw - rv)
+
+        # 他エージェント情報 (痛覚メタファー適用)
         ens = [k for k in self.agent_keys if k != ak]
+        # 学習対象を優先的にソートする既存ロジック
         if ak.startswith("s"):
             ens.sort(key=lambda k: (0 if k.startswith("h") else 1, k))
         else:
             ens.sort(key=lambda k: (0 if k.startswith("s") else 1, k))
+
         for i, enm in enumerate(ens[:len(self.idx.OTHERS)]):
-            en_idx = self.idx.OTHERS[i]; eid = self.body_ids[enm]
-            if self._is_vis(ps[:2], rv, d.xpos[eid][:2], self.body_ids[ak], eid):
-                d_w = d.xpos[eid][:2] - ps[:2]
-                o[en_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r
-                o[en_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r
+            en_idx = self.idx.OTHERS[i]
+            eid = self.body_ids[enm]
+            e_pos = d.xpos[eid][:2]
+            
+            # 視界判定
+            visible = self._is_vis(ps[:2], rv, e_pos, self.body_ids[ak], eid)
+            
+            # 被弾判定 (自分がHiderで、相手がSeekerで、相手から自分が見えているか)
+            being_attacked = False
+            if ak.startswith("h") and enm.startswith("s"):
+                s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]['rot']]])
+                if self._is_vis(e_pos, s_rot, ps[:2], eid, self.body_ids[ak]):
+                    being_attacked = True
+
+            if visible or being_attacked:
+                d_w = e_pos - ps[:2]
+                rel_x = d_w[0] * cos_r - d_w[1] * sin_r
+                rel_y = d_w[0] * sin_r + d_w[1] * cos_r
+                o[en_idx.REL_X], o[en_idx.REL_Y] = rel_x, rel_y
                 o[en_idx.VISIBLE] = 1.0
-                # 他エージェントの向き情報（自分基準の相対yaw角）をcos,sinで観測にセット
-                agent_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]['rot']]])
-                rel_agent_rot = agent_rot - rv
-                o[en_idx.QUAT_0] = math.cos(rel_agent_rot)
-                o[en_idx.QUAT_1] = math.sin(rel_agent_rot)
+
+                if visible:
+                    # 視覚情報
+                    # Use the agent's stored joint ids (defined on {enm}_anchor),
+                    # not model.body_jntadr on the child body id which can be incorrect.
+                    v_adr = m.jnt_dofadr[self.qpos_indices[enm]['x']]
+                    o[en_idx.VEL_X] = d.qvel[v_adr] * cos_r - d.qvel[v_adr + 1] * sin_r
+                    o[en_idx.VEL_Y] = d.qvel[v_adr] * sin_r + d.qvel[v_adr + 1] * cos_r
+                    o[en_idx.VEL_Y] = d.qvel[v_adr] * sin_r + d.qvel[v_adr+1] * cos_r
+                    agent_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]['rot']]])
+                    o[en_idx.QUAT_0], o[en_idx.QUAT_1] = math.cos(agent_rot - rv), math.sin(agent_rot - rv)
+                    speed = math.sqrt(d.qvel[v_adr]**2 + d.qvel[v_adr+1]**2)
+                    o[en_idx.IS_MOVING] = 1.0 if speed > 0.05 else 0.0
+                else:
+                    # 痛覚推論 (位置ベクトルを反転させて敵が自分を向いていると仮定)
+                    dist = math.sqrt(rel_x**2 + rel_y**2) + 1e-8
+                    o[en_idx.QUAT_0], o[en_idx.QUAT_1] = -rel_x / dist, -rel_y / dist
+                    o[en_idx.IS_MOVING] = 0.5 # 不確定だが動いている可能性
+                    o[en_idx.VEL_X], o[en_idx.VEL_Y] = 0.0, 0.0
             else:
+                # 非検知
                 o[en_idx.REL_X], o[en_idx.REL_Y] = L_SCALE, L_SCALE
                 o[en_idx.VISIBLE] = 0.0
-                o[en_idx.QUAT_0] = 0.0
-                o[en_idx.QUAT_1] = 0.0
+                o[en_idx.QUAT_0], o[en_idx.QUAT_1] = 0.0, 0.0
+                o[en_idx.VEL_X], o[en_idx.VEL_Y] = 0.0, 0.0
+                o[en_idx.IS_MOVING] = 0.0
         return o
 
     def render(self):
