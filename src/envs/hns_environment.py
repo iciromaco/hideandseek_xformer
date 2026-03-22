@@ -20,9 +20,9 @@ from models.ppo_transformer_v2 import AgentV2
 # module logger
 logger = logging.getLogger(__name__)
 
-# Pylint: mujoco C-extension exposes members dynamically; suppress no-member warnings here
-# to reduce false positives from static analysis.
-# pylint: disable=E1101
+# Pylint: mujoco C-extension exposes members dynamically; suppress no-member and
+# broad-exception warnings here to reduce false positives from static analysis.
+# pylint: disable=E1101,W0718
 
 
 # --- DebugLoggerクラス ---
@@ -50,6 +50,9 @@ class DebugLogger:
 
     def clear_policy_src_log(self):
         self._policy_src_logged.clear()
+
+    def clear_last_step(self):
+        self._log_last_step.clear()
 
 
 def _euler_z_to_quat(yaw):
@@ -413,7 +416,7 @@ class TeamCosEnv(gym.Env):
         )
         acts = "".join(self._xml_actuators(ak) for ak in self.agent_keys)
 
-        ramp_mesh_vertex = "-0.6666 -0.5 0.0 0.6666 -0.5 0.0 0.6666 -0.5 1.0 " "-0.6666 0.5 0.0 0.6666 0.5 0.0 0.6666 0.5 1.0"
+        ramp_mesh_vertex = "-0.6666 -0.5 0.0 0.6666 -0.5 0.0 0.6666 -0.5 1.0 " + "-0.6666 0.5 0.0 0.6666 0.5 0.0 0.6666 0.5 1.0"
 
         return f"""
 <mujoco>
@@ -450,6 +453,11 @@ class TeamCosEnv(gym.Env):
 
     def _xml_ramp(self, i, xy, rot):
         q = _euler_z_to_quat(rot)
+        inner_weight = (
+            f'<geom name="ramp{i}_inner_weight" type="box" size="0.3333 0.5 0.25" '
+            f'pos="0.3333 0 0.25" rgba="0 1 0 0.3" mass="{self.RAMP_INNER_WEIGHT_MASS}" '
+            'solimp="0.95 0.99 0.001" friction="1.35 0.22 0.01"/>'
+        )
         return f"""
         <body name="ramp{i}_body" pos="{xy[0]} {xy[1]} 0" quat="{q}">
             <inertial pos="0.3 0 0.25" mass="{self.RAMP_MASS}" diaginertia="10 10 20"/>
@@ -457,7 +465,7 @@ class TeamCosEnv(gym.Env):
             <geom name="ramp{i}_geom" type="mesh" mesh="ramp_mesh" contype="0" conaffinity="0" rgba="0 1 0 1"/>
             <geom name="ramp{i}_slope_surface" type="box" size="0.8333 0.5 0.02" pos="0 0 0.516" euler="0 -36.87 0" rgba="0 1 0 0.3" friction="1.35 0.22 0.01"/>
             <geom name="ramp{i}_back_panel" type="box" size="0.02 0.5 0.5" pos="0.6666 0 0.5" rgba="0 1 0 0.3" friction="1.35 0.22 0.01"/>
-            <geom name="ramp{i}_inner_weight" type="box" size="0.3333 0.5 0.25" pos="0.3333 0 0.25" rgba="0 1 0 0.3" mass="{self.RAMP_INNER_WEIGHT_MASS}" solimp="0.95 0.99 0.001" friction="1.35 0.22 0.01"/>
+            {inner_weight}
     </body>"""
 
     def _xml_box(self, i, xy, rot):
@@ -937,11 +945,11 @@ class TeamCosEnv(gym.Env):
                 return False
         return True
 
-    def reset(self, seed=None, options=None):
+    def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
         self._policy_histories.clear()
-        self.debug_logger._log_last_step.clear()
+        self.debug_logger.clear_last_step()
         if self.debug_mode:
             self.debug_logger.clear_policy_src_log()
         mujoco.mj_resetData(self.model, self.data)
