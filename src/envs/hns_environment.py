@@ -213,6 +213,9 @@ class TeamCosEnv(gym.Env):
         # temporal caches for visibility / being-hit freshness
         self._prev_vis = {}
         self._prev_being_hit = {}
+        # counters for persisting BEING_HIT in observations
+        self.being_hit_persist = 3
+        self._being_hit_counters = {}
         # cached last observation returned for the learnable agent
         self._cached_obs = None
         self._init_debug_stats()
@@ -1001,6 +1004,102 @@ class TeamCosEnv(gym.Env):
                     self.debug_logger.print("[DEBUG][reset] Non-finite detected in qpos/qvel after forward")
             except Exception:
                 pass
+        # --- update prev_vis / prev_being_hit to reflect post-step state ---
+        try:
+            # refresh caches based on current (post-physics) positions/rotations
+            self._prev_vis.clear()
+            self._prev_being_hit.clear()
+            for viewer in self.agent_keys:
+                try:
+                    v_bid = self.body_ids[viewer]
+                    v_pos = self.data.xpos[v_bid][:2]
+                    v_idx_r = self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]
+                    v_rot = float(self.data.qpos[v_idx_r])
+                except Exception:
+                    continue
+                for target in self.agent_keys:
+                    if target == viewer:
+                        continue
+                    try:
+                        t_bid = self.body_ids[target]
+                        t_pos = self.data.xpos[t_bid][:2]
+                    except Exception:
+                        self._prev_vis[(viewer, target)] = False
+                        continue
+                    vis = False
+                    try:
+                        vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
+                    except Exception:
+                        vis = False
+                    self._prev_vis[(viewer, target)] = vis
+                    if viewer.startswith("h") and target.startswith("s"):
+                        # check whether seeker (target) sees the hider (viewer)
+                        is_hit = False
+                        try:
+                            s_idx_r = self.model.jnt_qposadr[self.qpos_indices[target]["rot"]]
+                            s_rot = float(self.data.qpos[s_idx_r])
+                            try:
+                                is_hit = bool(self._is_vis(t_pos, s_rot, v_pos, t_bid, v_bid))
+                            except Exception:
+                                is_hit = False
+                        except Exception:
+                            is_hit = False
+                        self._prev_being_hit[(viewer, target)] = 1.0 if is_hit else 0.0
+        except Exception:
+            # be conservative: leave existing caches intact on failure
+            pass
+        # initialize previous-step visibility / being-hit caches so _get_obs
+        # can use a well-defined 'previous' value immediately after reset
+        self._prev_vis.clear()
+        self._prev_being_hit.clear()
+        for viewer in self.agent_keys:
+            try:
+                v_bid = self.body_ids[viewer]
+                v_pos = self.data.xpos[v_bid][:2]
+                v_idx_r = self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]
+                v_rot = float(self.data.qpos[v_idx_r])
+            except Exception:
+                # skip this viewer if we cannot access its state
+                continue
+
+            for target in self.agent_keys:
+                if target == viewer:
+                    continue
+                try:
+                    t_bid = self.body_ids[target]
+                    t_pos = self.data.xpos[t_bid][:2]
+                except Exception:
+                    # cannot access target state; mark not visible
+                    self._prev_vis[(viewer, target)] = False
+                    continue
+
+                # 視界判定 (局所的に例外を捕捉)
+                vis = False
+                try:
+                    vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
+                except Exception:
+                    vis = False
+                self._prev_vis[(viewer, target)] = vis
+
+                # 被弾フラグ: viewer が Hider で target が Seeker の場合、
+                # seeker の視界で自分(viewer)が見られているかを判定して保存する
+                if viewer.startswith("h") and target.startswith("s"):
+                    try:
+                        s_idx_r = self.model.jnt_qposadr[self.qpos_indices[target]["rot"]]
+                        s_rot = float(self.data.qpos[s_idx_r])
+                        is_hit = False
+                        try:
+                            is_hit = bool(self._is_vis(t_pos, s_rot, v_pos, t_bid, v_bid))
+                        except Exception:
+                            is_hit = False
+                    except Exception:
+                        is_hit = False
+                    # store as (hider, seeker)
+                    self._prev_being_hit[(viewer, target)] = 1.0 if is_hit else 0.0
+                    # set persistence counter when hit detected
+                    if is_hit:
+                        self._being_hit_counters[(viewer, target)] = int(self.being_hit_persist)
+
         self._cache_planar_object_pose()
 
         for i, ak in enumerate(self.agent_keys):
@@ -1269,6 +1368,16 @@ class TeamCosEnv(gym.Env):
         except Exception:
             pass
 
+        # decrement being_hit counters
+        try:
+            if self._being_hit_counters:
+                for k in list(self._being_hit_counters.keys()):
+                    self._being_hit_counters[k] = max(0, int(self._being_hit_counters[k]) - 1)
+                    if self._being_hit_counters[k] == 0:
+                        del self._being_hit_counters[k]
+        except Exception:
+            pass
+
         return obs, reward, False, done, info
 
     def _compute_team_reward(self):
@@ -1439,13 +1548,18 @@ class TeamCosEnv(gym.Env):
             # 2. 被弾判定 (自分がHider、相手がSeeker、かつ相手が自分を見ているか)
             being_hit_flag = 0.0
             if ak.startswith("h") and enm.startswith("s"):
-                prev_bh = self._prev_being_hit.get((ak, enm), None)
-                if prev_bh is not None:
-                    being_hit_flag = float(prev_bh)
+                # Use persistence counter if present (preferred)
+                cnt = int(self._being_hit_counters.get((ak, enm), 0))
+                if cnt > 0:
+                    being_hit_flag = 1.0
                 else:
-                    s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]["rot"]]])
-                    if self._is_vis(e_pos, s_rot, ps[:2], eid, self.body_ids[ak]):
+                    prev_bh = self._prev_being_hit.get((ak, enm), None)
+                    if prev_bh is not None and float(prev_bh) > 0.0:
                         being_hit_flag = 1.0
+                    else:
+                        s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]["rot"]]])
+                        if self._is_vis(e_pos, s_rot, ps[:2], eid, self.body_ids[ak]):
+                            being_hit_flag = 1.0
 
             if visible:
                 # 【視覚情報】
