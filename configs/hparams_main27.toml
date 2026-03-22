@@ -111,7 +111,7 @@ wandb_run_name = "wall_only_confirm_10M"
 # runtime.trainseeker_forRB: 学習向け設定 Seeker
 [runtime.trainseeker_forRB]
 train_mode = true
-use_viewer = true
+use_viewer = false
 training_target = "seeker"
 train_other_hider_policy = "rule"
 train_other_seeker_policy = "rule"

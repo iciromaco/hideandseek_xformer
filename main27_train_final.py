@@ -1074,6 +1074,40 @@ def evaluate_fixed_ramp_climb(mode, target, agent, device, episodes=3, max_steps
     for ep in range(episodes):
         obs, _ = env.reset()
         history.prime_single(obs)
+        # deterministic placement: place learnable agent under first ramp facing uphill
+        try:
+            if getattr(env, "ramp_ids", None):
+                rid = env.ramp_ids[0]
+                rpos = env.data.xpos[rid][:2].copy()
+                up = env._ramp_uphill_dir(rid)
+                offset_along = -0.6
+                place_xy = rpos + up * offset_along
+                ak = env.learnable_agent_key
+                jx = env.qpos_indices[ak]["x"]
+                jy = env.qpos_indices[ak]["y"]
+                jz = env.qpos_indices[ak]["z"]
+                jr = env.qpos_indices[ak]["rot"]
+                qx_adr = env.model.jnt_qposadr[jx]
+                qy_adr = env.model.jnt_qposadr[jy]
+                qz_adr = env.model.jnt_qposadr[jz]
+                qr_adr = env.model.jnt_qposadr[jr]
+                # place agent on top of ramp: ramp body z + estimated slope offset
+                ramp_body_z = float(env.data.xpos[rid][2])
+                # drop from slightly above the ramp so the agent settles naturally
+                place_z = ramp_body_z + 1.0
+                env.data.qpos[qx_adr] = float(place_xy[0])
+                env.data.qpos[qy_adr] = float(place_xy[1])
+                env.data.qpos[qz_adr] = float(place_z)
+                rot = float(math.atan2(up[1], up[0]))
+                env.data.qpos[qr_adr] = rot
+                try:
+                    import mujoco
+
+                    mujoco.mj_forward(env.model, env.data)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         done = False
         max_height = -float("inf")
         max_progress = -float("inf")

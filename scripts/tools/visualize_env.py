@@ -11,7 +11,8 @@ from envs.hns_environment import TeamCosEnv
 
 def main():
     # 環境の初期化
-    env = TeamCosEnv(lidar_mode=1)
+    # create env with a typical configuration (avoid passing removed args)
+    env = TeamCosEnv(mode="initial", target="seeker", n_seekers=1, n_hiders=2, n_boxes=2, n_ramps=1, render_mode=None)
 
     # 物理エンジンのハンドル取得
     model = env.model

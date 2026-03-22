@@ -119,42 +119,46 @@ def _blocked_by_walls_numba(p1x, p1y, p2x, p2y, walls, margin):
 class TeamCosEnv(gym.Env):
     # --- 統計バッファ初期化 ---
     def _init_debug_stats(self):
-        self._debug_reward_buffer = []
-        self._debug_hide_buffer = []
-        self._debug_wall_distance_buffer = []
-        self._debug_step_counter = 0
-        self._debug_log_interval = getattr(self, "debug_logger", None) and getattr(self.debug_logger, "log_interval_steps", 100) or 100
+        self._dbg_reward_buf = []
+        self._dbg_hide_buf = []
+        self._dbg_wall_dist_buf = []
+        self._dbg_step_ctr = 0
+        self._dbg_log_int = getattr(self, "debug_logger", None) and getattr(self.debug_logger, "log_interval_steps", 100) or 100
+        # store last ramp boost per agent for toggle detection
+        self._last_ramp_boost = {k: 0.0 for k in getattr(self, "agent_keys", [])}
+        # previous agent world z for detecting upward motion (climbing)
+        self._prev_agent_z = {k: None for k in getattr(self, "agent_keys", [])}
 
-    def _debug_collect_stats(self, reward, info):
+    def _dbg_collect_stats(self, reward, info):
         if not self.debug_mode:
             return
-        self._debug_reward_buffer.append(reward)
+        self._dbg_reward_buf.append(reward)
         # 隠れ率: is_detected==False なら隠れているとみなす
-        self._debug_hide_buffer.append(0 if info.get("is_detected", False) else 1)
+        self._dbg_hide_buf.append(0 if info.get("is_detected", False) else 1)
         wd = info.get("wall_distance", None)
         if wd is not None:
             if isinstance(wd, (list, tuple, np.ndarray)):
-                self._debug_wall_distance_buffer.extend([float(v) for v in wd])
+                self._dbg_wall_dist_buf.extend([float(v) for v in wd])
             else:
-                self._debug_wall_distance_buffer.append(float(wd))
-        self._debug_step_counter += 1
+                self._dbg_wall_dist_buf.append(float(wd))
+        self._dbg_step_ctr += 1
         # log_intervalごとに統計出力
-        if self._debug_step_counter % self._debug_log_interval == 0:
-            self._debug_print_stats()
+        if self._dbg_step_ctr % self._dbg_log_int == 0:
+            self._dbg_print_stats()
 
-    def _debug_print_stats(self):
+    def _dbg_print_stats(self):
         if not self.debug_mode:
             return
-        avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
-        hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
-        wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
+        avg_reward = float(np.mean(self._dbg_reward_buf)) if self._dbg_reward_buf else 0.0
+        hide_rate = float(np.mean(self._dbg_hide_buf)) if self._dbg_hide_buf else 0.0
+        wd_arr = np.array(self._dbg_wall_dist_buf, dtype=np.float32) if self._dbg_wall_dist_buf else np.array([0.0])
         wd_mean = float(wd_arr.mean())
         wd_min = float(wd_arr.min())
         wd_max = float(wd_arr.max())
         self.debug_logger.print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} " f"WD(mean/min/max)={wd_mean:.3f}/{wd_min:.3f}/{wd_max:.3f}")
-        self._debug_reward_buffer.clear()
-        self._debug_hide_buffer.clear()
-        self._debug_wall_distance_buffer.clear()
+        self._dbg_reward_buf.clear()
+        self._dbg_hide_buf.clear()
+        self._dbg_wall_dist_buf.clear()
 
     # Hide and Seek 高度物理環境 (単一エージェント学習最適化版)
     ARENA_HALF = 6.0
@@ -163,14 +167,14 @@ class TeamCosEnv(gym.Env):
     R_BOX = 0.95
     R_RAMP = 1.30
 
-    AGENT_DAMPING_XY = 30.0
-    AGENT_DAMPING_Z = 16.0
-    AGENT_DAMPING_ROT = 25.0
-    AGENT_ACTUATOR_FWD = 700
-    AGENT_Z_MIN = 0.35
+    AGENT_DAMPING_XY = 8  # 10 # 30.0
+    AGENT_DAMPING_Z = 8  # 16.0
+    AGENT_DAMPING_ROT = 8  # 15 # 25.0
+    AGENT_ACTUATOR_FWD = 1500  # 700
+    AGENT_Z_MIN = -0.05
     AGENT_Z_MAX = 1.20
     AGENT_MAX_VZ = 2.2
-    RAMP_JOINT_DAMPING = 90.0
+    RAMP_JOINT_DAMPING = 30  # 90.0
     BOX_JOINT_DAMPING = 28.0
     RAMP_MASS = 60.0
     RAMP_INNER_WEIGHT_MASS = 30.0
@@ -488,7 +492,7 @@ class TeamCosEnv(gym.Env):
       <body name="{pre}_body">
         <site name="{pre}_thrust" pos="0 0 0"/>
         <geom name="{pre}_btm" type="sphere" size="0.4" pos="0 0 -0.1" mass="12" friction="1.2 0.12 0.003"/>
-        <geom name="{pre}_capsule" type="capsule" size="0.3 0.3" rgba="{r} {g} {b} 1" mass="4" contype="0" conaffinity="0"/>
+        <geom name="{pre}_capsule" type="capsule" size="0.3 0.2" rgba="{r} {g} {b} 1" mass="4" contype="0" conaffinity="0"/>
         <geom name="{pre}_nose" type="capsule" fromto="0 0 0.3 0.3 0 0.3" size="0.09" rgba="1 1 1 1" contype="0" conaffinity="0"/>
         <geom name="{pre}_tail" type="capsule" fromto="0 0 0 -0.45 0 -0.3" size="0.05" rgba="{r} {g} {b} 1" contype="0" conaffinity="0"/>
       </body>
@@ -617,6 +621,124 @@ class TeamCosEnv(gym.Env):
         )
         return np.array([math.cos(yaw), math.sin(yaw)], dtype=np.float32)
 
+    def _compute_ramp_lx_bounds(self, rid, up):
+        """
+        Compute lx bounds (min, max) in ramp-local uphill coordinates.
+        Attempts to use geom positions if available; falls back to sensible defaults.
+        Returns (lx_min, lx_max).
+        """
+        # try to map rid -> rkey (ramp1..n)
+        try:
+            idx = int(self.ramp_ids.index(rid))
+            rkey = f"ramp{idx+1}"
+        except Exception:
+            rkey = None
+        geom_ids = []
+        if rkey is not None:
+            geom_ids = self.obj_geom_ids.get(rkey, [])
+
+        # try to read geom_size for a representative geom
+        gsize = None
+        for gid in geom_ids:
+            try:
+                gsize = np.asarray(self.model.geom_size[gid], dtype=np.float32)
+                if gsize.size > 0:
+                    break
+            except Exception:
+                gsize = None
+
+        # determine ramp length L and width W
+        if gsize is not None and gsize.size >= 1:
+            # MuJoCo geom_size is half-extents; assume index 0 is along ramp length
+            half_length = float(gsize[0])
+            L = 2.0 * half_length
+            half_width = float(gsize[1]) if gsize.size > 1 else 0.5
+        else:
+            # fall back to class constant if present
+            try:
+                L = float(self.R_RAMP)
+            except Exception:
+                L = 0.833
+            half_length = 0.5 * L
+            # fallback width
+            half_width = 0.5
+
+        # compute pitch from quaternion (safe asin argument clamp)
+        q = self.data.xquat[rid]
+        # q = [w, x, y, z]
+        sinp = 2.0 * (q[0] * q[2] - q[3] * q[1])
+        if sinp >= 1.0:
+            pitch = math.pi / 2
+        elif sinp <= -1.0:
+            pitch = -math.pi / 2
+        else:
+            pitch = math.asin(sinp)
+
+        # projected half-length on XY plane
+        projected_half = half_length * float(math.cos(pitch))
+        # allow boosting from slightly before the ramp to overcome the gap
+        # below the ramp: subtract an approach margin roughly equal to the
+        # agent radius (≈0.4m). Also keep a small numerical EPS margin.
+        APPROACH_MARGIN = 0.4
+        EPS_MARGIN = 0.02
+        lx_min = -projected_half - APPROACH_MARGIN - EPS_MARGIN
+        lx_max = projected_half + EPS_MARGIN
+        ly_thresh = half_width + 0.05
+        return lx_min, lx_max, ly_thresh
+
+    def _compute_ramp_top_z(self, rid):
+        """
+        Estimate ramp top z (world) from geom_size and quaternion.
+        Returns a single float (top z). Falls back to body z if computation fails.
+        """
+        try:
+            # try to find a representative geom size
+            geom_ids = []
+            try:
+                idx = int(self.ramp_ids.index(rid))
+                rkey = f"ramp{idx+1}"
+                geom_ids = self.obj_geom_ids.get(rkey, [])
+            except Exception:
+                geom_ids = []
+
+            gsize = None
+            for gid in geom_ids:
+                try:
+                    gsize = np.asarray(self.model.geom_size[gid], dtype=np.float32)
+                    if gsize.size > 0:
+                        break
+                except Exception:
+                    gsize = None
+
+            if gsize is not None and gsize.size >= 1:
+                half_length = float(gsize[0])
+            else:
+                try:
+                    L = float(self.R_RAMP)
+                except Exception:
+                    L = 0.833
+                half_length = 0.5 * L
+
+            q = self.data.xquat[rid]
+            sinp = 2.0 * (q[0] * q[2] - q[3] * q[1])
+            if sinp >= 1.0:
+                pitch = math.pi / 2
+            elif sinp <= -1.0:
+                pitch = -math.pi / 2
+            else:
+                pitch = math.asin(sinp)
+
+            # vertical half (height difference from center to top)
+            vertical_half = half_length * float(math.sin(pitch))
+            body_z = float(self.data.xpos[rid][2])
+            # assume top is body_z + vertical_half
+            return body_z + vertical_half
+        except Exception:
+            try:
+                return float(self.data.xpos[rid][2])
+            except Exception:
+                return 0.0
+
     def _is_ramp_blocked_or_locked(self, ramp_key, rid):
         if self.object_state[ramp_key]["mode"] == "locked":
             return True
@@ -641,9 +763,14 @@ class TeamCosEnv(gym.Env):
         arot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]]
         afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
         gain = 0.0
+        per_ramp = []
         for i, rid in enumerate(self.ramp_ids, start=1):
             rkey = f"ramp{i}"
-            if not self._is_ramp_blocked_or_locked(rkey, rid):
+            # ランプが他のエージェントにホールドされている（locked + owner が存在する）場合のみ除外する。
+            # そうでなければ（壁際で固定されている等のケースを含む）判定対象にする。
+            st = self.object_state.get(rkey, {})
+            # エージェントが持ち運んでいる（grabbed）ランプは除外する。
+            if st.get("mode") == "grabbed" and st.get("owner") is not None:
                 continue
             rpos = self.data.xpos[rid][:2]
             up = self._ramp_uphill_dir(rid)
@@ -652,13 +779,70 @@ class TeamCosEnv(gym.Env):
             lx = float(np.dot(rel, up))
             ly = float(np.dot(rel, side))
             facing = float(np.dot(afwd, up))
-            if abs(ly) > 0.95 or facing < 0.55:
+            # record this ramp candidate for diagnostics
+            # compute dynamic bounds and record this ramp candidate for diagnostics
+            try:
+                lx_min, lx_max, ly_thresh = self._compute_ramp_lx_bounds(rid, up)
+            except Exception:
+                lx_min, lx_max, ly_thresh = -1.15, 0.666, 0.95
+            full_thresh = lx_min + 0.5 * (lx_max - lx_min)
+            per_ramp.append(
+                {
+                    "rkey": rkey,
+                    "lx": lx,
+                    "ly": ly,
+                    "facing": facing,
+                    "lx_min": lx_min,
+                    "lx_max": lx_max,
+                    "ly_thresh": ly_thresh,
+                    "full_thresh": full_thresh,
+                }
+            )
+
+            if abs(ly) > ly_thresh or facing < 0.55:
                 continue
-            if -1.15 <= lx <= 0.2:
+            # determine gain: full boost closer to ramp start, partial boost near top
+            if lx_min <= lx <= full_thresh:
                 gain = max(gain, 1.0)
-            elif 0.2 < lx <= 0.95:
+            elif full_thresh < lx <= lx_max:
                 gain = max(gain, 0.6)
-        return gain
+
+        # detect toggle and print diagnostics when boost value changes for this agent
+        # apply hysteresis: set_thresh to engage, clear_thresh to disengage
+        SET_THRESH = 0.6
+        CLEAR_THRESH = 0.4
+        try:
+            prev = float(self._last_ramp_boost.get(ak, 0.0))
+        except Exception:
+            prev = 0.0
+        prev_on = prev >= SET_THRESH
+        cand_on = gain >= SET_THRESH
+        # determine final_on using hysteresis
+        if prev_on:
+            final_on = gain >= CLEAR_THRESH
+        else:
+            final_on = cand_on
+
+        if final_on:
+            # prefer the current candidate magnitude if available, otherwise keep previous
+            final_gain = gain if gain > 0.0 else prev
+        else:
+            final_gain = 0.0
+
+        if final_gain != prev:
+            try:
+                s = ", ".join(
+                    f"{p['rkey']}(lx={p['lx']:.3f},ly={p['ly']:.3f},f={p['facing']:.3f},min={p['lx_min']:.3f},max={p['lx_max']:.3f},lyt={p['ly_thresh']:.3f},full={p['full_thresh']:.3f})"
+                    for p in per_ramp
+                )
+                print(f"[RAMP_BOOST_TOGGLE] step={getattr(self,'current_step',-1)} ak={ak} prev={prev:.1f} raw_gain={gain:.1f} new={final_gain:.1f} candidates=[{s}]")
+            except Exception:
+                print(f"[RAMP_BOOST_TOGGLE] step={getattr(self, 'current_step', -1)} ak={ak} prev={prev:.1f} new={final_gain:.1f}")
+        try:
+            self._last_ramp_boost[ak] = float(final_gain)
+        except Exception:
+            pass
+        return final_gain
 
     def _stabilize_agent_vertical_motion(self):
         for ak in self.agent_keys:
@@ -923,7 +1107,7 @@ class TeamCosEnv(gym.Env):
             return
         self.debug_logger.log_policy_src(agent_key, source, self.current_step, force=True)
 
-    def _debug_print_throttled(self, key, message, force=False):
+    def _dbg_print_throttled(self, key, message, force=False):
         self.debug_logger.print_throttled(key, message, self.current_step, force=force)
 
     def _is_spawn_position_valid(self, pos_xy, radius, placed, margin):
@@ -1347,6 +1531,11 @@ class TeamCosEnv(gym.Env):
         jz = self.qpos_indices[self.learnable_agent_key]["z"]
         vz_idx = self.model.jnt_dofadr[jz]
         agent_vz = float(self.data.qvel[vz_idx])
+        # agent world z (body position) and debug vz
+        agent_body_id = learnable_agent_body_id
+        agent_z = float(self.data.xpos[agent_body_id][2])
+        dbg_agent_z = float(agent_z)
+        dbg_agent_vz = float(agent_vz)
         # xy 速度と直近コントロールも取得して info に含める
         # Use stored joint indices for the learnable agent (joints live on the
         # "{agent}_anchor" body). Avoid using model.body_jntadr on the child
@@ -1362,6 +1551,113 @@ class TeamCosEnv(gym.Env):
         obs = self._normalize_obs(self._get_obs(idx_to_obs))
         reward = float(rb if self.target == "hider" else -rb)
         done = self.current_step >= self.max_episode_steps
+        # ランプ関連のデバッグ指標を計算（ランプ上にいると判断できる場合のみ）
+        dbg_ramp_progress = None
+        dbg_ramp_lx = None
+        dbg_ramp_ly = None
+        dbg_ramp_facing = None
+        dbg_ramp_rpos = None
+        try:
+            # _ramp_boost_gain が高いとランプ上にいる可能性が高いのでそれをフィルタに使う
+            boost = float(self._ramp_boost_gain(self.learnable_agent_key))
+            if boost > 0.0:
+                # agent の位置・高さ — qpos の z ではなく body の world z を使う
+                # (qpos.z はジョイント制約で AGENT_Z_MIN にクリップされるため、
+                #  実際のボディ高さを使う方がランプ接触の指標として有用)
+                agent_body_id = learnable_agent_body_id
+                agent_z = float(self.data.xpos[agent_body_id][2])
+                apos2 = learnable_agent_pos[:2]
+                # 学習対象の回転角（z）を取得して facing 計算に使う
+                arot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[self.learnable_agent_key]["rot"]]]
+                # 進捗正規化に使う範囲はランプごとの実ジオメトリから算出
+                for _i, rid in enumerate(self.ramp_ids, start=1):
+                    rpos = self.data.xpos[rid][:2]
+                    up = self._ramp_uphill_dir(rid)
+                    side = np.array([-up[1], up[0]], dtype=np.float32)
+                    rel = apos2 - rpos
+                    lx = float(np.dot(rel, up))
+                    ly = float(np.dot(rel, side))
+                    # 横ずれが大きければ無視
+                    if abs(ly) > 1.5:
+                        continue
+                    try:
+                        lx_min, lx_max, _ = self._compute_ramp_lx_bounds(rid, up)
+                    except Exception:
+                        lx_min, lx_max = -1.15, 0.666
+                    # 正規化された進捗（clamp 0..1）
+                    prog = (lx - lx_min) / max(1e-6, (lx_max - lx_min))
+                    prog = max(0.0, min(1.0, prog))
+                    # ランプの高さはブースト判定には関係しないため、
+                    # `dbg_agent_z` にはエージェントの world z をそのまま記録する。
+                    # 最も進捗が大きいランプを採用
+                    if dbg_ramp_progress is None or prog > dbg_ramp_progress:
+                        dbg_ramp_progress = float(prog)
+                        dbg_agent_z = float(agent_z)
+                        dbg_ramp_lx = float(lx)
+                        dbg_ramp_ly = float(ly)
+                        # facing はエージェント向きとランプ上り方向のコサイン
+                        afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
+                        dbg_ramp_facing = float(np.dot(afwd, up))
+                        dbg_ramp_rpos = rpos.copy()
+                        dbg_ramp_rid = rid
+                # end per-ramp loop
+                # If boost suggests a ramp but we didn't select any, emit per-ramp diagnostics
+                # to help tune filters (temporary verbose diagnostic).
+                if dbg_ramp_progress is None:
+                    try:
+                        details = []
+                        afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
+                        for i2, rid2 in enumerate(self.ramp_ids, start=1):
+                            rkey2 = f"ramp{i2}"
+                            st2 = self.object_state.get(rkey2, {})
+                            rpos2 = self.data.xpos[rid2][:2]
+                            up2 = self._ramp_uphill_dir(rid2)
+                            side2 = np.array([-up2[1], up2[0]], dtype=np.float32)
+                            rel2 = apos2 - rpos2
+                            lx2 = float(np.dot(rel2, up2))
+                            ly2 = float(np.dot(rel2, side2))
+                            facing2 = float(np.dot(afwd, up2))
+                            details.append(f"{rkey2}(mode={st2.get('mode')},owner={st2.get('owner')}," f"lx={lx2:.3f},ly={ly2:.3f},f={facing2:.3f},rpos=({rpos2[0]:.3f},{rpos2[1]:.3f}))")
+                        s = ", ".join(details)
+                        print(f"[RAMP_DBG_REJECT] step={getattr(self,'current_step',-1)} ak={self.learnable_agent_key} " f"boost={boost:.3f} candidates=[{s}]")
+                    except Exception:
+                        pass
+            # detect climbing (agent z increasing while on/near ramp) and reaching top
+            prev_z = self._prev_agent_z.get(self.learnable_agent_key, None)
+            dbg_ramp_climbing = False
+            dbg_ramp_reached_top = False
+            if dbg_ramp_progress is not None:
+                if prev_z is not None and (agent_z - prev_z) > 0.01 and dbg_ramp_progress > 0.05:
+                    dbg_ramp_climbing = True
+                # reached-top is only debug info; use height-only criterion
+                try:
+                    HEIGHT_TOL = 0.02
+                    if dbg_ramp_rid is not None:
+                        top_z = self._compute_ramp_top_z(dbg_ramp_rid)
+                        dbg_ramp_reached_top = agent_z >= (top_z - HEIGHT_TOL)
+                    else:
+                        dbg_ramp_reached_top = False
+                except Exception:
+                    dbg_ramp_reached_top = False
+            # store for next step
+            try:
+                self._prev_agent_z[self.learnable_agent_key] = float(agent_z)
+            except Exception:
+                pass
+        except Exception:
+            # ランプ指標の計算で失敗しても主処理に影響を出さない。
+            # ただしエージェントの位置/速度は常に報告したいため
+            # `dbg_agent_z` と `dbg_agent_vz` は上書きしない。
+            dbg_ramp_progress = None
+            dbg_ramp_climbing = False
+            dbg_ramp_reached_top = False
+        # Ensure agent z is reported when we have a computed progress but z wasn't set
+        try:
+            if dbg_ramp_progress is not None and dbg_agent_z is None:
+                agent_body_id = learnable_agent_body_id
+                dbg_agent_z = float(self.data.xpos[agent_body_id][2])
+        except Exception:
+            dbg_agent_z = None
         info = {
             "is_detected": find,
             "lock_event": any_lock_event,
@@ -1396,7 +1692,29 @@ class TeamCosEnv(gym.Env):
             "applied_forward_model": applied_forward_model,
             "applied_forward": applied_forward_env,
         }
-        self._debug_collect_stats(reward, info)
+        # デバッグ用: ランプ上判定に使った boost 値を常に出力する
+        try:
+            info["dbg_ramp_boost"] = float(self._ramp_boost_gain(self.learnable_agent_key))
+        except Exception:
+            pass
+        # 追加デバッグ出力
+        if dbg_ramp_lx is not None:
+            info["dbg_ramp_lx"] = dbg_ramp_lx
+        if dbg_ramp_ly is not None:
+            info["dbg_ramp_ly"] = dbg_ramp_ly
+        if dbg_ramp_facing is not None:
+            info["dbg_ramp_facing"] = dbg_ramp_facing
+        if dbg_ramp_rpos is not None:
+            info["dbg_ramp_rpos_x"] = float(dbg_ramp_rpos[0])
+            info["dbg_ramp_rpos_y"] = float(dbg_ramp_rpos[1])
+        info["dbg_agent_z"] = dbg_agent_z
+        info["dbg_agent_vz"] = dbg_agent_vz
+        if dbg_ramp_progress is not None:
+            info["dbg_ramp_progress"] = dbg_ramp_progress
+        # climbing / reached-top diagnostics
+        info["dbg_ramp_climbing"] = bool(dbg_ramp_climbing)
+        info["dbg_ramp_reached_top"] = bool(dbg_ramp_reached_top)
+        self._dbg_collect_stats(reward, info)
 
         # cache the observation returned for the learnable agent
         try:
