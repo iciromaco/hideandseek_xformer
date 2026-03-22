@@ -131,7 +131,7 @@ class TeamCosEnv(gym.Env):
         avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
         hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
         wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
-        print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} WallDist(mean/min/max)={wd_arr.mean():.3f}/{wd_arr.min():.3f}/{wd_arr.max():.3f}")
+        self.debug_logger.print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} WallDist(mean/min/max)={wd_arr.mean():.3f}/{wd_arr.min():.3f}/{wd_arr.max():.3f}")
         self._debug_reward_buffer.clear()
         self._debug_hide_buffer.clear()
         self._debug_wall_distance_buffer.clear()
@@ -532,6 +532,14 @@ class TeamCosEnv(gym.Env):
             # z軸の基準設定
             self.object_state[tk]["planar_z"] = 0.0 if tk.startswith("ramp") else 0.5
 
+            # オブジェクトがロック状態なら、planar lock は常に水平向きの恒等クォータニオンを使う
+            if self.object_state[tk].get("mode") == "locked":
+                pq = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                self.object_state[tk]["planar_quat"] = pq
+                if self.debug_mode:
+                    self.debug_logger.print(f"[DEBUG][_cache_planar_object_pose] tk={tk} mode=locked -> forcing identity planar_quat")
+                continue
+
             # Freejointオブジェクト (box/b/ramp) の判定
             # シンプルに 's' (seeker) や 'h' (hider) で始まらないものを対象とするのも手です
             if tk[0] in ("b", "r"):  # 'b'(box/b1), 'r'(ramp) に合致
@@ -551,7 +559,7 @@ class TeamCosEnv(gym.Env):
 
                 # デバッグログは失敗時のみ、かつ簡潔に
                 if self.debug_mode and pq is None:
-                    print(f"[DEBUG] Pose cache failed for {tk}: bid={bid}, qadr={qadr}")
+                    self.debug_logger.print(f"[DEBUG] Pose cache failed for {tk}: bid={bid}, qadr={qadr}")
             else:
                 # Agent
                 self.object_state[tk]["planar_quat"] = None
@@ -862,10 +870,10 @@ class TeamCosEnv(gym.Env):
                         self.data.qpos[qadr + QUAT_START : qadr + QUAT_STOP] = pq
                     else:
                         if self.debug_mode:
-                            print(f"[DEBUG][_apply_object_constraints] skipping invalid planar_quat for {tk}: {pq}")
+                            self.debug_logger.print(f"[DEBUG][_apply_object_constraints] skipping invalid planar_quat for {tk}: {pq}")
                 except Exception:
                     if self.debug_mode:
-                        print(f"[DEBUG][_apply_object_constraints] exception validating planar_quat for {tk}")
+                        self.debug_logger.print(f"[DEBUG][_apply_object_constraints] exception validating planar_quat for {tk}")
                 self.data.qvel[vadr + Z_VEL_IDX] = 0.0
                 self.data.qvel[vadr + ANG_VEL_START : vadr + ANG_VEL_STOP] = 0.0
         for tk, geom_ids in self.obj_geom_ids.items():
@@ -972,11 +980,11 @@ class TeamCosEnv(gym.Env):
             try:
                 qpos = self.data.qpos
                 qvel = self.data.qvel
-                print(f"[DEBUG][reset] qpos.shape={qpos.shape} qvel.shape={qvel.shape}")
+                self.debug_logger.print(f"[DEBUG][reset] qpos.shape={qpos.shape} qvel.shape={qvel.shape}")
                 if np.any(~np.isfinite(qpos)):
-                    print(f"[DEBUG][reset] qpos contains non-finite values at indices: {np.where(~np.isfinite(qpos))[0][:10]}")
+                    self.debug_logger.print(f"[DEBUG][reset] qpos contains non-finite values at indices: {np.where(~np.isfinite(qpos))[0][:10]}")
                 if np.any(~np.isfinite(qvel)):
-                    print(f"[DEBUG][reset] qvel contains non-finite values at indices: {np.where(~np.isfinite(qvel))[0][:10]}")
+                    self.debug_logger.print(f"[DEBUG][reset] qvel contains non-finite values at indices: {np.where(~np.isfinite(qvel))[0][:10]}")
             except Exception:
                 pass
         self._init_agent_intelligence()
@@ -992,18 +1000,18 @@ class TeamCosEnv(gym.Env):
                         jadr = self.model.body_jntadr[bid]
                         if jadr is None or int(jadr) < 0:
                             if self.debug_mode:
-                                print(f"[DEBUG][reset] invalid body_jntadr for body {bid}: {jadr}")
+                                self.debug_logger.print(f"[DEBUG][reset] invalid body_jntadr for body {bid}: {jadr}")
                             continue
                         adr = int(self.model.jnt_qposadr[jadr])
                         if adr is None or adr < 0 or (adr + 7) > self.data.qpos.shape[0]:
                             if self.debug_mode:
-                                print(f"[DEBUG][reset] invalid qpos adr for body {bid}: {adr}")
+                                self.debug_logger.print(f"[DEBUG][reset] invalid qpos adr for body {bid}: {adr}")
                             continue
                         self.data.qpos[adr : adr + 7] = [p[0], p[1], z, 1, 0, 0, 0]
                         placed.append((p, rad))
                     except Exception:
                         if self.debug_mode:
-                            print(f"[DEBUG][reset] exception placing body {bid}")
+                            self.debug_logger.print(f"[DEBUG][reset] exception placing body {bid}")
                         continue
                     # ランプのみx, y出力とqpos値も出力
                     # if (bid, rad, z) in ramp_specs:
@@ -1041,10 +1049,10 @@ class TeamCosEnv(gym.Env):
                         if np.allclose(pos, 0.0, atol=1e-6):
                             origins.append(ak)
                 if origins:
-                    print(f"[DEBUG][reset] objects/agents at origin after reset: {origins}")
+                    self.debug_logger.print(f"[DEBUG][reset] objects/agents at origin after reset: {origins}")
                 # also quick qpos/qvel NaN check
                 if np.any(~np.isfinite(self.data.qpos)) or np.any(~np.isfinite(self.data.qvel)):
-                    print("[DEBUG][reset] Non-finite detected in qpos/qvel after forward")
+                    self.debug_logger.print("[DEBUG][reset] Non-finite detected in qpos/qvel after forward")
             except Exception:
                 pass
         self._cache_planar_object_pose()
@@ -1162,8 +1170,8 @@ class TeamCosEnv(gym.Env):
                 bad_qpos = np.where(~np.isfinite(self.data.qpos))[0]
                 bad_qvel = np.where(~np.isfinite(self.data.qvel))[0]
                 if bad_qpos.size or bad_qvel.size:
-                    print(f"[DEBUG][step] Non-finite qpos indices: {bad_qpos}")
-                    print(f"[DEBUG][step] Non-finite qvel indices: {bad_qvel}")
+                    self.debug_logger.print(f"[DEBUG][step] Non-finite qpos indices: {bad_qpos}")
+                    self.debug_logger.print(f"[DEBUG][step] Non-finite qvel indices: {bad_qvel}")
                     # map qpos indices back to joints/bodies where possible
                     qpos_to_j = {}
                     for jid in range(self.model.njnt):
@@ -1174,7 +1182,7 @@ class TeamCosEnv(gym.Env):
                         qpos_to_j[qadr] = jid
                     # print joint qposadr table to help map indices to joints
                     try:
-                        print(f"[DEBUG][step] model.nq={int(self.model.nq)} model.njnt={int(self.model.njnt)}")
+                        self.debug_logger.print(f"[DEBUG][step] model.nq={int(self.model.nq)} model.njnt={int(self.model.njnt)}")
                         rows = []
                         for jid in range(min(200, int(self.model.njnt))):
                             try:
@@ -1186,16 +1194,16 @@ class TeamCosEnv(gym.Env):
                             except Exception:
                                 dadr = -1
                             rows.append((jid, qadr, dadr))
-                        print("[DEBUG][step] sample joint qposadr/dofadr:")
+                        self.debug_logger.print("[DEBUG][step] sample joint qposadr/dofadr:")
                         for r in rows[:50]:
-                            print(f"  jid={r[0]:3d} qposadr={r[1]:3d} dofadr={r[2]:3d}")
+                            self.debug_logger.print(f"  jid={r[0]:3d} qposadr={r[1]:3d} dofadr={r[2]:3d}")
                     except Exception:
                         pass
                     # show qpos around bad indices
                     for idx in bad_qpos.tolist():
                         lo = max(0, idx - 3)
                         hi = min(self.data.qpos.shape[0], idx + 4)
-                        print(f"[DEBUG][step] qpos[{lo}:{hi}] = {self.data.qpos[lo:hi]}")
+                        self.debug_logger.print(f"[DEBUG][step] qpos[{lo}:{hi}] = {self.data.qpos[lo:hi]}")
             except Exception:
                 pass
 
