@@ -16,21 +16,22 @@ action_repeat = 10
 mode4_sdf_cell_size = 0.05
 # デバッグ表示
 show_turn_lines = false
-dbg_log_interval_steps = 200
+# policy_source ログ制御（大量ログ抑制）
+policy_source_log = false
+policy_source_log_each_reset = false
+debug_log_interval_steps = 200
 # 報酬・評価系
 use_custom_reward = true
 # 前進飽和抑制（常時前進ボーナスは使わない）
 rw_move_sat_penalty = 0.02
-# 壁張り付き対策（全エージェント共通）
+ # 壁張り付き対策（全エージェント共通）
 rw_wall_stick_penalty = 0.15
-agent_head_clearance = 0.2  # 壁近判定閾値（全エージェント共通）
-wall_near_margin = 0.4  # 壁近マージン（エージェント表面からの近接閾値）
-rw_still_speed_threshold = 0.1  # 静止判定速度閾値（全エージェント共通）
-rw_hide_visible_near_penalty = 0.05
+
+rw_wall_near_threshold = 0.18  # 壁近判定閾値（全エージェント共通）
+rw_still_speed_threshold = 0.05  # 静止判定速度閾値（全エージェント共通）
+rw_hide_visible_near_penalty = 0.025
 rw_hide_seeker_gaze_penalty = 0.03
 rw_seek_gaze_reward = 0.03
-# 敵が見えていないときの回転インセンティブ（小さな正の値を設定）
-rw_turn_incentive = 0.01
 rw_wall_avoid_penalty = 0.15
 ramp_check_enabled = false
 ramp_check_viewer = false
@@ -57,19 +58,18 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 30000
 wandb_run_name = "wall_only_confirm_1M"
+rw_move_sat_penalty = 0.0
 
 # runtime.debug: 再生/検証向け設定
 [runtime.debug]
 train_mode = false
 debug_hider_policy = "model_if_available"
 debug_seeker_policy = "model_if_available"
-# model_policy_deterministic = true
+debug_deterministic_inference = false
 debug_symmetric_hider_policy = false
 npc_only_debug = false
-# play_episodes = 100
+play_episodes = 100
 auto_tune_hparams = false
-play_episodes = 10
-dbg_log_interval_steps = 200
 
 # runtime.train: 学習向け設定
 [runtime.train]
@@ -82,6 +82,7 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 100_000_000
 wandb_run_name = "wall_only_confirm_100M"
+rw_move_sat_penalty = 0.0
 
 # runtime.train1: Viewer 表示ありの学習環境
 [runtime.train1]
@@ -94,6 +95,7 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 100_000_000
 wandb_run_name = "train1"
+rw_move_sat_penalty = 0.0
 num_envs = 1
 
 # runtime.trainseeker: 学習向け設定 Seeker
@@ -107,25 +109,20 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 10_000_000
 wandb_run_name = "wall_only_confirm_10M"
+rw_move_sat_penalty = 0.0
 
 # runtime.trainseeker_forRB: 学習向け設定 Seeker
 [runtime.trainseeker_forRB]
 train_mode = true
-use_viewer = true
+use_viewer = false
 training_target = "seeker"
 train_other_hider_policy = "rule"
 train_other_seeker_policy = "rule"
-use_custom_reward = true
 npc_only_debug = false
 auto_tune_hparams = false
-total_timesteps = 100_000_000
-wandb_run_name = "wall_only_confirm_100K"
-# rw_move_sat_penalty = 0.02
-
-# w_wall_avoid_penalty = 0.0
-# rw_wall_stick_penalty = 0.15 # 壁張り付き対策（全エージェント共通）
-# rw_wall_near_threshold = 0.4  # 壁近判定閾値（全エージェント共通）
-# rw_still_speed_threshold = 0.1  # 静止判定速度閾値（全エージェント共通）
+total_timesteps = 10_000_000
+wandb_run_name = "wall_only_confirm_10M"
+rw_move_sat_penalty = 0.0
 
 # base: PPOの基本ハイパーパラメータ（全ターゲット共通）
 [base]

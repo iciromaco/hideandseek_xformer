@@ -16,7 +16,7 @@ action_repeat = 10
 mode4_sdf_cell_size = 0.05
 # デバッグ表示
 show_turn_lines = false
-dbg_log_interval_steps = 200
+debug_log_interval_steps = 200
 # 報酬・評価系
 use_custom_reward = true
 # 前進飽和抑制（常時前進ボーナスは使わない）
@@ -69,7 +69,7 @@ npc_only_debug = false
 # play_episodes = 100
 auto_tune_hparams = false
 play_episodes = 10
-dbg_log_interval_steps = 200
+debug_log_interval_steps = 200
 
 # runtime.train: 学習向け設定
 [runtime.train]

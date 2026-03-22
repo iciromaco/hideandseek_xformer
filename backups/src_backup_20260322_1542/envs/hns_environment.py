@@ -1,8 +1,7 @@
-# mathのimportを明示的に追加
+# src/envs/hns_environment.py
+# hns_environment.py v4.5９
 import math
 
-# src/envs/hns_environment.py
-# hns_environment.py v4.59
 import gymnasium as gym
 import mujoco
 import mujoco.viewer
@@ -24,27 +23,137 @@ class DebugLogger:
         self.enabled = enabled
         self.log_interval_steps = log_interval_steps
         self._log_last_step = {}
-        self._policy_src_logged = set()
+        self._policy_source_logged = set()
 
     def print(self, message):
         if self.enabled:
             print(message)
 
     def print_throttled(self, key, message, current_step, force=False):
+        # debug統計以外の出力は抑制
         return
 
     def log_policy_source(self, agent_key, source, current_step, force=False):
+        # policy_sourceログも抑制
         return
 
-    def clear_policy_src_log(self):
-        if hasattr(self, "_policy_src_logged"):
-            self._policy_src_logged.clear()
-        return
+    def clear_policy_source_log(self):
+        self._policy_source_logged.clear()
+
+
+def _euler_z_to_quat(yaw):
+    """Z軸回転角からクォータニオン文字列を生成。"""
+    w, z = math.cos(yaw / 2.0), math.sin(yaw / 2.0)
+    return f"{w:.6f} 0 0 {z:.6f}"
+
+
+@njit(cache=True)
+def _blocked_by_static_walls_numba(p1x, p1y, p2x, p2y, walls, margin):
+    dx = p2x - p1x
+    dy = p2y - p1y
+    for i in range(walls.shape[0]):
+        cx = walls[i, 0]
+        cy = walls[i, 1]
+        hx = walls[i, 2]
+        hy = walls[i, 3]
+        x_min = cx - hx - margin
+        x_max = cx + hx + margin
+        y_min = cy - hy - margin
+        y_max = cy + hy + margin
+        t0 = 0.0
+        t1 = 1.0
+
+        if abs(dx) < 1e-9:
+            if p1x < x_min or p1x > x_max:
+                continue
+        else:
+            inv_dx = 1.0 / dx
+            tx1 = (x_min - p1x) * inv_dx
+            tx2 = (x_max - p1x) * inv_dx
+            t_enter = tx1 if tx1 < tx2 else tx2
+            t_exit = tx2 if tx1 < tx2 else tx1
+            if t_enter > t0:
+                t0 = t_enter
+            if t_exit < t1:
+                t1 = t_exit
+            if t0 > t1:
+                continue
+
+        if abs(dy) < 1e-9:
+            if p1y < y_min or p1y > y_max:
+                continue
+        else:
+            inv_dy = 1.0 / dy
+            ty1 = (y_min - p1y) * inv_dy
+            ty2 = (y_max - p1y) * inv_dy
+            t_enter = ty1 if ty1 < ty2 else ty2
+            t_exit = ty2 if ty1 < ty2 else ty1
+            if t_enter > t0:
+                t0 = t_enter
+            if t_exit < t1:
+                t1 = t_exit
+            if t0 > t1:
+                continue
+
+        return True
+    return False
 
 
 class TeamCosEnv(gym.Env):
-    # Environment constants and implementation follow
-    
+    # --- 統計バッファ初期化 ---
+    def _init_debug_stats(self):
+        self._debug_reward_buffer = []
+        self._debug_hide_buffer = []
+        self._debug_wall_distance_buffer = []
+        self._debug_step_counter = 0
+        self._debug_log_interval = getattr(self, "debug_logger", None) and getattr(self.debug_logger, "log_interval_steps", 100) or 100
+
+    def _debug_collect_stats(self, reward, info):
+        if not self.debug_mode:
+            return
+        self._debug_reward_buffer.append(reward)
+        # 隠れ率: is_detected==False なら隠れているとみなす
+        self._debug_hide_buffer.append(0 if info.get("is_detected", False) else 1)
+        wd = info.get("wall_distance", None)
+        if wd is not None:
+            if isinstance(wd, (list, tuple, np.ndarray)):
+                self._debug_wall_distance_buffer.extend([float(v) for v in wd])
+            else:
+                self._debug_wall_distance_buffer.append(float(wd))
+        self._debug_step_counter += 1
+        # log_intervalごとに統計出力
+        if self._debug_step_counter % self._debug_log_interval == 0:
+            self._debug_print_stats()
+
+    def _debug_print_stats(self):
+        if not self.debug_mode:
+            return
+        avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
+        hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
+        wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
+        self.debug_logger.print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} WallDist(mean/min/max)={wd_arr.mean():.3f}/{wd_arr.min():.3f}/{wd_arr.max():.3f}")
+        self._debug_reward_buffer.clear()
+        self._debug_hide_buffer.clear()
+        self._debug_wall_distance_buffer.clear()
+
+    """
+    Hide and Seek 高度物理環境 (単一エージェント学習最適化版)
+    """
+    ARENA_HALF = 6.0
+    SAFE_HALF = 5.0
+    R_AGENT = 0.55
+    R_BOX = 0.95
+    R_RAMP = 1.30
+
+    AGENT_DAMPING_XY = 30.0
+    AGENT_DAMPING_Z = 16.0
+    AGENT_DAMPING_ROT = 25.0
+    AGENT_ACTUATOR_FWD = 700
+    AGENT_Z_MIN = 0.35
+    AGENT_Z_MAX = 1.20
+    AGENT_MAX_VZ = 2.2
+    RAMP_JOINT_DAMPING = 90.0
+    BOX_JOINT_DAMPING = 28.0
     RAMP_MASS = 60.0
     RAMP_INNER_WEIGHT_MASS = 30.0
     BOX_MASS = 22.0
@@ -61,54 +170,11 @@ class TeamCosEnv(gym.Env):
     FREE_OBJ_LINEAR_DAMP = 0.90
     FREE_OBJ_STOP_EPS = 0.045
     INTERACT_OCCLUSION_MARGIN = 0.03
+    # When an inference model is present for the learnable agent, the model's
+    # forward channel can be multiplied by this sign. Set to 1.0 for no change
+    # or -1.0 to flip the forward direction at apply-time. Keeping this as a
+    # tunable class attribute avoids editing code logic elsewhere.
     INFERENCE_FORWARD_SIGN = 1.0
-
-    # Arena / object size defaults (restore missing constants)
-    ARENA_HALF = 6.0
-
-    # radii used for spawn collision checks
-    R_AGENT = 0.6
-    R_BOX = 0.6
-    R_RAMP = 0.9
-
-    # joint/actuator damping and limits
-    RAMP_JOINT_DAMPING = 0.5
-    BOX_JOINT_DAMPING = 0.5
-    AGENT_DAMPING_XY = 0.5
-    AGENT_DAMPING_Z = 0.5
-    AGENT_DAMPING_ROT = 0.5
-    AGENT_Z_MIN = 0.1
-    AGENT_Z_MAX = 2.0
-    AGENT_MAX_VZ = 4.0
-    AGENT_ACTUATOR_FWD = 1.0
-
-    def _init_debug_stats(self):
-        """Initialize lightweight debug statistics storage."""
-        self.debug_stats = {
-            "reward_history": [],
-            "last_info": None,
-        }
-        # ensure DebugLogger internals exist
-        if not hasattr(self, "debug_logger"):
-            self.debug_logger = DebugLogger(enabled=False)
-        if not hasattr(self.debug_logger, "_log_last_step"):
-            self.debug_logger._log_last_step = {}
-        return
-
-    def _debug_collect_stats(self, reward, info):
-        """Collect minimal debug stats; non-fatal and lightweight."""
-        try:
-            self.debug_stats["reward_history"].append((int(self.current_step), float(reward)))
-            self.debug_stats["last_info"] = info
-            if self.debug_mode and getattr(self.debug_logger, "enabled", False):
-                if int(self.current_step) % int(getattr(self.debug_logger, "log_interval_steps", 200)) == 0:
-                    # Throttled debug print
-                    self.debug_logger.print(f"[DEBUG][step={self.current_step}] reward={float(reward)}")
-        except Exception:
-            # Never raise from debug collector
-            pass
-        return
-
 
     def __init__(
         self,
@@ -121,7 +187,9 @@ class TeamCosEnv(gym.Env):
         render_mode=None,
         inference_policies=None,
         show_turn_lines=True,
-        dbg_log_interval_steps=200,
+        policy_source_log=False,
+        policy_source_log_each_reset=False,
+        debug_log_interval_steps=200,
         mode4_sdf_cell_size=0.05,
         debug_mode=False,
         action_repeat=16,
@@ -140,37 +208,17 @@ class TeamCosEnv(gym.Env):
         self.mode4_sdf_cell_size = float(mode4_sdf_cell_size)
         self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
         self.debug_mode = debug_mode
-        self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=dbg_log_interval_steps)
+        self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=debug_log_interval_steps)
         self.action_repeat = action_repeat
+        # temporal caches for visibility / being-hit freshness
+        self._prev_vis = {}
+        self._prev_being_hit = {}
+        # counters for persisting BEING_HIT in observations
+        self.being_hit_persist = 3
+        self._being_hit_counters = {}
+        # cached last observation returned for the learnable agent
+        self._cached_obs = None
         self._init_debug_stats()
-        # Debug-only: validate cached addresses and report suspicious values
-        if self.debug_mode:
-            try:
-                bad = []
-                for tk, bid in self.obj_body_map.items():
-                    qadr = None
-                    vadr = None
-                    if hasattr(self, "obj_qpos_adr") and tk in self.obj_qpos_adr:
-                        qadr = int(self.obj_qpos_adr.get(tk, -1))
-                        vadr = int(self.obj_qvel_adr.get(tk, -1))
-                    else:
-                        try:
-                            jid = self.model.body_jntadr[bid]
-                            qadr = int(self.model.jnt_qposadr[jid]) if jid is not None and jid >= 0 else -1
-                            vadr = int(self.model.jnt_dofadr[jid]) if jid is not None and jid >= 0 else -1
-                        except Exception:
-                            qadr, vadr = -1, -1
-                    # basic sanity checks
-                    if qadr < 0 or qadr >= self.data.qpos.shape[0]:
-                        bad.append((tk, 'qpos', qadr))
-                    if vadr < 0 or vadr >= self.data.qvel.shape[0]:
-                        bad.append((tk, 'qvel', vadr))
-                if bad:
-                    print("[DEBUG][addr-check] suspicious obj addresses:")
-                    for b in bad:
-                        print("  -", b)
-            except Exception:
-                pass
         if self.n_seekers == 1:
             self.seeker_keys = ["s"]
         else:
@@ -178,7 +226,7 @@ class TeamCosEnv(gym.Env):
         self.hider_keys = [f"h{i}" for i in range(1, self.n_hiders + 1)]
         self.agent_keys = self.seeker_keys + self.hider_keys
         self.learnable_agent_key = self.seeker_keys[0] if target == "seeker" else self.hider_keys[0]
-        self.learnable_agent_idx = self.agent_keys.index(self.learnable_agent_key)
+        self.learnable_agent_index = self.agent_keys.index(self.learnable_agent_key)
         self.idx = ObsIdx(n_boxes, n_ramps, n_others=len(self.agent_keys) - 1)
 
         self.model = mujoco.MjModel.from_xml_string(self._build_dynamic_xml())
@@ -195,7 +243,7 @@ class TeamCosEnv(gym.Env):
         self.shared_team_policy = False
         self.shared_policy_model = None
         self.shared_policy_seq_len = 8
-        self.shared_policy_hdim = 128
+        self.shared_policy_hidden_dim = 128
         self.shared_team_prefix = "h" if self.learnable_agent_key.startswith("h") else "s"
         self._policy_histories = {}
         self.override_learnable_policy = False
@@ -244,10 +292,10 @@ class TeamCosEnv(gym.Env):
 
         self.shared_team_policy = True
         self.shared_policy_seq_len = int(seq_len)
-        self.shared_policy_hdim = int(hidden_dim)
+        self.shared_policy_hidden_dim = int(hidden_dim)
         obs_dim = int(self.observation_space.shape[0])
         act_dim = int(self.action_space.shape[0])
-        policy_model = AgentV2(obs_dim, act_dim, self.shared_policy_hdim, self.shared_policy_seq_len)
+        policy_model = AgentV2(obs_dim, act_dim, self.shared_policy_hidden_dim, self.shared_policy_seq_len)
         policy_model.load_state_dict(state_dict)
         policy_model.eval()
         self.shared_policy_model = policy_model
@@ -464,61 +512,6 @@ class TeamCosEnv(gym.Env):
             self.obj_geom_ids[f"ramp{i}"] = [m.geom(f"ramp{i}_geom").id]
         self.obj_default_rgba = {k: m.geom_rgba[v[0]].copy() for k, v in self.obj_geom_ids.items()}
 
-        # --- 安全: 各オブジェクトに対応する qpos/qvel アドレスをキャッシュ ---
-        # ボディ入れ子や XML 構造の違いで body_jntadr が期待通りのジョイントを指さない
-        # 場合があるため、ここで各オブジェクトに対して確実なアドレスを決定して保存する。
-        self.obj_qpos_adr = {}
-        self.obj_qvel_adr = {}
-        # try: use joint->body mapping if available; otherwise fall back to body_jntadr
-        for tk, bid in self.obj_body_map.items():
-            chosen_jid = None
-            try:
-                # model.jnt_bodyid exists in some mujoco bindings; search for a joint whose body matches
-                for jid in range(m.njnt):
-                    try:
-                        if int(m.jnt_bodyid[jid]) == int(bid):
-                            chosen_jid = jid
-                            break
-                    except Exception:
-                        # ignore and continue
-                        pass
-            except Exception:
-                chosen_jid = None
-
-            if chosen_jid is None:
-                # fallback: use the body's joint-address if it looks valid
-                try:
-                    jadr = m.body_jntadr[bid]
-                    if jadr >= 0 and jadr < m.njnt:
-                        chosen_jid = int(jadr)
-                except Exception:
-                    chosen_jid = None
-
-            if chosen_jid is None:
-                # final fallback: scan for any joint with a valid qposadr/qveladr
-                for jid in range(m.njnt):
-                    try:
-                        qposadr = int(m.jnt_qposadr[jid])
-                        if qposadr >= 0:
-                            chosen_jid = jid
-                            break
-                    except Exception:
-                        pass
-
-            if chosen_jid is None:
-                # as a last resort, set invalid addresses to -1 so callers can handle
-                self.obj_qpos_adr[tk] = -1
-                self.obj_qvel_adr[tk] = -1
-            else:
-                try:
-                    self.obj_qpos_adr[tk] = int(m.jnt_qposadr[chosen_jid])
-                except Exception:
-                    self.obj_qpos_adr[tk] = -1
-                try:
-                    self.obj_qvel_adr[tk] = int(m.jnt_dofadr[chosen_jid])
-                except Exception:
-                    self.obj_qvel_adr[tk] = -1
-
     def _init_agent_intelligence(self):
         self.npcs = {ak: (RuleBasedSeeker() if ak.startswith("s") else RuleBasedHider()) for ak in self.agent_keys}
 
@@ -537,31 +530,52 @@ class TeamCosEnv(gym.Env):
         self.btn_cooldown = dict.fromkeys(self.agent_keys, 0)
 
     def _cache_planar_object_pose(self):
-        for tk in self.obj_body_map:
-            # use body-space world quaternion which is robust to joint layout
-            bid = self.obj_body_map[tk]
-            if tk.startswith("ramp"):
-                self.object_state[tk]["planar_z"] = 0.0
+        # 実行中にデータ形状が変わることはないので、外部で一度 shape を取っておく
+        qpos_len = self.data.qpos.shape[0]
+        xquat_len = self.data.xquat.shape[0]
+
+        for tk, bid in self.obj_body_map.items():
+            qadr, _ = self._obj_addr(tk)
+
+            # z軸の基準設定
+            self.object_state[tk]["planar_z"] = 0.0 if tk.startswith("ramp") else 0.5
+
+            # オブジェクトがロック状態なら、planar lock は常に水平向きの恒等クォータニオンを使う
+            if self.object_state[tk].get("mode") == "locked":
+                pq = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                self.object_state[tk]["planar_quat"] = pq
+                if self.debug_mode:
+                    self.debug_logger.print(f"[DEBUG][_cache_planar_object_pose] tk={tk} mode=locked -> forcing identity planar_quat")
+                continue
+
+            # Freejointオブジェクト (box/b/ramp) の判定
+            # シンプルに 's' (seeker) や 'h' (hider) で始まらないものを対象とするのも手です
+            if tk[0] in ("b", "r"):  # 'b'(box/b1), 'r'(ramp) に合致
+                pq = None
+
+                # 1. xquat 優先 (もっとも直接的で安全)
+                if bid < xquat_len:
+                    xq = self.data.xquat[bid]
+                    # 基本的に MuJoCo の xquat は常に size 4 です
+                    pq = xq.copy()
+
+                # 2. qpos スライス (fallback)
+                if pq is None and qadr >= 0 and (qadr + 7) <= qpos_len:
+                    pq = self.data.qpos[qadr + 3 : qadr + 7].copy()
+
+                self.object_state[tk]["planar_quat"] = pq
+
+                # デバッグログは失敗時のみ、かつ簡潔に
+                if self.debug_mode and pq is None:
+                    self.debug_logger.print(f"[DEBUG] Pose cache failed for {tk}: bid={bid}, qadr={qadr}")
             else:
-                self.object_state[tk]["planar_z"] = 0.5
-            # data.xquat[body_id] is the world quaternion for the body's frame
-            try:
-                self.object_state[tk]["planar_quat"] = self.data.xquat[bid].copy()
-            except Exception:
-                # fallback: leave None (calling code will handle guarded writes)
+                # Agent
                 self.object_state[tk]["planar_quat"] = None
 
     def _obj_addr(self, obj_key):
-        # return cached addresses if available
-        if hasattr(self, "obj_qpos_adr") and obj_key in self.obj_qpos_adr:
-            return self.obj_qpos_adr.get(obj_key, -1), self.obj_qvel_adr.get(obj_key, -1)
-
-        # legacy fallback: attempt to derive from model body_jntadr
         bid = self.obj_body_map[obj_key]
         jadr = self.model.body_jntadr[bid]
-        qposadr = self.model.jnt_qposadr[jadr] if jadr is not None and jadr >= 0 else -1
-        dofadr = self.model.jnt_dofadr[jadr] if jadr is not None and jadr >= 0 else -1
-        return qposadr, dofadr
+        return self.model.jnt_qposadr[jadr], self.model.jnt_dofadr[jadr]
 
     def _body_speed_xy(self, bid):
         vadr = self.model.jnt_dofadr[self.model.body_jntadr[bid]]
@@ -645,7 +659,7 @@ class TeamCosEnv(gym.Env):
 
     def _interaction_blocked_by_static_walls(self, p1, p2):
         return bool(
-            _blocked_by_walls_numba(
+            _blocked_by_static_walls_numba(
                 float(p1[0]),
                 float(p1[1]),
                 float(p2[0]),
@@ -798,25 +812,27 @@ class TeamCosEnv(gym.Env):
                     self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = 0.0
             # Planar lock
             if self.OBJECT_PLANAR_LOCK and st.get("planar_z") is not None:
-                # guard qpos write by address validity and available slice
-                if qadr is not None and qadr >= 0 and (qadr + QUAT_STOP) <= self.data.qpos.shape[0] and st.get("planar_quat") is not None:
-                    self.data.qpos[qadr + Z_IDX] = st["planar_z"]
-                    self.data.qpos[qadr + QUAT_START : qadr + QUAT_STOP] = st["planar_quat"]
-                    self.data.qvel[vadr + Z_VEL_IDX] = 0.0
-                    self.data.qvel[vadr + ANG_VEL_START : vadr + ANG_VEL_STOP] = 0.0
-                else:
-                    # cannot safely write qpos slice; skip and zero velocities where possible
-                    try:
-                        if vadr is not None and vadr >= 0:
-                            self.data.qvel[vadr + Z_VEL_IDX] = 0.0
-                            self.data.qvel[vadr + ANG_VEL_START : vadr + ANG_VEL_STOP] = 0.0
-                    except Exception:
-                        pass
+                self.data.qpos[qadr + Z_IDX] = st["planar_z"]
+                pq = st.get("planar_quat")
+                try:
+                    if pq is not None and np.all(np.isfinite(pq)) and len(pq) >= (QUAT_STOP - QUAT_START):
+                        self.data.qpos[qadr + QUAT_START : qadr + QUAT_STOP] = pq
+                    else:
+                        if self.debug_mode:
+                            self.debug_logger.print(f"[DEBUG][_apply_object_constraints] skipping invalid planar_quat for {tk}: {pq}")
+                except Exception:
+                    if self.debug_mode:
+                        self.debug_logger.print(f"[DEBUG][_apply_object_constraints] exception validating planar_quat for {tk}")
+                self.data.qvel[vadr + Z_VEL_IDX] = 0.0
+                self.data.qvel[vadr + ANG_VEL_START : vadr + ANG_VEL_STOP] = 0.0
         for tk, geom_ids in self.obj_geom_ids.items():
             mode = self.object_state[tk]["mode"]
-            rgba = np.array([0.2, 0.2, 0.2, 1.0]) if mode == "locked" else (
-                np.array([1.0, 0.85, 0.1, 1.0]) if mode == "grabbed" else self.obj_default_rgba[tk]
-            )
+            if mode == "locked":
+                rgba = np.array([0.2, 0.2, 0.2, 1.0])
+            elif mode == "grabbed":
+                rgba = np.array([1.0, 0.85, 0.1, 1.0])
+            else:
+                rgba = self.obj_default_rgba[tk]
             for gid in geom_ids:
                 self.model.geom_rgba[gid] = rgba
 
@@ -906,8 +922,20 @@ class TeamCosEnv(gym.Env):
         self._policy_histories.clear()
         self.debug_logger._log_last_step.clear()
         if self.debug_mode:
-            self.debug_logger.clear_policy_src_log()
+            self.debug_logger.clear_policy_source_log()
         mujoco.mj_resetData(self.model, self.data)
+        if self.debug_mode:
+            # quick sanity checks after reset
+            try:
+                qpos = self.data.qpos
+                qvel = self.data.qvel
+                self.debug_logger.print(f"[DEBUG][reset] qpos.shape={qpos.shape} qvel.shape={qvel.shape}")
+                if np.any(~np.isfinite(qpos)):
+                    self.debug_logger.print(f"[DEBUG][reset] qpos contains non-finite values at indices: {np.where(~np.isfinite(qpos))[0][:10]}")
+                if np.any(~np.isfinite(qvel)):
+                    self.debug_logger.print(f"[DEBUG][reset] qvel contains non-finite values at indices: {np.where(~np.isfinite(qvel))[0][:10]}")
+            except Exception:
+                pass
         self._init_agent_intelligence()
         self._init_interaction_state()
         placed = []
@@ -917,9 +945,23 @@ class TeamCosEnv(gym.Env):
             for _ in range(500):
                 p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
                 if self._is_spawn_position_valid(p, rad, placed, margin=0.2):
-                    adr = self.model.jnt_qposadr[self.model.body_jntadr[bid]]
-                    self.data.qpos[adr : adr + 7] = [p[0], p[1], z, 1, 0, 0, 0]
-                    placed.append((p, rad))
+                    try:
+                        jadr = self.model.body_jntadr[bid]
+                        if jadr is None or int(jadr) < 0:
+                            if self.debug_mode:
+                                self.debug_logger.print(f"[DEBUG][reset] invalid body_jntadr for body {bid}: {jadr}")
+                            continue
+                        adr = int(self.model.jnt_qposadr[jadr])
+                        if adr is None or adr < 0 or (adr + 7) > self.data.qpos.shape[0]:
+                            if self.debug_mode:
+                                self.debug_logger.print(f"[DEBUG][reset] invalid qpos adr for body {bid}: {adr}")
+                            continue
+                        self.data.qpos[adr : adr + 7] = [p[0], p[1], z, 1, 0, 0, 0]
+                        placed.append((p, rad))
+                    except Exception:
+                        if self.debug_mode:
+                            self.debug_logger.print(f"[DEBUG][reset] exception placing body {bid}")
+                        continue
                     # ランプのみx, y出力とqpos値も出力
                     # if (bid, rad, z) in ramp_specs:
                     #    print(f"[reset] ramp placed: x={p[0]:.3f}, y={p[1]:.3f}, qpos={self.data.qpos[adr]:.3f},{self.data.qpos[adr+1]:.3f}")
@@ -941,6 +983,123 @@ class TeamCosEnv(gym.Env):
                     placed.append((p, self.R_AGENT))
                     break
         mujoco.mj_forward(self.model, self.data)
+        if self.debug_mode:
+            # report any objects or agents still at origin (likely placement failure)
+            try:
+                origins = []
+                for name, bid in self.obj_body_map.items():
+                    pos = self.data.xpos[bid]
+                    if np.allclose(pos, 0.0, atol=1e-6):
+                        origins.append(name)
+                for ak in self.agent_keys:
+                    bid = self.body_ids.get(ak, None)
+                    if bid is not None:
+                        pos = self.data.xpos[bid]
+                        if np.allclose(pos, 0.0, atol=1e-6):
+                            origins.append(ak)
+                if origins:
+                    self.debug_logger.print(f"[DEBUG][reset] objects/agents at origin after reset: {origins}")
+                # also quick qpos/qvel NaN check
+                if np.any(~np.isfinite(self.data.qpos)) or np.any(~np.isfinite(self.data.qvel)):
+                    self.debug_logger.print("[DEBUG][reset] Non-finite detected in qpos/qvel after forward")
+            except Exception:
+                pass
+        # --- update prev_vis / prev_being_hit to reflect post-step state ---
+        try:
+            # refresh caches based on current (post-physics) positions/rotations
+            self._prev_vis.clear()
+            self._prev_being_hit.clear()
+            for viewer in self.agent_keys:
+                try:
+                    v_bid = self.body_ids[viewer]
+                    v_pos = self.data.xpos[v_bid][:2]
+                    v_idx_r = self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]
+                    v_rot = float(self.data.qpos[v_idx_r])
+                except Exception:
+                    continue
+                for target in self.agent_keys:
+                    if target == viewer:
+                        continue
+                    try:
+                        t_bid = self.body_ids[target]
+                        t_pos = self.data.xpos[t_bid][:2]
+                    except Exception:
+                        self._prev_vis[(viewer, target)] = False
+                        continue
+                    vis = False
+                    try:
+                        vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
+                    except Exception:
+                        vis = False
+                    self._prev_vis[(viewer, target)] = vis
+                    if viewer.startswith("h") and target.startswith("s"):
+                        # check whether seeker (target) sees the hider (viewer)
+                        is_hit = False
+                        try:
+                            s_idx_r = self.model.jnt_qposadr[self.qpos_indices[target]["rot"]]
+                            s_rot = float(self.data.qpos[s_idx_r])
+                            try:
+                                is_hit = bool(self._is_vis(t_pos, s_rot, v_pos, t_bid, v_bid))
+                            except Exception:
+                                is_hit = False
+                        except Exception:
+                            is_hit = False
+                        self._prev_being_hit[(viewer, target)] = 1.0 if is_hit else 0.0
+        except Exception:
+            # be conservative: leave existing caches intact on failure
+            pass
+        # initialize previous-step visibility / being-hit caches so _get_obs
+        # can use a well-defined 'previous' value immediately after reset
+        self._prev_vis.clear()
+        self._prev_being_hit.clear()
+        for viewer in self.agent_keys:
+            try:
+                v_bid = self.body_ids[viewer]
+                v_pos = self.data.xpos[v_bid][:2]
+                v_idx_r = self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]
+                v_rot = float(self.data.qpos[v_idx_r])
+            except Exception:
+                # skip this viewer if we cannot access its state
+                continue
+
+            for target in self.agent_keys:
+                if target == viewer:
+                    continue
+                try:
+                    t_bid = self.body_ids[target]
+                    t_pos = self.data.xpos[t_bid][:2]
+                except Exception:
+                    # cannot access target state; mark not visible
+                    self._prev_vis[(viewer, target)] = False
+                    continue
+
+                # 視界判定 (局所的に例外を捕捉)
+                vis = False
+                try:
+                    vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
+                except Exception:
+                    vis = False
+                self._prev_vis[(viewer, target)] = vis
+
+                # 被弾フラグ: viewer が Hider で target が Seeker の場合、
+                # seeker の視界で自分(viewer)が見られているかを判定して保存する
+                if viewer.startswith("h") and target.startswith("s"):
+                    try:
+                        s_idx_r = self.model.jnt_qposadr[self.qpos_indices[target]["rot"]]
+                        s_rot = float(self.data.qpos[s_idx_r])
+                        is_hit = False
+                        try:
+                            is_hit = bool(self._is_vis(t_pos, s_rot, v_pos, t_bid, v_bid))
+                        except Exception:
+                            is_hit = False
+                    except Exception:
+                        is_hit = False
+                    # store as (hider, seeker)
+                    self._prev_being_hit[(viewer, target)] = 1.0 if is_hit else 0.0
+                    # set persistence counter when hit detected
+                    if is_hit:
+                        self._being_hit_counters[(viewer, target)] = int(self.being_hit_persist)
+
         self._cache_planar_object_pose()
 
         for i, ak in enumerate(self.agent_keys):
@@ -956,13 +1115,16 @@ class TeamCosEnv(gym.Env):
             if self.shared_team_policy and self.shared_policy_model is not None and ak.startswith(self.shared_team_prefix):
                 self._prime_policy_history(ak, self.shared_policy_seq_len, norm_obs)
 
-        idx_to_obs = self.learnable_agent_idx
+        idx_to_obs = self.learnable_agent_index
 
         # wall_distance を計算
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
         learnable_agent_pos = self.data.xpos[learnable_agent_body_id]
         wall_dist = self.vis_engine.wall_distance(learnable_agent_pos[0], learnable_agent_pos[1])
-        return self._normalize_obs(self._get_obs(idx_to_obs)), {
+        obs = self._normalize_obs(self._get_obs(idx_to_obs))
+        # cache current observation
+        self._cached_obs = obs
+        return obs, {
             "is_detected": False,
             "wall_distance": wall_dist,
         }
@@ -1046,11 +1208,75 @@ class TeamCosEnv(gym.Env):
             self.last_debug_ctrl[ak] = (f_env, t)
 
         self.data.ctrl[:] = cv
+        # --- capture pre-physics visibility / being-hit state (used as 'previous' freshness) ---
+        try:
+            self._prev_vis.clear()
+            self._prev_being_hit.clear()
+            for viewer in self.agent_keys:
+                v_bid = self.body_ids[viewer]
+                v_pos = self.data.xpos[v_bid][:2]
+                v_rot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]])
+                for target in self.agent_keys:
+                    if target == viewer:
+                        continue
+                    t_bid = self.body_ids[target]
+                    t_pos = self.data.xpos[t_bid][:2]
+                    try:
+                        vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
+                    except Exception:
+                        vis = False
+                    self._prev_vis[(viewer, target)] = vis
+                    # being_hit: store as (hider, seeker) -> flag
+                    if viewer.startswith("s") and target.startswith("h"):
+                        self._prev_being_hit[(target, viewer)] = 1.0 if vis else 0.0
+        except Exception:
+            pass
         for _ in range(self.action_repeat):
             mujoco.mj_step(self.model, self.data)
             self._apply_object_constraints()
             self._stabilize_agent_vertical_motion()
         mujoco.mj_forward(self.model, self.data)
+        if self.debug_mode:
+            try:
+                bad_qpos = np.where(~np.isfinite(self.data.qpos))[0]
+                bad_qvel = np.where(~np.isfinite(self.data.qvel))[0]
+                if bad_qpos.size or bad_qvel.size:
+                    self.debug_logger.print(f"[DEBUG][step] Non-finite qpos indices: {bad_qpos}")
+                    self.debug_logger.print(f"[DEBUG][step] Non-finite qvel indices: {bad_qvel}")
+                    # map qpos indices back to joints/bodies where possible
+                    qpos_to_j = {}
+                    for jid in range(self.model.njnt):
+                        try:
+                            qadr = int(self.model.jnt_qposadr[jid])
+                        except Exception:
+                            continue
+                        qpos_to_j[qadr] = jid
+                    # print joint qposadr table to help map indices to joints
+                    try:
+                        self.debug_logger.print(f"[DEBUG][step] model.nq={int(self.model.nq)} model.njnt={int(self.model.njnt)}")
+                        rows = []
+                        for jid in range(min(200, int(self.model.njnt))):
+                            try:
+                                qadr = int(self.model.jnt_qposadr[jid])
+                            except Exception:
+                                qadr = -1
+                            try:
+                                dadr = int(self.model.jnt_dofadr[jid])
+                            except Exception:
+                                dadr = -1
+                            rows.append((jid, qadr, dadr))
+                        self.debug_logger.print("[DEBUG][step] sample joint qposadr/dofadr:")
+                        for r in rows[:50]:
+                            self.debug_logger.print(f"  jid={r[0]:3d} qposadr={r[1]:3d} dofadr={r[2]:3d}")
+                    except Exception:
+                        pass
+                    # show qpos around bad indices
+                    for idx in bad_qpos.tolist():
+                        lo = max(0, idx - 3)
+                        hi = min(self.data.qpos.shape[0], idx + 4)
+                        self.debug_logger.print(f"[DEBUG][step] qpos[{lo}:{hi}] = {self.data.qpos[lo:hi]}")
+            except Exception:
+                pass
 
         box_speeds = [self._body_speed_xy(bid) for bid in self.box_ids]
         ramp_speeds = [self._body_speed_xy(rid) for rid in self.ramp_ids]
@@ -1074,7 +1300,7 @@ class TeamCosEnv(gym.Env):
                 self._update_policy_history(ak, self.shared_policy_seq_len, norm_obs_next)
 
         # 学習対象に合わせて観測を生成
-        idx_to_obs = self.learnable_agent_idx
+        idx_to_obs = self.learnable_agent_index
 
         # 壁までの最短距離を計算
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
@@ -1135,6 +1361,22 @@ class TeamCosEnv(gym.Env):
             "applied_forward": applied_forward_env,
         }
         self._debug_collect_stats(reward, info)
+
+        # cache the observation returned for the learnable agent
+        try:
+            self._cached_obs = obs
+        except Exception:
+            pass
+
+        # decrement being_hit counters
+        try:
+            if self._being_hit_counters:
+                for k in list(self._being_hit_counters.keys()):
+                    self._being_hit_counters[k] = max(0, int(self._being_hit_counters[k]) - 1)
+                    if self._being_hit_counters[k] == 0:
+                        del self._being_hit_counters[k]
+        except Exception:
+            pass
 
         return obs, reward, False, done, info
 
@@ -1297,14 +1539,27 @@ class TeamCosEnv(gym.Env):
             e_pos = d.xpos[eid][:2]
 
             # 1. 視界判定 (自分が相手を見ているか)
-            visible = self._is_vis(ps[:2], rv, e_pos, self.body_ids[ak], eid)
+            prev_vis = self._prev_vis.get((ak, enm), None)
+            if prev_vis is not None:
+                visible = bool(prev_vis)
+            else:
+                visible = self._is_vis(ps[:2], rv, e_pos, self.body_ids[ak], eid)
 
             # 2. 被弾判定 (自分がHider、相手がSeeker、かつ相手が自分を見ているか)
             being_hit_flag = 0.0
             if ak.startswith("h") and enm.startswith("s"):
-                s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]["rot"]]])
-                if self._is_vis(e_pos, s_rot, ps[:2], eid, self.body_ids[ak]):
+                # Use persistence counter if present (preferred)
+                cnt = int(self._being_hit_counters.get((ak, enm), 0))
+                if cnt > 0:
                     being_hit_flag = 1.0
+                else:
+                    prev_bh = self._prev_being_hit.get((ak, enm), None)
+                    if prev_bh is not None and float(prev_bh) > 0.0:
+                        being_hit_flag = 1.0
+                    else:
+                        s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]["rot"]]])
+                        if self._is_vis(e_pos, s_rot, ps[:2], eid, self.body_ids[ak]):
+                            being_hit_flag = 1.0
 
             if visible:
                 # 【視覚情報】

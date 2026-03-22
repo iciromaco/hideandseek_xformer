@@ -24,7 +24,7 @@ class DebugLogger:
         self.enabled = enabled
         self.log_interval_steps = log_interval_steps
         self._log_last_step = {}
-        self._policy_src_logged = set()
+        self._policy_source_logged = set()
 
     def print(self, message):
         if self.enabled:
@@ -36,9 +36,9 @@ class DebugLogger:
     def log_policy_source(self, agent_key, source, current_step, force=False):
         return
 
-    def clear_policy_src_log(self):
-        if hasattr(self, "_policy_src_logged"):
-            self._policy_src_logged.clear()
+    def clear_policy_source_log(self):
+        if hasattr(self, "_policy_source_logged"):
+            self._policy_source_logged.clear()
         return
 
 
@@ -121,7 +121,7 @@ class TeamCosEnv(gym.Env):
         render_mode=None,
         inference_policies=None,
         show_turn_lines=True,
-        dbg_log_interval_steps=200,
+        debug_log_interval_steps=200,
         mode4_sdf_cell_size=0.05,
         debug_mode=False,
         action_repeat=16,
@@ -140,7 +140,7 @@ class TeamCosEnv(gym.Env):
         self.mode4_sdf_cell_size = float(mode4_sdf_cell_size)
         self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
         self.debug_mode = debug_mode
-        self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=dbg_log_interval_steps)
+        self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=debug_log_interval_steps)
         self.action_repeat = action_repeat
         self._init_debug_stats()
         # Debug-only: validate cached addresses and report suspicious values
@@ -178,7 +178,7 @@ class TeamCosEnv(gym.Env):
         self.hider_keys = [f"h{i}" for i in range(1, self.n_hiders + 1)]
         self.agent_keys = self.seeker_keys + self.hider_keys
         self.learnable_agent_key = self.seeker_keys[0] if target == "seeker" else self.hider_keys[0]
-        self.learnable_agent_idx = self.agent_keys.index(self.learnable_agent_key)
+        self.learnable_agent_index = self.agent_keys.index(self.learnable_agent_key)
         self.idx = ObsIdx(n_boxes, n_ramps, n_others=len(self.agent_keys) - 1)
 
         self.model = mujoco.MjModel.from_xml_string(self._build_dynamic_xml())
@@ -195,7 +195,7 @@ class TeamCosEnv(gym.Env):
         self.shared_team_policy = False
         self.shared_policy_model = None
         self.shared_policy_seq_len = 8
-        self.shared_policy_hdim = 128
+        self.shared_policy_hidden_dim = 128
         self.shared_team_prefix = "h" if self.learnable_agent_key.startswith("h") else "s"
         self._policy_histories = {}
         self.override_learnable_policy = False
@@ -244,10 +244,10 @@ class TeamCosEnv(gym.Env):
 
         self.shared_team_policy = True
         self.shared_policy_seq_len = int(seq_len)
-        self.shared_policy_hdim = int(hidden_dim)
+        self.shared_policy_hidden_dim = int(hidden_dim)
         obs_dim = int(self.observation_space.shape[0])
         act_dim = int(self.action_space.shape[0])
-        policy_model = AgentV2(obs_dim, act_dim, self.shared_policy_hdim, self.shared_policy_seq_len)
+        policy_model = AgentV2(obs_dim, act_dim, self.shared_policy_hidden_dim, self.shared_policy_seq_len)
         policy_model.load_state_dict(state_dict)
         policy_model.eval()
         self.shared_policy_model = policy_model
@@ -645,7 +645,7 @@ class TeamCosEnv(gym.Env):
 
     def _interaction_blocked_by_static_walls(self, p1, p2):
         return bool(
-            _blocked_by_walls_numba(
+            _blocked_by_static_walls_numba(
                 float(p1[0]),
                 float(p1[1]),
                 float(p2[0]),
@@ -906,7 +906,7 @@ class TeamCosEnv(gym.Env):
         self._policy_histories.clear()
         self.debug_logger._log_last_step.clear()
         if self.debug_mode:
-            self.debug_logger.clear_policy_src_log()
+            self.debug_logger.clear_policy_source_log()
         mujoco.mj_resetData(self.model, self.data)
         self._init_agent_intelligence()
         self._init_interaction_state()
@@ -956,7 +956,7 @@ class TeamCosEnv(gym.Env):
             if self.shared_team_policy and self.shared_policy_model is not None and ak.startswith(self.shared_team_prefix):
                 self._prime_policy_history(ak, self.shared_policy_seq_len, norm_obs)
 
-        idx_to_obs = self.learnable_agent_idx
+        idx_to_obs = self.learnable_agent_index
 
         # wall_distance を計算
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
@@ -1074,7 +1074,7 @@ class TeamCosEnv(gym.Env):
                 self._update_policy_history(ak, self.shared_policy_seq_len, norm_obs_next)
 
         # 学習対象に合わせて観測を生成
-        idx_to_obs = self.learnable_agent_idx
+        idx_to_obs = self.learnable_agent_index
 
         # 壁までの最短距離を計算
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]

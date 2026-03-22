@@ -23,7 +23,7 @@ class DebugLogger:
         self.enabled = enabled
         self.log_interval_steps = log_interval_steps
         self._log_last_step = {}
-        self._policy_source_logged = set()
+        self._policy_src_logged = set()
 
     def print(self, message):
         if self.enabled:
@@ -37,8 +37,8 @@ class DebugLogger:
         # policy_sourceログも抑制
         return
 
-    def clear_policy_source_log(self):
-        self._policy_source_logged.clear()
+    def clear_policy_src_log(self):
+        self._policy_src_logged.clear()
 
 
 def _euler_z_to_quat(yaw):
@@ -48,7 +48,7 @@ def _euler_z_to_quat(yaw):
 
 
 @njit(cache=True)
-def _blocked_by_static_walls_numba(p1x, p1y, p2x, p2y, walls, margin):
+def _blocked_by_walls_numba(p1x, p1y, p2x, p2y, walls, margin):
     dx = p2x - p1x
     dy = p2y - p1y
     for i in range(walls.shape[0]):
@@ -104,7 +104,7 @@ class TeamCosEnv(gym.Env):
     def _init_debug_stats(self):
         self._debug_reward_buffer = []
         self._debug_hide_buffer = []
-        self._debug_wall_distance_buffer = []
+        self._wall_dist_buf = []
         self._debug_step_counter = 0
         self._debug_log_interval = getattr(self, "debug_logger", None) and getattr(self.debug_logger, "log_interval_steps", 100) or 100
 
@@ -117,9 +117,9 @@ class TeamCosEnv(gym.Env):
         wd = info.get("wall_distance", None)
         if wd is not None:
             if isinstance(wd, (list, tuple, np.ndarray)):
-                self._debug_wall_distance_buffer.extend([float(v) for v in wd])
+                self._wall_dist_buf.extend([float(v) for v in wd])
             else:
-                self._debug_wall_distance_buffer.append(float(wd))
+                self._wall_dist_buf.append(float(wd))
         self._debug_step_counter += 1
         # log_intervalごとに統計出力
         if self._debug_step_counter % self._debug_log_interval == 0:
@@ -130,11 +130,11 @@ class TeamCosEnv(gym.Env):
             return
         avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
         hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
-        wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
+        wd_arr = np.array(self._wall_dist_buf, dtype=np.float32) if self._wall_dist_buf else np.array([0.0])
         self.debug_logger.print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} WallDist(mean/min/max)={wd_arr.mean():.3f}/{wd_arr.min():.3f}/{wd_arr.max():.3f}")
         self._debug_reward_buffer.clear()
         self._debug_hide_buffer.clear()
-        self._debug_wall_distance_buffer.clear()
+        self._wall_dist_buf.clear()
 
     """
     Hide and Seek 高度物理環境 (単一エージェント学習最適化版)
@@ -188,8 +188,8 @@ class TeamCosEnv(gym.Env):
         inference_policies=None,
         show_turn_lines=True,
         policy_source_log=False,
-        policy_source_log_each_reset=False,
-        debug_log_interval_steps=200,
+        policy_src_log_each_reset=False,
+        dbg_log_interval_steps=200,
         mode4_sdf_cell_size=0.05,
         debug_mode=False,
         action_repeat=16,
@@ -208,7 +208,7 @@ class TeamCosEnv(gym.Env):
         self.mode4_sdf_cell_size = float(mode4_sdf_cell_size)
         self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
         self.debug_mode = debug_mode
-        self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=debug_log_interval_steps)
+        self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=dbg_log_interval_steps)
         self.action_repeat = action_repeat
         # temporal caches for visibility / being-hit freshness
         self._prev_vis = {}
@@ -226,7 +226,7 @@ class TeamCosEnv(gym.Env):
         self.hider_keys = [f"h{i}" for i in range(1, self.n_hiders + 1)]
         self.agent_keys = self.seeker_keys + self.hider_keys
         self.learnable_agent_key = self.seeker_keys[0] if target == "seeker" else self.hider_keys[0]
-        self.learnable_agent_index = self.agent_keys.index(self.learnable_agent_key)
+        self.learnable_agent_idx = self.agent_keys.index(self.learnable_agent_key)
         self.idx = ObsIdx(n_boxes, n_ramps, n_others=len(self.agent_keys) - 1)
 
         self.model = mujoco.MjModel.from_xml_string(self._build_dynamic_xml())
@@ -243,7 +243,7 @@ class TeamCosEnv(gym.Env):
         self.shared_team_policy = False
         self.shared_policy_model = None
         self.shared_policy_seq_len = 8
-        self.shared_policy_hidden_dim = 128
+        self.shared_policy_hdim = 128
         self.shared_team_prefix = "h" if self.learnable_agent_key.startswith("h") else "s"
         self._policy_histories = {}
         self.override_learnable_policy = False
@@ -292,10 +292,10 @@ class TeamCosEnv(gym.Env):
 
         self.shared_team_policy = True
         self.shared_policy_seq_len = int(seq_len)
-        self.shared_policy_hidden_dim = int(hidden_dim)
+        self.shared_policy_hdim = int(hidden_dim)
         obs_dim = int(self.observation_space.shape[0])
         act_dim = int(self.action_space.shape[0])
-        policy_model = AgentV2(obs_dim, act_dim, self.shared_policy_hidden_dim, self.shared_policy_seq_len)
+        policy_model = AgentV2(obs_dim, act_dim, self.shared_policy_hdim, self.shared_policy_seq_len)
         policy_model.load_state_dict(state_dict)
         policy_model.eval()
         self.shared_policy_model = policy_model
@@ -659,7 +659,7 @@ class TeamCosEnv(gym.Env):
 
     def _interaction_blocked_by_static_walls(self, p1, p2):
         return bool(
-            _blocked_by_static_walls_numba(
+            _blocked_by_walls_numba(
                 float(p1[0]),
                 float(p1[1]),
                 float(p2[0]),
@@ -922,7 +922,7 @@ class TeamCosEnv(gym.Env):
         self._policy_histories.clear()
         self.debug_logger._log_last_step.clear()
         if self.debug_mode:
-            self.debug_logger.clear_policy_source_log()
+            self.debug_logger.clear_policy_src_log()
         mujoco.mj_resetData(self.model, self.data)
         if self.debug_mode:
             # quick sanity checks after reset
@@ -1115,7 +1115,7 @@ class TeamCosEnv(gym.Env):
             if self.shared_team_policy and self.shared_policy_model is not None and ak.startswith(self.shared_team_prefix):
                 self._prime_policy_history(ak, self.shared_policy_seq_len, norm_obs)
 
-        idx_to_obs = self.learnable_agent_index
+        idx_to_obs = self.learnable_agent_idx
 
         # wall_distance を計算
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
@@ -1300,7 +1300,7 @@ class TeamCosEnv(gym.Env):
                 self._update_policy_history(ak, self.shared_policy_seq_len, norm_obs_next)
 
         # 学習対象に合わせて観測を生成
-        idx_to_obs = self.learnable_agent_index
+        idx_to_obs = self.learnable_agent_idx
 
         # 壁までの最短距離を計算
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]

@@ -282,7 +282,7 @@ ENV_CONFIG = {
     "n_ramps": _cfg("n_ramps", "1", int, RUNTIME_OVERRIDES),
     "mode4_sdf_cell_size": _cfg("mode4_sdf_cell_size", "0.05", float, RUNTIME_OVERRIDES),
     "show_turn_lines": SHOW_TURN_LINES,
-    "debug_log_interval_steps": _cfg("debug_log_interval_steps", "200", int, RUNTIME_OVERRIDES),
+    "dbg_log_interval_steps": _cfg("dbg_log_interval_steps", "200", int, RUNTIME_OVERRIDES),
     "action_repeat": _cfg("action_repeat", "10", int, RUNTIME_OVERRIDES),
 }
 
@@ -1718,7 +1718,7 @@ def run_debug_or_playback(env, agent, device, model_loaded):
         wall_stick = 0.0
         wall_dist = []
         # per-step debug logging (first N steps)
-        debug_log_n = int(hp.get("debug_log_interval_steps", 200))
+        debug_log_n = int(hp.get("dbg_log_interval_steps", 200))
         step_logs = []
 
         viewer_started = False
