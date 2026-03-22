@@ -145,7 +145,10 @@ class TeamCosEnv(gym.Env):
         avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
         hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
         wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
-        self.debug_logger.print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} WallDist(mean/min/max)={wd_arr.mean():.3f}/{wd_arr.min():.3f}/{wd_arr.max():.3f}")
+        wd_mean = float(wd_arr.mean())
+        wd_min = float(wd_arr.min())
+        wd_max = float(wd_arr.max())
+        self.debug_logger.print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} " f"WD(mean/min/max)={wd_mean:.3f}/{wd_min:.3f}/{wd_max:.3f}")
         self._debug_reward_buffer.clear()
         self._debug_hide_buffer.clear()
         self._debug_wall_distance_buffer.clear()
@@ -410,19 +413,21 @@ class TeamCosEnv(gym.Env):
         )
         acts = "".join(self._xml_actuators(ak) for ak in self.agent_keys)
 
+        ramp_mesh_vertex = "-0.6666 -0.5 0.0 0.6666 -0.5 0.0 0.6666 -0.5 1.0 " "-0.6666 0.5 0.0 0.6666 0.5 0.0 0.6666 0.5 1.0"
+
         return f"""
 <mujoco>
   <option gravity="0 0 -9.81" timestep="0.005"/>
     <asset>
     <texture name="grid" type="2d" builtin="checker" rgb1=".1 .2 .3" rgb2=".2 .3 .4" width="300" height="300"/>
-    <material name="grid" texture="grid" texrepeat="1 1" reflectance="0.2"/>
-    <mesh name="ramp_mesh"
-          vertex="-0.6666 -0.5 0.0 0.6666 -0.5 0.0 0.6666 -0.5 1.0 -0.6666 0.5 0.0 0.6666 0.5 0.0 0.6666 0.5 1.0"
-          face="0 1 2 3 5 4 0 3 4 0 4 1 1 4 5 1 5 2 2 5 3 2 3 0"/>
-  </asset>
-  <worldbody>
-    <light pos="0 0 12" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
-    <camera name="overview" pos="0 13 13" euler="2.35 0 -3.14" mode="fixed" />
+        <material name="grid" texture="grid" texrepeat="1 1" reflectance="0.2"/>
+        <mesh name="ramp_mesh"
+                    vertex="{ramp_mesh_vertex}"
+                    face="0 1 2 3 5 4 0 3 4 0 4 1 1 4 5 1 5 2 2 5 3 2 3 0"/>
+    </asset>
+    <worldbody>
+        <light pos="0 0 12" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+        <camera name="overview" pos="0 13 13" euler="2.35 0 -3.14" mode="fixed" />
         {arena} {ramps} {boxes} {seekers} {hiders}
   </worldbody>
   <actuator>{acts}</actuator>
@@ -860,9 +865,10 @@ class TeamCosEnv(gym.Env):
             seq_t = torch.as_tensor(seq_np[None, :, :], dtype=torch.float32)
             with torch.no_grad():
                 if self.model_policy_deterministic and hasattr(model, "get_deterministic_action_and_value"):
-                    arr = model.get_deterministic_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+                    out = model.get_deterministic_action_and_value(seq_t)
                 else:
-                    arr = model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+                    out = model.get_action_and_value(seq_t)
+                arr = out[0].cpu().numpy().reshape(-1)
             if arr.size >= 4:
                 return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
             if arr.size >= 2:
@@ -888,9 +894,10 @@ class TeamCosEnv(gym.Env):
             seq_t = torch.as_tensor(seq_np[None, :, :], dtype=torch.float32)
             with torch.no_grad():
                 if self.model_policy_deterministic and hasattr(self.shared_policy_model, "get_deterministic_action_and_value"):
-                    arr = self.shared_policy_model.get_deterministic_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+                    out = self.shared_policy_model.get_deterministic_action_and_value(seq_t)
                 else:
-                    arr = self.shared_policy_model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+                    out = self.shared_policy_model.get_action_and_value(seq_t)
+                arr = out[0].cpu().numpy().reshape(-1)
             if arr.size >= 4:
                 return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
             if arr.size >= 2:
