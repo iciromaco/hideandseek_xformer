@@ -16,9 +16,6 @@ action_repeat = 10
 mode4_sdf_cell_size = 0.05
 # デバッグ表示
 show_turn_lines = false
-# policy_source ログ制御（大量ログ抑制）
-policy_source_log = false
-policy_source_log_each_reset = false
 debug_log_interval_steps = 200
 # 報酬・評価系
 use_custom_reward = true
@@ -114,7 +111,7 @@ wandb_run_name = "wall_only_confirm_10M"
 # runtime.trainseeker_forRB: 学習向け設定 Seeker
 [runtime.trainseeker_forRB]
 train_mode = true
-use_viewer = true
+use_viewer = false
 training_target = "seeker"
 train_other_hider_policy = "rule"
 train_other_seeker_policy = "rule"

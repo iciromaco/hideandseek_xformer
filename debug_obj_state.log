@@ -1,0 +1,16 @@
+[DEBUG][reset] qpos.shape=(33,) qvel.shape=(30,)
+model.nq= 33 data.qpos.shape= (33,) xquat.shape= (10, 4)
+OBJ b1: bid=2 qadr=7 vadr=6 planar_quat=None
+  xquat: [1. 0. 0. 0.]
+  qpos[qadr:qadr+7]: [-2.91065179  3.78112255  0.5         1.          0.          0.
+  0.        ]
+OBJ b2: bid=3 qadr=14 vadr=12 planar_quat=None
+  xquat: [1. 0. 0. 0.]
+  qpos[qadr:qadr+7]: [-2.89380227 -3.81979034  0.5         1.          0.          0.
+  0.        ]
+OBJ ramp1: bid=1 qadr=0 vadr=0 planar_quat=[1. 0. 0. 0.]
+  xquat: [1. 0. 0. 0.]
+  qpos[qadr:qadr+7]: [ 2.34545837 -2.3973682   0.          1.          0.          0.
+  0.        ]
+obj_geom_ids: {'b1': [13], 'b2': [14], 'ramp1': [9]}
+obj_default_rgba keys: ['b1', 'b2', 'ramp1']

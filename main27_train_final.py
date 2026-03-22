@@ -282,8 +282,6 @@ ENV_CONFIG = {
     "n_ramps": _cfg("n_ramps", "1", int, RUNTIME_OVERRIDES),
     "mode4_sdf_cell_size": _cfg("mode4_sdf_cell_size", "0.05", float, RUNTIME_OVERRIDES),
     "show_turn_lines": SHOW_TURN_LINES,
-    "policy_source_log": _cfg("policy_source_log", "0", _to_bool, RUNTIME_OVERRIDES),
-    "policy_source_log_each_reset": _cfg("policy_source_log_each_reset", "0", _to_bool, RUNTIME_OVERRIDES),
     "debug_log_interval_steps": _cfg("debug_log_interval_steps", "200", int, RUNTIME_OVERRIDES),
     "action_repeat": _cfg("action_repeat", "10", int, RUNTIME_OVERRIDES),
 }

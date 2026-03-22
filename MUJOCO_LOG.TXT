@@ -7,3 +7,18 @@ ERROR: mjv_cameraFrustum: fixed camera id is outside valid range
 Wed Mar  4 16:03:55 2026
 ERROR: mjv_cameraFrustum: fixed camera id is outside valid range
 
+Sun Mar 22 09:33:14 2026
+WARNING: Nan, Inf or huge value in QPOS at DOF 10. The simulation is unstable. Time = 0.0050.
+
+Sun Mar 22 09:33:43 2026
+WARNING: Nan, Inf or huge value in QPOS at DOF 10. The simulation is unstable. Time = 0.0050.
+
+Sun Mar 22 09:36:49 2026
+WARNING: Nan, Inf or huge value in QPOS at DOF 10. The simulation is unstable. Time = 0.0050.
+
+Sun Mar 22 09:37:41 2026
+WARNING: Nan, Inf or huge value in QPOS at DOF 10. The simulation is unstable. Time = 0.0050.
+
+Sun Mar 22 09:38:36 2026
+WARNING: Nan, Inf or huge value in QPOS at DOF 10. The simulation is unstable. Time = 0.0050.
+
