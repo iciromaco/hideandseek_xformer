@@ -829,6 +829,7 @@ class TeamCosEnv(gym.Env):
         else:
             final_gain = 0.0
 
+        """
         if final_gain != prev:
             try:
                 s = ", ".join(
@@ -842,6 +843,7 @@ class TeamCosEnv(gym.Env):
             self._last_ramp_boost[ak] = float(final_gain)
         except Exception:
             pass
+        """
         return final_gain
 
     def _stabilize_agent_vertical_motion(self):
