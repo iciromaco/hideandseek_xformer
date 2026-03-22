@@ -35,3 +35,9 @@ target-version = ['py311']
 
 [tool.isort]
 profile = "black"
+
+[dependency-groups]
+dev = [
+    "flake8>=7.3.0",
+    "pylint>=4.0.5",
+]
