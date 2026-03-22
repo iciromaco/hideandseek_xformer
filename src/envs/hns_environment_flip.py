@@ -10,11 +10,14 @@
 だけを反転して親の `step()` に渡します。その他の振る舞いは完全に継承されます。
 """
 
+import logging
 from typing import Any
 
 import numpy as np
 
 from .hns_environment import TeamCosEnv
+
+logger = logging.getLogger(__name__)
 
 
 class FlippedForwardTeamCosEnv(TeamCosEnv):
@@ -29,8 +32,8 @@ class FlippedForwardTeamCosEnv(TeamCosEnv):
         try:
             af = np.ravel(np.asarray(action, dtype=np.float32)).copy()
         except Exception:
-            # 万一変換できない場合はそのまま親に渡す
-            return super().step(action)
+            logger.exception("Failed to convert action to numpy array")
+            raise
 
         if af.size >= 1:
             af[0] = -af[0]

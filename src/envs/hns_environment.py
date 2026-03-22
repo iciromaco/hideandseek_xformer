@@ -1,5 +1,6 @@
 # src/envs/hns_environment.py
 # hns_environment.py v4.5９
+import logging
 import math
 
 import gymnasium as gym
@@ -16,6 +17,9 @@ from core.obs_indices import ObsIdx
 from core.visibility_engine import VisibilityEngine
 from models.ppo_transformer_v2 import AgentV2
 
+# module logger
+logger = logging.getLogger(__name__)
+
 
 # --- DebugLoggerクラス ---
 class DebugLogger:
@@ -23,6 +27,7 @@ class DebugLogger:
         self.enabled = enabled
         self.log_interval_steps = log_interval_steps
         self._log_last_step = {}
+        # use short name consistently
         self._policy_src_logged = set()
 
     def print(self, message):
@@ -33,8 +38,8 @@ class DebugLogger:
         # debug統計以外の出力は抑制
         return
 
-    def log_policy_source(self, agent_key, source, current_step, force=False):
-        # policy_sourceログも抑制
+    def log_policy_src(self, agent_key, source, current_step, force=False):
+        # short-name API — suppressed in this debug logger
         return
 
     def clear_policy_src_log(self):
@@ -99,12 +104,15 @@ def _blocked_by_walls_numba(p1x, p1y, p2x, p2y, walls, margin):
     return False
 
 
+# (short name only) previously there was a longer name; keep short name
+
+
 class TeamCosEnv(gym.Env):
     # --- 統計バッファ初期化 ---
     def _init_debug_stats(self):
         self._debug_reward_buffer = []
         self._debug_hide_buffer = []
-        self._wall_dist_buf = []
+        self._debug_wall_distance_buffer = []
         self._debug_step_counter = 0
         self._debug_log_interval = getattr(self, "debug_logger", None) and getattr(self.debug_logger, "log_interval_steps", 100) or 100
 
@@ -117,9 +125,9 @@ class TeamCosEnv(gym.Env):
         wd = info.get("wall_distance", None)
         if wd is not None:
             if isinstance(wd, (list, tuple, np.ndarray)):
-                self._wall_dist_buf.extend([float(v) for v in wd])
+                self._debug_wall_distance_buffer.extend([float(v) for v in wd])
             else:
-                self._wall_dist_buf.append(float(wd))
+                self._debug_wall_distance_buffer.append(float(wd))
         self._debug_step_counter += 1
         # log_intervalごとに統計出力
         if self._debug_step_counter % self._debug_log_interval == 0:
@@ -130,11 +138,11 @@ class TeamCosEnv(gym.Env):
             return
         avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
         hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
-        wd_arr = np.array(self._wall_dist_buf, dtype=np.float32) if self._wall_dist_buf else np.array([0.0])
+        wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
         self.debug_logger.print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} WallDist(mean/min/max)={wd_arr.mean():.3f}/{wd_arr.min():.3f}/{wd_arr.max():.3f}")
         self._debug_reward_buffer.clear()
         self._debug_hide_buffer.clear()
-        self._wall_dist_buf.clear()
+        self._debug_wall_distance_buffer.clear()
 
     """
     Hide and Seek 高度物理環境 (単一エージェント学習最適化版)
@@ -496,8 +504,8 @@ class TeamCosEnv(gym.Env):
                     ids.append(gid)
                     cols.append(m.geom_rgba[gid].copy())
                 except Exception:
-                    # ignore missing
-                    pass
+                    logger.exception("failed to lookup geom or rgba in _analyze_structure")
+                    raise
             self.agent_geom_ids[ak] = ids
             # store per-geom default rgba array list
             self.agent_default_rgba[ak] = cols
@@ -840,7 +848,7 @@ class TeamCosEnv(gym.Env):
         """モデルが設定されている場合は必ずそのモデルを使う。"""
         model = self._inference_models.get(agent_key)
         if model is not None:
-            self._log_policy_source(agent_key, "model")
+            self._log_policy_src(agent_key, "model")
             seq_len = int(self._inference_seq_lens.get(agent_key, 8))
             seq_np = self._get_policy_history_seq(agent_key, seq_len, norm_obs)
             seq_t = torch.as_tensor(seq_np[None, :, :], dtype=torch.float32)
@@ -858,7 +866,7 @@ class TeamCosEnv(gym.Env):
         policy = self.inference_policies.get(agent_key)
         if policy is not None:
             try:
-                self._log_policy_source(agent_key, "callable")
+                self._log_policy_src(agent_key, "callable")
                 pred = policy(norm_obs)
                 arr = np.asarray(pred).reshape(-1)
                 if arr.size >= 4:
@@ -869,7 +877,7 @@ class TeamCosEnv(gym.Env):
                 pass
 
         if self.shared_team_policy and self.shared_policy_model is not None and agent_key != self.learnable_agent_key and agent_key.startswith(self.shared_team_prefix):
-            self._log_policy_source(agent_key, "shared_model")
+            self._log_policy_src(agent_key, "shared_model")
             seq_np = self._get_policy_history_seq(agent_key, self.shared_policy_seq_len, norm_obs)
             seq_t = torch.as_tensor(seq_np[None, :, :], dtype=torch.float32)
             with torch.no_grad():
@@ -883,16 +891,16 @@ class TeamCosEnv(gym.Env):
                 return float(arr[0]), float(arr[1]), 0.0, 0.0
             raise RuntimeError(f"Invalid shared action size: agent={agent_key}, size={arr.size}")
 
-        self._log_policy_source(agent_key, "rule")
+        self._log_policy_src(agent_key, "rule")
         arr = np.asarray(self.npcs[agent_key].get_action(norm_obs, self.idx)).reshape(-1)
         if arr.size >= 4:
             return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
         return float(arr[0]), float(arr[1]), 0.0, 0.0
 
-    def _log_policy_source(self, agent_key, source):
+    def _log_policy_src(self, agent_key, source):
         if not self.debug_mode:
             return
-        self.debug_logger.log_policy_source(agent_key, source, self.current_step, force=True)
+        self.debug_logger.log_policy_src(agent_key, source, self.current_step, force=True)
 
     def _debug_print_throttled(self, key, message, force=False):
         self.debug_logger.print_throttled(key, message, self.current_step, force=force)
@@ -935,7 +943,8 @@ class TeamCosEnv(gym.Env):
                 if np.any(~np.isfinite(qvel)):
                     self.debug_logger.print(f"[DEBUG][reset] qvel contains non-finite values at indices: {np.where(~np.isfinite(qvel))[0][:10]}")
             except Exception:
-                pass
+                logger.exception("exception while doing debug sanity checks in reset")
+                raise
         self._init_agent_intelligence()
         self._init_interaction_state()
         placed = []
@@ -1016,6 +1025,7 @@ class TeamCosEnv(gym.Env):
                     v_idx_r = self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]
                     v_rot = float(self.data.qpos[v_idx_r])
                 except Exception:
+                    logger.exception("failed to read viewer body/joint data in reset visibility cache; skipping viewer")
                     continue
                 for target in self.agent_keys:
                     if target == viewer:
@@ -1024,12 +1034,14 @@ class TeamCosEnv(gym.Env):
                         t_bid = self.body_ids[target]
                         t_pos = self.data.xpos[t_bid][:2]
                     except Exception:
+                        logger.exception("failed to read target body data in reset visibility cache; marking not visible")
                         self._prev_vis[(viewer, target)] = False
                         continue
                     vis = False
                     try:
                         vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
                     except Exception:
+                        logger.exception("_is_vis failed while populating _prev_vis")
                         vis = False
                     self._prev_vis[(viewer, target)] = vis
                     if viewer.startswith("h") and target.startswith("s"):
@@ -1041,13 +1053,15 @@ class TeamCosEnv(gym.Env):
                             try:
                                 is_hit = bool(self._is_vis(t_pos, s_rot, v_pos, t_bid, v_bid))
                             except Exception:
+                                logger.exception("_is_vis failed when checking seeker->hider hit in reset cache")
                                 is_hit = False
                         except Exception:
+                            logger.exception("failed to read seeker rotation while computing being_hit in reset cache")
                             is_hit = False
                         self._prev_being_hit[(viewer, target)] = 1.0 if is_hit else 0.0
         except Exception:
-            # be conservative: leave existing caches intact on failure
-            pass
+            logger.exception("failed while refreshing prev_vis/prev_being_hit caches after forward")
+            raise
         # initialize previous-step visibility / being-hit caches so _get_obs
         # can use a well-defined 'previous' value immediately after reset
         self._prev_vis.clear()
@@ -1059,7 +1073,7 @@ class TeamCosEnv(gym.Env):
                 v_idx_r = self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]
                 v_rot = float(self.data.qpos[v_idx_r])
             except Exception:
-                # skip this viewer if we cannot access its state
+                logger.exception("failed to access viewer state when initializing prev_vis; skipping viewer")
                 continue
 
             for target in self.agent_keys:
@@ -1069,7 +1083,7 @@ class TeamCosEnv(gym.Env):
                     t_bid = self.body_ids[target]
                     t_pos = self.data.xpos[t_bid][:2]
                 except Exception:
-                    # cannot access target state; mark not visible
+                    logger.exception("failed to access target state when initializing prev_vis; marking not visible")
                     self._prev_vis[(viewer, target)] = False
                     continue
 
@@ -1078,6 +1092,7 @@ class TeamCosEnv(gym.Env):
                 try:
                     vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
                 except Exception:
+                    logger.exception("_is_vis exception during initialization of prev_vis; marking not visible")
                     vis = False
                 self._prev_vis[(viewer, target)] = vis
 
