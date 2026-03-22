@@ -317,12 +317,12 @@ RW_SEEK_VISIBLE_BONUS = _cfg("rw_seek_visible_bonus", "0.03", float, RUNTIME_OVE
 RW_STILL_SPEED_THRESHOLD = _cfg("rw_still_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値（全エージェント共通）
 
 RW_MOVE_SAT_PENALTY = _cfg("rw_move_sat_penalty", "0.02", float, RUNTIME_OVERRIDES)  # 移動行動の飽和ペナルティ（全エージェント共通、速度の絶対値が閾値を超えるとペナルティ発生）
-RW_TURN_SAT_PENALTY = _cfg("rw_turn_sat_penalty", "0.01", float, RUNTIME_OVERRIDES)  # 回転行動の飽和ペナルティ（全エージェント共通、回転の絶対値が閾値を超えるとペナルティ発生）
+RW_TURN_SAT_PENALTY = _cfg("rw_turn_sat_penalty", "0.02", float, RUNTIME_OVERRIDES)  # 回転行動の飽和ペナルティ（全エージェント共通、回転の絶対値が閾値を超えるとペナルティ発生）
 RW_MOVE_CTRL_COST = _cfg("rw_move_ctrl_cost", "0.001", float, RUNTIME_OVERRIDES)  # 行動コスト（移動と回転の両方に適用、全エージェント共通）
 
 RW_MOVE_INCENTIVE = _cfg("rw_move_incentive", "0.02", float, RUNTIME_OVERRIDES)  # 移動インセンティブ（速度が閾値に近づくほど増加、閾値以上で一定、閾値以下で減少。全エージェント共通）
 RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float, RUNTIME_OVERRIDES)  # 動いていないほどペナルティ大（全エージェント共通）
-RW_TURN_INCENTIVE = _cfg("rw_turn_incentive", "0.0", float, RUNTIME_OVERRIDES)  # 敵が見えていない時の回転インセンティブ（デフォルト0）
+RW_TURN_INCENTIVE = _cfg("rw_turn_incentive", "0.01", float, RUNTIME_OVERRIDES)  # 敵が見えていない時の回転インセンティブ（デフォルト0）
 RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.15", float, RUNTIME_OVERRIDES)  # 壁回避ペナルティ（全エージェント共通、壁に近いほどペナルティ大）
 
 RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.15", float, RUNTIME_OVERRIDES)  # 壁に張り付いていると判断された場合のペナルティ（全エージェント共通）
@@ -593,7 +593,12 @@ def _compute_custom_reward_batch_numba(
             if not visible:
                 # 独楽回りを防ぐため、ここでも「低速な回転」に限定してボーナスを出す設計にする
                 # abs_turn が大きすぎない範囲で加点
-                bonus += rw_turn_incentive * abs_turn
+                half_threshold = turn_sat_threshold / 2.0 if turn_sat_threshold > 0.0 else 0.5
+                if abs_turn > half_threshold:
+                    bonus += rw_turn_incentive * (1.0 - ((abs_turn - half_threshold) / half_threshold))
+                else:
+                    bonus += rw_turn_incentive * abs_turn / half_threshold
+                    # 回転が大きいほどインセンティブ増加（ただし turn_sat_threshold / 2.0 まで）
 
         control_cost = -move_ctrl_cost * (move * move + turn * turn)
         # control_cost = 0.0 # 行動コストは一旦無効化（速度ペナルティと重複するため）
@@ -1705,7 +1710,6 @@ def run_debug_or_playback(env, agent, device, model_loaded):
             seed = 123456789
             torch.manual_seed(seed)
             np.random.seed(seed)
-            random.seed(seed)
         history.prime_single(obs)
         done = False
         ep_reward = 0.0
