@@ -210,6 +210,11 @@ class TeamCosEnv(gym.Env):
         self.debug_mode = debug_mode
         self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=debug_log_interval_steps)
         self.action_repeat = action_repeat
+        # temporal caches for visibility / being-hit freshness
+        self._prev_vis = {}
+        self._prev_being_hit = {}
+        # cached last observation returned for the learnable agent
+        self._cached_obs = None
         self._init_debug_stats()
         if self.n_seekers == 1:
             self.seeker_keys = ["s"]
@@ -756,65 +761,6 @@ class TeamCosEnv(gym.Env):
             return False, grab_evt
         return False, False
 
-    # ---
-    # 旧実装: 複雑なGrab/Lock拘束ロジック
-    # 復元用にコメントアウトで保存
-    # def _apply_object_constraints(self):
-    #     for ak in self.agent_keys:
-    #         if self.btn_cooldown[ak] > 0:
-    #             self.btn_cooldown[ak] -= 1
-    #     for tk, st in self.object_state.items():
-    #         qadr, vadr = self._obj_addr(tk)
-    #         if st["mode"] == "locked" and st["locked_pose"] is not None:
-    #             self.data.qpos[qadr:qadr+7] = st["locked_pose"]
-    #             self.data.qvel[vadr:vadr+6] = 0.0
-    #         elif st["mode"] == "grabbed" and st["owner"] is not None:
-    #             owner = st["owner"]
-    #             opos = self.data.xpos[self.body_ids[owner]][:2]
-    #             cur_xy = self.data.qpos[qadr:qadr+2].copy()
-    #             grab_dist = float(np.linalg.norm(cur_xy - opos))
-    #             if grab_dist > self.GRAB_BREAK_DIST or self._interaction_blocked_by_static_walls(opos, cur_xy):
-    #                 st["mode"] = "free"
-    #                 st["owner"] = None
-    #                 self.data.qvel[vadr:vadr+2] *= 0.5
-    #                 continue
-    #             rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[owner]['rot']]]
-    #             target_xy = opos + np.array([math.cos(rot), math.sin(rot)]) * self.GRAB_OFFSET
-    #             err_xy = target_xy - cur_xy
-    #             desired_xy = np.clip(
-    #                 err_xy * self.GRAB_FOLLOW_GAIN,
-    #                 -self.GRAB_MAX_SPEED,
-    #                 self.GRAB_MAX_SPEED,
-    #             )
-    #             owner_xy = self.data.qvel[
-    #                 self.model.jnt_dofadr[self.qpos_indices[owner]['x']]:
-    #                 self.model.jnt_dofadr[self.qpos_indices[owner]['x']] + 2
-    #             ]
-    #             self.data.qvel[vadr:vadr+2] = 0.75 * desired_xy + 0.25 * owner_xy
-    #             self.data.qvel[vadr+2] = 0.0
-    #             self.data.qvel[vadr+3:vadr+6] *= 0.6
-    #         else:
-    #             self.data.qvel[vadr:vadr+2] *= self.FREE_OBJ_LINEAR_DAMP
-    #             speed_xy = float(np.linalg.norm(self.data.qvel[vadr:vadr+2]))
-    #             if speed_xy < self.FREE_OBJ_STOP_EPS:
-    #                 self.data.qvel[vadr:vadr+2] = 0.0
-    #
-    #         if self.OBJECT_PLANAR_LOCK and st["planar_z"] is not None:
-    #             self.data.qpos[qadr + 2] = st["planar_z"]
-    #             self.data.qpos[qadr + 3:qadr + 7] = st["planar_quat"]
-    #             self.data.qvel[vadr + 2] = 0.0
-    #             self.data.qvel[vadr + 3:vadr + 6] = 0.0
-    #     for tk, geom_ids in self.obj_geom_ids.items():
-    #         mode = self.object_state[tk]["mode"]
-    #         if mode == "locked":
-    #             rgba = np.array([0.2, 0.2, 0.2, 1.0])
-    #         elif mode == "grabbed":
-    #             rgba = np.array([1.0, 0.85, 0.1, 1.0])
-    #         else:
-    #             rgba = self.obj_default_rgba[tk]
-    #         for gid in geom_ids:
-    #             self.model.geom_rgba[gid] = rgba
-
     def _apply_object_constraints(self):
         """
         より単純なGrab/Lock拘束ロジック。
@@ -1076,7 +1022,10 @@ class TeamCosEnv(gym.Env):
         learnable_agent_body_id = self.body_ids[self.learnable_agent_key]
         learnable_agent_pos = self.data.xpos[learnable_agent_body_id]
         wall_dist = self.vis_engine.wall_distance(learnable_agent_pos[0], learnable_agent_pos[1])
-        return self._normalize_obs(self._get_obs(idx_to_obs)), {
+        obs = self._normalize_obs(self._get_obs(idx_to_obs))
+        # cache current observation
+        self._cached_obs = obs
+        return obs, {
             "is_detected": False,
             "wall_distance": wall_dist,
         }
@@ -1160,6 +1109,29 @@ class TeamCosEnv(gym.Env):
             self.last_debug_ctrl[ak] = (f_env, t)
 
         self.data.ctrl[:] = cv
+        # --- capture pre-physics visibility / being-hit state (used as 'previous' freshness) ---
+        try:
+            self._prev_vis.clear()
+            self._prev_being_hit.clear()
+            for viewer in self.agent_keys:
+                v_bid = self.body_ids[viewer]
+                v_pos = self.data.xpos[v_bid][:2]
+                v_rot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]])
+                for target in self.agent_keys:
+                    if target == viewer:
+                        continue
+                    t_bid = self.body_ids[target]
+                    t_pos = self.data.xpos[t_bid][:2]
+                    try:
+                        vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
+                    except Exception:
+                        vis = False
+                    self._prev_vis[(viewer, target)] = vis
+                    # being_hit: store as (hider, seeker) -> flag
+                    if viewer.startswith("s") and target.startswith("h"):
+                        self._prev_being_hit[(target, viewer)] = 1.0 if vis else 0.0
+        except Exception:
+            pass
         for _ in range(self.action_repeat):
             mujoco.mj_step(self.model, self.data)
             self._apply_object_constraints()
@@ -1290,6 +1262,12 @@ class TeamCosEnv(gym.Env):
             "applied_forward": applied_forward_env,
         }
         self._debug_collect_stats(reward, info)
+
+        # cache the observation returned for the learnable agent
+        try:
+            self._cached_obs = obs
+        except Exception:
+            pass
 
         return obs, reward, False, done, info
 
@@ -1452,14 +1430,22 @@ class TeamCosEnv(gym.Env):
             e_pos = d.xpos[eid][:2]
 
             # 1. 視界判定 (自分が相手を見ているか)
-            visible = self._is_vis(ps[:2], rv, e_pos, self.body_ids[ak], eid)
+            prev_vis = self._prev_vis.get((ak, enm), None)
+            if prev_vis is not None:
+                visible = bool(prev_vis)
+            else:
+                visible = self._is_vis(ps[:2], rv, e_pos, self.body_ids[ak], eid)
 
             # 2. 被弾判定 (自分がHider、相手がSeeker、かつ相手が自分を見ているか)
             being_hit_flag = 0.0
             if ak.startswith("h") and enm.startswith("s"):
-                s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]["rot"]]])
-                if self._is_vis(e_pos, s_rot, ps[:2], eid, self.body_ids[ak]):
-                    being_hit_flag = 1.0
+                prev_bh = self._prev_being_hit.get((ak, enm), None)
+                if prev_bh is not None:
+                    being_hit_flag = float(prev_bh)
+                else:
+                    s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]["rot"]]])
+                    if self._is_vis(e_pos, s_rot, ps[:2], eid, self.body_ids[ak]):
+                        being_hit_flag = 1.0
 
             if visible:
                 # 【視覚情報】
