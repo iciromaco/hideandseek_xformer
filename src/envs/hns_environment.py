@@ -150,9 +150,7 @@ class TeamCosEnv(gym.Env):
         self._debug_hide_buffer.clear()
         self._debug_wall_distance_buffer.clear()
 
-    """
-    Hide and Seek 高度物理環境 (単一エージェント学習最適化版)
-    """
+    # Hide and Seek 高度物理環境 (単一エージェント学習最適化版)
     ARENA_HALF = 6.0
     SAFE_HALF = 5.0
     R_AGENT = 0.55
@@ -224,6 +222,9 @@ class TeamCosEnv(gym.Env):
         self.debug_mode = debug_mode
         self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=dbg_log_interval_steps)
         self.action_repeat = action_repeat
+        # preserve flags passed for backward compatibility / debugging
+        self.policy_source_log = bool(policy_source_log)
+        self.policy_src_log_each_reset = bool(policy_src_log_each_reset)
         # temporal caches for visibility / being-hit freshness
         self._prev_vis = {}
         self._prev_being_hit = {}
@@ -561,9 +562,6 @@ class TeamCosEnv(gym.Env):
                 if self.debug_mode:
                     self.debug_logger.print(f"[DEBUG][_cache_planar_object_pose] tk={tk} mode=locked -> forcing identity planar_quat")
                 continue
-
-            # Freejointオブジェクト (box/b/ramp) の判定
-            # シンプルに 's' (seeker) や 'h' (hider) で始まらないものを対象とするのも手です
             if tk[0] in ("b", "r"):  # 'b'(box/b1), 'r'(ramp) に合致
                 pq = None
 
