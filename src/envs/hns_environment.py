@@ -20,6 +20,10 @@ from models.ppo_transformer_v2 import AgentV2
 # module logger
 logger = logging.getLogger(__name__)
 
+# Pylint: mujoco C-extension exposes members dynamically; suppress no-member warnings here
+# to reduce false positives from static analysis.
+# pylint: disable=E1101
+
 
 # --- DebugLoggerクラス ---
 class DebugLogger:
@@ -36,10 +40,12 @@ class DebugLogger:
 
     def print_throttled(self, key, message, current_step, force=False):
         # debug統計以外の出力は抑制
+        del key, message, current_step, force
         return
 
     def log_policy_src(self, agent_key, source, current_step, force=False):
         # short-name API — suppressed in this debug logger
+        del agent_key, source, current_step, force
         return
 
     def clear_policy_src_log(self):
@@ -717,11 +723,13 @@ class TeamCosEnv(gym.Env):
         if st["mode"] == "locked" and st["owner"] == ak:
             st["mode"], st["owner"], st["locked_pose"] = "free", None, None
             return True
+
         if st["mode"] in ("free", "grabbed") and (st["owner"] is None or st["owner"] == ak):
             st["mode"] = "locked"
             st["owner"] = ak
             st["locked_pose"] = self.data.qpos[qadr : qadr + 7].copy()
             return True
+
         return False
 
     def _toggle_grab(self, ak):
