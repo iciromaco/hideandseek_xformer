@@ -126,6 +126,8 @@ class TeamCosEnv(gym.Env):
         self._dbg_log_int = getattr(self, "debug_logger", None) and getattr(self.debug_logger, "log_interval_steps", 100) or 100
         # store last ramp boost per agent for toggle detection
         self._last_ramp_boost = {k: 0.0 for k in getattr(self, "agent_keys", [])}
+        # hold counter per-agent to ignore brief CLEAR transitions
+        self._ramp_boost_hold = {k: 0 for k in getattr(self, "agent_keys", [])}
         # previous agent world z for detecting upward motion (climbing)
         self._prev_agent_z = {k: None for k in getattr(self, "agent_keys", [])}
 
@@ -167,18 +169,21 @@ class TeamCosEnv(gym.Env):
     R_BOX = 0.95
     R_RAMP = 1.30
 
-    AGENT_DAMPING_XY = 8  # 10 # 30.0
-    AGENT_DAMPING_Z = 8  # 16.0
-    AGENT_DAMPING_ROT = 8  # 15 # 25.0
+    AGENT_DAMPING_XY = 40  # 10 # 30.0
+    AGENT_DAMPING_Z = 20  # 16.0
+    AGENT_DAMPING_ROT = 25
     AGENT_ACTUATOR_FWD = 1500  # 700
+    AGENT_ACTUATOR_TURN_GAIN = 300
+    AGENT_BOTTOM_MASS = 16.0
+    AGENT_HEAD_MASS = 6.0
     AGENT_Z_MIN = -0.05
     AGENT_Z_MAX = 1.20
     AGENT_MAX_VZ = 2.2
-    RAMP_JOINT_DAMPING = 30  # 90.0
-    BOX_JOINT_DAMPING = 28.0
+    RAMP_JOINT_DAMPING = 500  # 90.0
+    BOX_JOINT_DAMPING = 100.0
     RAMP_MASS = 60.0
     RAMP_INNER_WEIGHT_MASS = 30.0
-    BOX_MASS = 22.0
+    BOX_MASS = 100.0
     INTERACT_RANGE = 1.95
     BTN_ON = 0.1
     BTN_COOLDOWN = 8
@@ -187,6 +192,9 @@ class TeamCosEnv(gym.Env):
     GRAB_MAX_SPEED = 2.6
     GRAB_BREAK_DIST = 2.8
     RAMP_BOOST_FWD = 0.35
+    # number of simulation steps to hold a previously-engaged boost when a
+    # transient CLEAR condition is observed (mitigates brief overshoots/noise)
+    RAMP_BOOST_HOLD_STEPS = 8
     OBJECT_PLANAR_LOCK = True
     RAMP_LOCKED_SPEED_EPS = 0.035
     FREE_OBJ_LINEAR_DAMP = 0.90
@@ -418,7 +426,7 @@ class TeamCosEnv(gym.Env):
             )
             for i, ak in enumerate(self.hider_keys)
         )
-        acts = "".join(self._xml_actuators(ak) for ak in self.agent_keys)
+        acts = "".join(self._xml_actuators_fixed(ak) for ak in self.agent_keys)
 
         ramp_mesh_vertex = "-0.6666 -0.5 0.0 0.6666 -0.5 0.0 0.6666 -0.5 1.0 " + "-0.6666 0.5 0.0 0.6666 0.5 0.0 0.6666 0.5 1.0"
 
@@ -444,7 +452,7 @@ class TeamCosEnv(gym.Env):
         s = self.ARENA_HALF
         attr = 'friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"'
         return f"""
-    <geom name="floor" type="plane" size="{s} {s} 0.1" material="grid" friction="1.1 0.15 0.003"/>
+    <geom name="floor" type="plane" size="{s} {s} 0.1" material="grid" friction="1.0 0.05 0.0001"/>
     <geom name="wall_n" type="box" size="{s + 0.15} 0.1 2.0" pos="0 6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
     <geom name="wall_s" type="box" size="{s + 0.15} 0.1 2.0" pos="0 -6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
     <geom name="wall_e" type="box" size="0.1 {s} 2.0" pos="6.1 0 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
@@ -477,7 +485,7 @@ class TeamCosEnv(gym.Env):
         return f"""
     <body name="box{i}_body" pos="{xy[0]} {xy[1]} 0.5" quat="{q}">
             <joint name="box{i}_joint" type="free" damping="{self.BOX_JOINT_DAMPING}"/>
-            <geom name="box{i}_geom" type="box" size="0.6 0.6 0.5" mass="{self.BOX_MASS}" rgba="0.75 0.55 0.3 1" friction="1.2 0.08 0.003"/>
+            <geom name="box{i}_geom" type="box" size="0.6 0.6 0.5" mass="{self.BOX_MASS}" solref="0.02 1" condim="3" rgba="0.75 0.55 0.3 1" friction="1.2 0.08 0.003"/>
     </body>"""
 
     def _xml_agent(self, pre, xy, rot, color):
@@ -488,11 +496,11 @@ class TeamCosEnv(gym.Env):
       <joint name="{pre}_x" type="slide" axis="1 0 0" damping="{self.AGENT_DAMPING_XY}"/>
       <joint name="{pre}_y" type="slide" axis="0 1 0" damping="{self.AGENT_DAMPING_XY}"/>
     <joint name="{pre}_z" type="slide" axis="0 0 1" damping="{self.AGENT_DAMPING_Z}" limited="true" range="{self.AGENT_Z_MIN} {self.AGENT_Z_MAX}"/>
-      <joint name="{pre}_rot" type="hinge" axis="0 0 1" damping="{self.AGENT_DAMPING_ROT}"/>
+    <joint name="{pre}_rot" type="hinge" axis="0 0 1" damping="{self.AGENT_DAMPING_ROT}" armature="3.0"/>
       <body name="{pre}_body">
         <site name="{pre}_thrust" pos="0 0 0"/>
-        <geom name="{pre}_btm" type="sphere" size="0.4" pos="0 0 -0.1" mass="12" friction="1.2 0.12 0.003"/>
-        <geom name="{pre}_capsule" type="capsule" size="0.3 0.2" rgba="{r} {g} {b} 1" mass="4" contype="0" conaffinity="0"/>
+        <geom name="{pre}_btm" type="sphere" size="0.4" pos="0 0 -0.1" mass="{self.AGENT_BOTTOM_MASS}" friction="1.2 0.12 0.003"/>
+        <geom name="{pre}_capsule" type="capsule" size="0.3 0.2" rgba="{r} {g} {b} 1" mass="{self.AGENT_HEAD_MASS}" contype="0" conaffinity="0"/>
         <geom name="{pre}_nose" type="capsule" fromto="0 0 0.3 0.3 0 0.3" size="0.09" rgba="1 1 1 1" contype="0" conaffinity="0"/>
         <geom name="{pre}_tail" type="capsule" fromto="0 0 0 -0.45 0 -0.3" size="0.05" rgba="{r} {g} {b} 1" contype="0" conaffinity="0"/>
       </body>
@@ -501,7 +509,7 @@ class TeamCosEnv(gym.Env):
     def _xml_actuators(self, pre):
         return f"""
     <general name="{pre}_fwd" site="{pre}_thrust" gear="1 0 0 0 0 0" gainprm="{self.AGENT_ACTUATOR_FWD}" ctrlrange="-1 1"/>
-    <general name="{pre}_turn" joint="{pre}_rot" gear="0.5" gainprm="120" ctrlrange="-1 1"/>\n"""
+    <general name="{pre}_turn" joint="{pre}_rot" gear="0.5" gainprm="{self.AGENT_ACTUATOR_TURN_GAIN}" ctrlrange="-1 1"/>\n+"""
 
     def _analyze_structure(self):
         m = self.model
@@ -692,33 +700,60 @@ class TeamCosEnv(gym.Env):
         Returns a single float (top z). Falls back to body z if computation fails.
         """
         try:
-            # try to find a representative geom size
-            geom_ids = []
+            # Prefer using the explicit slope surface geom if present; this geom
+            # gives a reliable center position and half-length along the ramp.
+            slope_name = None
             try:
                 idx = int(self.ramp_ids.index(rid))
-                rkey = f"ramp{idx+1}"
-                geom_ids = self.obj_geom_ids.get(rkey, [])
+                slope_name = f"ramp{idx+1}_slope_surface"
             except Exception:
-                geom_ids = []
+                slope_name = None
 
-            gsize = None
-            for gid in geom_ids:
+            half_length = None
+            geom_center_z = None
+            geom_thickness = 0.0
+            if slope_name is not None:
                 try:
+                    gid = self.model.geom(slope_name).id
                     gsize = np.asarray(self.model.geom_size[gid], dtype=np.float32)
-                    if gsize.size > 0:
-                        break
+                    if gsize.size >= 1:
+                        half_length = float(gsize[0])
+                    if gsize.size >= 3:
+                        geom_thickness = float(gsize[2])
+                    # use data.geom_xpos for current world position of geom center
+                    geom_center_z = float(self.data.geom_xpos[gid][2])
                 except Exception:
-                    gsize = None
+                    half_length = None
+                    geom_center_z = None
 
-            if gsize is not None and gsize.size >= 1:
-                half_length = float(gsize[0])
-            else:
+            # fallback to body-based estimate if slope geom not available
+            if half_length is None:
                 try:
-                    L = float(self.R_RAMP)
+                    # try to find a representative geom size from stored obj_geom_ids
+                    idx = int(self.ramp_ids.index(rid))
+                    rkey = f"ramp{idx+1}"
+                    geom_ids = self.obj_geom_ids.get(rkey, [])
                 except Exception:
-                    L = 0.833
-                half_length = 0.5 * L
+                    geom_ids = []
+                gsize = None
+                for gid in geom_ids:
+                    try:
+                        gsize = np.asarray(self.model.geom_size[gid], dtype=np.float32)
+                        if gsize.size > 0:
+                            break
+                    except Exception:
+                        gsize = None
+                if gsize is not None and gsize.size >= 1:
+                    half_length = float(gsize[0])
+                else:
+                    try:
+                        L = float(self.R_RAMP)
+                    except Exception:
+                        L = 0.833
+                    half_length = 0.5 * L
+                geom_center_z = float(self.data.xpos[rid][2])
 
+            # compute pitch from body quaternion (same as before)
             q = self.data.xquat[rid]
             sinp = 2.0 * (q[0] * q[2] - q[3] * q[1])
             if sinp >= 1.0:
@@ -728,11 +763,11 @@ class TeamCosEnv(gym.Env):
             else:
                 pitch = math.asin(sinp)
 
-            # vertical half (height difference from center to top)
-            vertical_half = half_length * float(math.sin(pitch))
-            body_z = float(self.data.xpos[rid][2])
-            # assume top is body_z + vertical_half
-            return body_z + vertical_half
+            # top is at geom center + absolute vertical projection of half_length
+            vertical_half = abs(half_length * float(math.sin(pitch)))
+            # include half-thickness of the slope geom if available
+            top_z = float(geom_center_z) + vertical_half + float(geom_thickness)
+            return top_z
         except Exception:
             try:
                 return float(self.data.xpos[rid][2])
@@ -817,33 +852,51 @@ class TeamCosEnv(gym.Env):
             prev = 0.0
         prev_on = prev >= SET_THRESH
         cand_on = gain >= SET_THRESH
-        # determine final_on using hysteresis
+        # determine final_on using hysteresis and short hold to avoid spurious clears
+        try:
+            hold = int(self._ramp_boost_hold.get(ak, 0))
+        except Exception:
+            hold = 0
+
+        # normal hysteresis decision
         if prev_on:
-            final_on = gain >= CLEAR_THRESH
+            would_clear = gain < CLEAR_THRESH
         else:
+            would_clear = False
+
+        # if previously on and we would clear now, start/continue a short hold
+        if prev_on and would_clear:
+            if hold <= 0:
+                # begin hold period
+                hold = int(self.RAMP_BOOST_HOLD_STEPS)
+            # keep boost on during hold
+            final_on = True
+        elif hold > 0:
+            # decrement hold while forcing boost on
+            hold = max(0, hold - 1)
+            final_on = True
+        else:
+            # not in hold, use standard hysteresis engage rule
             final_on = cand_on
 
+        # choose magnitude: prefer current gain when available, otherwise preserve prev
         if final_on:
-            # prefer the current candidate magnitude if available, otherwise keep previous
             final_gain = gain if gain > 0.0 else prev
         else:
             final_gain = 0.0
 
-        """
-        if final_gain != prev:
-            try:
-                s = ", ".join(
-                    f"{p['rkey']}(lx={p['lx']:.3f},ly={p['ly']:.3f},f={p['facing']:.3f},min={p['lx_min']:.3f},max={p['lx_max']:.3f},lyt={p['ly_thresh']:.3f},full={p['full_thresh']:.3f})"
-                    for p in per_ramp
-                )
-                print(f"[RAMP_BOOST_TOGGLE] step={getattr(self,'current_step',-1)} ak={ak} prev={prev:.1f} raw_gain={gain:.1f} new={final_gain:.1f} candidates=[{s}]")
-            except Exception:
-                print(f"[RAMP_BOOST_TOGGLE] step={getattr(self, 'current_step', -1)} ak={ak} prev={prev:.1f} new={final_gain:.1f}")
+        # persist hold state
+        try:
+            self._ramp_boost_hold[ak] = int(hold)
+        except Exception:
+            pass
+
+        # update last seen boost magnitude
         try:
             self._last_ramp_boost[ak] = float(final_gain)
         except Exception:
             pass
-        """
+
         return final_gain
 
     def _stabilize_agent_vertical_motion(self):
@@ -1621,7 +1674,8 @@ class TeamCosEnv(gym.Env):
                             facing2 = float(np.dot(afwd, up2))
                             details.append(f"{rkey2}(mode={st2.get('mode')},owner={st2.get('owner')}," f"lx={lx2:.3f},ly={ly2:.3f},f={facing2:.3f},rpos=({rpos2[0]:.3f},{rpos2[1]:.3f}))")
                         s = ", ".join(details)
-                        print(f"[RAMP_DBG_REJECT] step={getattr(self,'current_step',-1)} ak={self.learnable_agent_key} " f"boost={boost:.3f} candidates=[{s}]")
+                        if getattr(self, "debug_mode", False):
+                            print(f"[RAMP_DBG_REJECT] step={getattr(self,'current_step',-1)} ak={self.learnable_agent_key} " f"boost={boost:.3f} candidates=[{s}]")
                     except Exception:
                         pass
             # detect climbing (agent z increasing while on/near ramp) and reaching top
@@ -2072,3 +2126,17 @@ class TeamCosEnv(gym.Env):
     def close(self):
         if self.viewer:
             self.viewer.close()
+
+
+# Provide a fixed actuator XML generator and attach it to the class so
+# _build_dynamic_xml can safely call it even if the original method
+# contained malformed content during edits.
+def _xml_actuators_fixed(self, pre):
+    return f"""
+    <general name="{pre}_fwd" site="{pre}_thrust" gear="1 0 0 0 0 0" gainprm="{self.AGENT_ACTUATOR_FWD}" ctrlrange="-1 1"/>
+    <general name="{pre}_turn" joint="{pre}_rot" gear="0.5" gainprm="{self.AGENT_ACTUATOR_TURN_GAIN}" ctrlrange="-1 1"/>
+    """
+
+
+# Attach to class
+TeamCosEnv._xml_actuators_fixed = _xml_actuators_fixed

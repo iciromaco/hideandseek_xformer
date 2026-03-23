@@ -47,6 +47,20 @@ turn_sat_threshold = 1.0
 idle_speed_threshold = 0.1
 move_incentive_speed_threshold = 0.3
 
+# runtime.npconly: ルールベースのモニタ向け
+[runtime.npconly]
+train_mode = false
+debug_hider_policy = "rule"
+debug_seeker_policy = "rule"
+model_policy_deterministic = true
+debug_symmetric_hider_policy = false
+training_target = "seeker"
+npc_only_debug = true
+# play_episodes = 100
+auto_tune_hparams = false
+play_episodes = 10
+dbg_log_interval_steps = 200
+
 [runtime.optuna]
 train_mode = true
 use_viewer = false
@@ -111,7 +125,7 @@ wandb_run_name = "wall_only_confirm_10M"
 # runtime.trainseeker_forRB: 学習向け設定 Seeker
 [runtime.trainseeker_forRB]
 train_mode = true
-use_viewer = false
+use_viewer = true
 training_target = "seeker"
 train_other_hider_policy = "rule"
 train_other_seeker_policy = "rule"
