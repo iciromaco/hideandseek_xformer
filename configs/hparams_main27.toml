@@ -17,6 +17,9 @@ mode4_sdf_cell_size = 0.05
 # デバッグ表示
 show_turn_lines = false
 dbg_log_interval_steps = 200
+# デバッグ関連フラグ
+debug_mode = false
+debug_console = false
 # 報酬・評価系
 use_custom_reward = true
 # 前進飽和抑制（常時前進ボーナスは使わない）

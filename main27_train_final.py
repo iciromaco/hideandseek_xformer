@@ -243,6 +243,10 @@ if RUNTIME_OVERRIDES:
 
 # フラグの初期化
 # プロファイルで指定した値（hp）をデフォルトにし、さらに CLI/ランタイムオーバーライドで上書きする。
+# debug flags may be set in TOML/runtime overrides
+DEBUG_MODE = _cfg("debug_mode", hp.get("debug_mode", "0"), _to_bool, RUNTIME_OVERRIDES)
+DEBUG_CONSOLE = _cfg("debug_console", hp.get("debug_console", "1"), _to_bool, RUNTIME_OVERRIDES)
+
 TRAIN_MODE = _cfg("train_mode", hp.get("train_mode", "0"), _to_bool, RUNTIME_OVERRIDES)
 USE_VIEWER = _cfg("use_viewer", hp.get("use_viewer", "1"), _to_bool, RUNTIME_OVERRIDES)
 NPC_ONLY_DEBUG = _cfg("npc_only_debug", hp.get("npc_only_debug", "1"), _to_bool, RUNTIME_OVERRIDES)
@@ -283,6 +287,8 @@ ENV_CONFIG = {
     "mode4_sdf_cell_size": _cfg("mode4_sdf_cell_size", "0.05", float, RUNTIME_OVERRIDES),
     "show_turn_lines": SHOW_TURN_LINES,
     "dbg_log_interval_steps": _cfg("dbg_log_interval_steps", "200", int, RUNTIME_OVERRIDES),
+    "debug_mode": DEBUG_MODE,
+    "debug_console": DEBUG_CONSOLE,
     "action_repeat": _cfg("action_repeat", "10", int, RUNTIME_OVERRIDES),
 }
 
@@ -304,7 +310,6 @@ WANDB_MODE = _cfg("wandb_mode", "online", str, RUNTIME_OVERRIDES)
 WANDB_RUN_NAME = _cfg("wandb_run_name", "", str, RUNTIME_OVERRIDES)
 WANDB_LOG_CODE = _cfg("wandb_log_code", "1", _to_bool, RUNTIME_OVERRIDES)
 WANDB_CODE_ROOT = _cfg("wandb_code_root", os.path.dirname(__file__), str, RUNTIME_OVERRIDES)
-
 
 RESUME_TRAINING = _cfg("resume_training", "0", _to_bool, RUNTIME_OVERRIDES)  # 学習再開フラグ（Trueの場合、checkpoint_pathからモデルをロードして学習再開を試みる）
 RESET_MODEL_ON_TRAIN = _cfg(
@@ -594,7 +599,7 @@ def _compute_custom_reward_batch_numba(
                 # 独楽回りを防ぐため、ここでも「低速な回転」に限定してボーナスを出す設計にする
                 # abs_turn が大きすぎない範囲で加点
                 half_threshold = turn_sat_threshold / 2.0 if turn_sat_threshold > 0.0 else 0.5
-                if abs_turn > half_threshold:
+                if abs_turn > half_threshold:  # abs_turn が閾値の半分を超えると、そこから先は減少させる（ただし turn_sat_threshold / 2.0 まで）
                     bonus += rw_turn_incentive * (1.0 - ((abs_turn - half_threshold) / half_threshold))
                 else:
                     bonus += rw_turn_incentive * abs_turn / half_threshold
@@ -2090,8 +2095,9 @@ def run():
             # ポリシーソース等の情報を観察しやすくする
             env = env
             try:
-                env.debug_mode = bool(USE_VIEWER)
-                env.debug_logger.enabled = bool(USE_VIEWER)
+                # Respect explicit debug flags from config; do not force debug on when viewer is enabled
+                env.debug_mode = bool(DEBUG_MODE)
+                env.debug_console = bool(DEBUG_CONSOLE)
             except Exception:
                 pass
             ref_env = env

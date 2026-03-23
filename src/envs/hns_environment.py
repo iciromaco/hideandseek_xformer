@@ -27,25 +27,31 @@ logger = logging.getLogger(__name__)
 
 # --- DebugLoggerクラス ---
 class DebugLogger:
-    def __init__(self, enabled=False, log_interval_steps=100):
+    def __init__(self, enabled=False, console=True, log_interval_steps=100):
+        # `enabled` controls whether the logger records/handles debug events
+        # `console` controls whether messages are printed to stdout
         self.enabled = enabled
+        self.console = console
         self.log_interval_steps = log_interval_steps
         self._log_last_step = {}
         # use short name consistently
         self._policy_src_logged = set()
 
     def print(self, message):
-        if self.enabled:
+        if self.console:
             print(message)
 
     def print_throttled(self, key, message, current_step, force=False):
-        # debug統計以外の出力は抑制
-        del key, message, current_step, force
+        # preserve previous behavior: suppressed unless logger enabled
+        if not self.enabled and not force:
+            return
+        # original implementation had no-op; keep suppressed behaviour
         return
 
     def log_policy_src(self, agent_key, source, current_step, force=False):
-        # short-name API — suppressed in this debug logger
-        del agent_key, source, current_step, force
+        if not self.enabled and not force:
+            return
+        # preserved as no-op for now (external sinks may implement later)
         return
 
     def clear_policy_src_log(self):
@@ -169,17 +175,17 @@ class TeamCosEnv(gym.Env):
     R_BOX = 0.95
     R_RAMP = 1.30
 
-    AGENT_DAMPING_XY = 40  # 10 # 30.0
+    AGENT_DAMPING_XY = 20  # 10 # 30.0
     AGENT_DAMPING_Z = 20  # 16.0
-    AGENT_DAMPING_ROT = 25
-    AGENT_ACTUATOR_FWD = 1500  # 700
-    AGENT_ACTUATOR_TURN_GAIN = 300
-    AGENT_BOTTOM_MASS = 16.0
-    AGENT_HEAD_MASS = 6.0
+    AGENT_DAMPING_ROT = 15
+    AGENT_ACTUATOR_FWD = 2000  # 700
+    AGENT_ACTUATOR_TURN_GAIN = 200
+    AGENT_BOTTOM_MASS = 20.0
+    AGENT_HEAD_MASS = 10.0
     AGENT_Z_MIN = -0.05
     AGENT_Z_MAX = 1.20
     AGENT_MAX_VZ = 2.2
-    RAMP_JOINT_DAMPING = 500  # 90.0
+    RAMP_JOINT_DAMPING = 100.0
     BOX_JOINT_DAMPING = 100.0
     RAMP_MASS = 60.0
     RAMP_INNER_WEIGHT_MASS = 30.0
@@ -222,6 +228,7 @@ class TeamCosEnv(gym.Env):
         dbg_log_interval_steps=200,
         mode4_sdf_cell_size=0.05,
         debug_mode=False,
+        debug_console=True,
         action_repeat=16,
     ):
         super().__init__()
@@ -237,8 +244,9 @@ class TeamCosEnv(gym.Env):
         self.show_turn_lines = bool(show_turn_lines)
         self.mode4_sdf_cell_size = float(mode4_sdf_cell_size)
         self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
-        self.debug_mode = debug_mode
-        self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=dbg_log_interval_steps)
+        # use private attr and property to keep debug_logger.enabled in sync
+        self._debug_mode = bool(debug_mode)
+        self.debug_logger = DebugLogger(enabled=self._debug_mode, console=bool(debug_console), log_interval_steps=dbg_log_interval_steps)
         self.action_repeat = action_repeat
         # preserve flags passed for backward compatibility / debugging
         self.policy_source_log = bool(policy_source_log)
@@ -473,7 +481,9 @@ class TeamCosEnv(gym.Env):
         return f"""
         <body name="ramp{i}_body" pos="{xy[0]} {xy[1]} 0" quat="{q}">
             <inertial pos="0.3 0 0.25" mass="{self.RAMP_MASS}" diaginertia="10 10 20"/>
-            <joint type="free" name="ramp{i}_joint" damping="{self.RAMP_JOINT_DAMPING}"/>
+            <joint name="ramp{i}_joint_x" type="slide" axis="1 0 0" damping="{self.RAMP_JOINT_DAMPING}"/>
+            <joint name="ramp{i}_joint_y" type="slide" axis="0 1 0" damping="{self.RAMP_JOINT_DAMPING}"/>
+            <joint name="ramp{i}_joint_z" type="hinge" axis="0 0 1" damping="{self.RAMP_JOINT_DAMPING}"/>
             <geom name="ramp{i}_geom" type="mesh" mesh="ramp_mesh" contype="0" conaffinity="0" rgba="0 1 0 1"/>
             <geom name="ramp{i}_slope_surface" type="box" size="0.8333 0.5 0.02" pos="0 0 0.516" euler="0 -36.87 0" rgba="0 1 0 0.3" friction="1.35 0.22 0.01"/>
             <geom name="ramp{i}_back_panel" type="box" size="0.02 0.5 0.5" pos="0.6666 0 0.5" rgba="0 1 0 0.3" friction="1.35 0.22 0.01"/>
@@ -569,6 +579,26 @@ class TeamCosEnv(gym.Env):
         self.prev_action_btns = {ak: np.zeros(2, dtype=np.float32) for ak in self.agent_keys}
         self.btn_cooldown = dict.fromkeys(self.agent_keys, 0)
 
+    # --- debug_mode property to keep logger.enabled synced ---
+    @property
+    def debug_mode(self):
+        return bool(getattr(self, "_debug_mode", False))
+
+    @debug_mode.setter
+    def debug_mode(self, v):
+        self._debug_mode = bool(v)
+        if hasattr(self, "debug_logger") and self.debug_logger is not None:
+            self.debug_logger.enabled = bool(v)
+
+    @property
+    def debug_console(self):
+        return bool(getattr(self, "debug_logger", None) and getattr(self.debug_logger, "console", False))
+
+    @debug_console.setter
+    def debug_console(self, v):
+        if hasattr(self, "debug_logger") and self.debug_logger is not None:
+            self.debug_logger.console = bool(v)
+
     def _cache_planar_object_pose(self):
         # 実行中にデータ形状が変わることはないので、外部で一度 shape を取っておく
         qpos_len = self.data.qpos.shape[0]
@@ -597,8 +627,15 @@ class TeamCosEnv(gym.Env):
                     pq = xq.copy()
 
                 # 2. qpos スライス (fallback)
-                if pq is None and qadr >= 0 and (qadr + 7) <= qpos_len:
-                    pq = self.data.qpos[qadr + 3 : qadr + 7].copy()
+                if pq is None and qadr >= 0:
+                    if tk.startswith("ramp"):
+                        # ramp は slide x/y + hinge z になったため qpos=[x,y,rot]
+                        if (qadr + 3) <= qpos_len:
+                            rot = float(self.data.qpos[qadr + 2])
+                            pq = np.array([math.cos(rot / 2.0), 0.0, 0.0, math.sin(rot / 2.0)], dtype=np.float32)
+                    else:
+                        if (qadr + 7) <= qpos_len:
+                            pq = self.data.qpos[qadr + 3 : qadr + 7].copy()
 
                 self.object_state[tk]["planar_quat"] = pq
 
@@ -688,7 +725,7 @@ class TeamCosEnv(gym.Env):
         # below the ramp: subtract an approach margin roughly equal to the
         # agent radius (≈0.4m). Also keep a small numerical EPS margin.
         APPROACH_MARGIN = 0.4
-        EPS_MARGIN = 0.02
+        EPS_MARGIN = 0.0
         lx_min = -projected_half - APPROACH_MARGIN - EPS_MARGIN
         lx_max = projected_half + EPS_MARGIN
         ly_thresh = half_width + 0.05
@@ -879,9 +916,10 @@ class TeamCosEnv(gym.Env):
             # not in hold, use standard hysteresis engage rule
             final_on = cand_on
 
-        # choose magnitude: prefer current gain when available, otherwise preserve prev
+        # choose magnitude: prefer current gain; do not preserve previous magnitude
+        # when current gain is zero (prevents boost magnitude lingering after exit)
         if final_on:
-            final_gain = gain if gain > 0.0 else prev
+            final_gain = gain if gain > 0.0 else 0.0
         else:
             final_gain = 0.0
 
@@ -977,7 +1015,10 @@ class TeamCosEnv(gym.Env):
         if st["mode"] in ("free", "grabbed") and (st["owner"] is None or st["owner"] == ak):
             st["mode"] = "locked"
             st["owner"] = ak
-            st["locked_pose"] = self.data.qpos[qadr : qadr + 7].copy()
+            if tk.startswith("ramp"):
+                st["locked_pose"] = self.data.qpos[qadr : qadr + 3].copy()
+            else:
+                st["locked_pose"] = self.data.qpos[qadr : qadr + 7].copy()
             return True
 
         return False
@@ -1039,58 +1080,85 @@ class TeamCosEnv(gym.Env):
         マジックナンバーは定数化。
         """
         # --- 定数定義 ---
-        POSE_SIZE = 7  # qposのpose成分長
-        VEL_SIZE = 6  # qvelの成分長
+        # POSE_SIZE / VEL_SIZE はオブジェクト毎に変わる（ramp は 3、box は 7）
         XY_START, XY_STOP = 0, 2  # x, y成分
-        Z_IDX = 2
-        QUAT_START, QUAT_STOP = 3, 7
-        XY_VEL_START, XY_VEL_STOP = 0, 2
-        Z_VEL_IDX = 2
-        ANG_VEL_START, ANG_VEL_STOP = 3, 6
+        # 以下のインデックスはオブジェクト種別に応じてループ内で決定する
 
         for ak in self.agent_keys:
             if self.btn_cooldown[ak] > 0:
                 self.btn_cooldown[ak] -= 1
         for tk, st in self.object_state.items():
             qadr, vadr = self._obj_addr(tk)
+            is_ramp = tk.startswith("ramp")
+            pose_size = 3 if is_ramp else 7
+            vel_size = 3 if is_ramp else 6
+            # velocity index layout per-object
+            XY_VEL_START, XY_VEL_STOP = 0, 2
+            if is_ramp:
+                Z_VEL_IDX = 2
+                # ramps have no separate angular-velocity block beyond index 2
+                ANG_VEL_START, ANG_VEL_STOP = 2, 3
+            else:
+                Z_VEL_IDX = 2
+                ANG_VEL_START, ANG_VEL_STOP = 3, 6
+
             if st["mode"] == "locked" and st["locked_pose"] is not None:
-                self.data.qpos[qadr : qadr + POSE_SIZE] = st["locked_pose"]
-                self.data.qvel[vadr : vadr + VEL_SIZE] = 0.0
+                # locked_pose は object 作成時の pose_size に合わせて保存される
+                self.data.qpos[qadr : qadr + pose_size] = st["locked_pose"]
+                self.data.qvel[vadr : vadr + vel_size] = 0.0
             elif st["mode"] == "grabbed" and st["owner"] is not None:
                 owner = st["owner"]
                 opos = self.data.xpos[self.body_ids[owner]][XY_START:XY_STOP]
-                cur_xy = self.data.qpos[qadr : qadr + POSE_SIZE][XY_START:XY_STOP].copy()
+                cur_xy = self.data.qpos[qadr : qadr + pose_size][XY_START:XY_STOP].copy()
                 # --- 距離・壁判定によるgrab解除 ---
                 grab_dist = float(np.linalg.norm(cur_xy - opos))
                 if grab_dist > self.GRAB_BREAK_DIST or self._interaction_blocked_by_static_walls(opos, cur_xy):
                     st["mode"] = "free"
                     st["owner"] = None
-                    self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP] *= 0.5
+                    self.data.qvel[vadr : vadr + vel_size][XY_VEL_START:XY_VEL_STOP] *= 0.5
                     continue
                 err_xy = opos - cur_xy
-                self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = err_xy  # 速度を直接目標方向に
-                self.data.qvel[vadr : vadr + VEL_SIZE][Z_VEL_IDX] = 0.0
-                self.data.qvel[vadr : vadr + VEL_SIZE][ANG_VEL_START:ANG_VEL_STOP] = 0.0
+                self.data.qvel[vadr : vadr + vel_size][XY_VEL_START:XY_VEL_STOP] = err_xy  # 速度を直接目標方向に
+                # Z 軸速度（垂直 or hinge 回転）を 0 にする
+                self.data.qvel[vadr : vadr + vel_size][Z_VEL_IDX] = 0.0
+                # 角速度ブロックがある場合は 0 にする（boxes: indices 3..6、ramps は短い範囲）
+                self.data.qvel[vadr : vadr + vel_size][ANG_VEL_START:ANG_VEL_STOP] = 0.0
             else:
-                self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP] *= 0.9
-                speed_xy = float(np.linalg.norm(self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP]))
+                self.data.qvel[vadr : vadr + vel_size][XY_VEL_START:XY_VEL_STOP] *= 0.9
+                speed_xy = float(np.linalg.norm(self.data.qvel[vadr : vadr + vel_size][XY_VEL_START:XY_VEL_STOP]))
                 if speed_xy < 1e-3:
-                    self.data.qvel[vadr : vadr + VEL_SIZE][XY_VEL_START:XY_VEL_STOP] = 0.0
+                    self.data.qvel[vadr : vadr + vel_size][XY_VEL_START:XY_VEL_STOP] = 0.0
             # Planar lock
             if self.OBJECT_PLANAR_LOCK and st.get("planar_z") is not None:
-                self.data.qpos[qadr + Z_IDX] = st["planar_z"]
                 pq = st.get("planar_quat")
                 try:
-                    if pq is not None and np.all(np.isfinite(pq)) and len(pq) >= (QUAT_STOP - QUAT_START):
-                        self.data.qpos[qadr + QUAT_START : qadr + QUAT_STOP] = pq
+                    if is_ramp:
+                        # ramps: qpos layout = [x, y, rot]
+                        # planar_z は ground 用に保存されているが qpos に高さ成分はないためスキップ
+                        # 回転は planar_quat から yaw を計算して hinge 値に適用する
+                        if pq is not None and np.all(np.isfinite(pq)) and len(pq) >= 4:
+                            w, xq, yq, zq = float(pq[0]), float(pq[1]), float(pq[2]), float(pq[3])
+                            yaw = math.atan2(2.0 * (w * zq + xq * yq), 1.0 - 2.0 * (yq * yq + zq * zq))
+                            # hinge joint qpos is at qadr + 2
+                            if (qadr + 3) <= self.data.qpos.shape[0]:
+                                self.data.qpos[qadr + 2] = yaw
+                        else:
+                            if self.debug_mode:
+                                self.debug_logger.print(f"[DEBUG][_apply_object_constraints] skipping invalid planar_quat for ramp {tk}: {pq}")
                     else:
-                        if self.debug_mode:
-                            self.debug_logger.print(f"[DEBUG][_apply_object_constraints] skipping invalid planar_quat for {tk}: {pq}")
+                        # boxes / free bodies: set z and quaternion in qpos
+                        self.data.qpos[qadr + 2] = st["planar_z"]
+                        if pq is not None and np.all(np.isfinite(pq)) and len(pq) >= 4:
+                            self.data.qpos[qadr + 3 : qadr + 7] = pq
+                        else:
+                            if self.debug_mode:
+                                self.debug_logger.print(f"[DEBUG][_apply_object_constraints] skipping invalid planar_quat for {tk}: {pq}")
                 except Exception:
                     if self.debug_mode:
                         self.debug_logger.print(f"[DEBUG][_apply_object_constraints] exception validating planar_quat for {tk}")
-                self.data.qvel[vadr + Z_VEL_IDX] = 0.0
-                self.data.qvel[vadr + ANG_VEL_START : vadr + ANG_VEL_STOP] = 0.0
+                # zero velocities for the vertical/rotational components
+                self.data.qvel[vadr : vadr + vel_size][Z_VEL_IDX] = 0.0
+                self.data.qvel[vadr : vadr + vel_size][ANG_VEL_START:ANG_VEL_STOP] = 0.0
         for tk, geom_ids in self.obj_geom_ids.items():
             mode = self.object_state[tk]["mode"]
             if mode == "locked":
@@ -1225,7 +1293,14 @@ class TeamCosEnv(gym.Env):
                             if self.debug_mode:
                                 self.debug_logger.print(f"[DEBUG][reset] invalid qpos adr for body {bid}: {adr}")
                             continue
-                        self.data.qpos[adr : adr + 7] = [p[0], p[1], z, 1, 0, 0, 0]
+                        # ランプは free から slide x/y + hinge z に変更したため
+                        # qpos の長さが異なる（3）点に注意する
+                        if bid in getattr(self, "ramp_ids", []):
+                            # slide x, slide y, hinge z
+                            self.data.qpos[adr : adr + 3] = [p[0], p[1], 0.0]
+                        else:
+                            # boxes 等は従来通り free joint (pos + quat)
+                            self.data.qpos[adr : adr + 7] = [p[0], p[1], z, 1, 0, 0, 0]
                         placed.append((p, rad))
                     except Exception:
                         if self.debug_mode:

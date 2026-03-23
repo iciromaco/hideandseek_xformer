@@ -204,7 +204,7 @@ class RuleBasedHider:
                 fwd, trn = 0.6 * self.escape_fwd_dir, 0.0
             else:
                 fwd, trn = 0.2 * self.escape_fwd_dir, 0.85 * self.escape_turn_dir
-        elif self.stuck_counter > 40 or front_min < 0.42:
+        elif self.stuck_counter > 20 or front_min < 0.42:
             self.reflex_timer, self.stuck_counter = 14, 0
             self.escape_fwd_dir = -1.0 if front_min < back_min else 1.0
             self.escape_turn_dir = 1.0 if l_gap >= r_gap else -1.0

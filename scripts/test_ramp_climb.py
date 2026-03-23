@@ -59,8 +59,18 @@ def main():
         qx = 0.0
         qy = math.sin(pitch / 2.0)
         qz = 0.0
-        env.data.qpos[qadr : qadr + 7] = [0.0, 0.0, 0.0, qw, qx, qy, qz]
+        # ramp now uses slide x/y + hinge z (qpos=[x,y,rot]), set position and leave rotation at 0
+        env.data.qpos[qadr : qadr + 3] = [0.0, 0.0, 0.0]
         mujoco.mj_forward(env.model, env.data)
+
+        # Lock the ramp from the start so it cannot translate while agent climbs
+        try:
+            env.object_state[rkey]["mode"] = "locked"
+            qadr_lock, _ = env._obj_addr(rkey)
+            env.object_state[rkey]["locked_pose"] = env.data.qpos[qadr_lock : qadr_lock + 3].copy()
+            print(f"Locked ramp {rkey} at qpos={env.object_state[rkey]['locked_pose']}")
+        except Exception:
+            pass
 
         # uphill direction
         up = env._ramp_uphill_dir(rid)
