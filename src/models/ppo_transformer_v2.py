@@ -115,7 +115,7 @@ class AgentV2(nn.Module):
 
         # 3. 行動分散の算出
         # 数値的安定性のために logstd をクランプ
-        logstd_clamped = torch.clamp(self.actor_logstd, -5.0, 2.0)
+        logstd_clamped = torch.clamp(self.actor_logstd, -3.0, 2.0)
         action_logstd_eval = logstd_clamped.expand_as(action_mean)
         action_std_eval = torch.exp(action_logstd_eval)
 
@@ -156,7 +156,7 @@ class AgentV2(nn.Module):
 
         action_mean = self.actor_mean(latent_eval)
 
-        logstd_clamped = torch.clamp(self.actor_logstd, -5.0, 2.0)
+        logstd_clamped = torch.clamp(self.actor_logstd, -3.0, 2.0)
         action_logstd_eval = logstd_clamped.expand_as(action_mean)
         action_std_eval = torch.exp(action_logstd_eval)
         probs = distributions.Normal(action_mean, action_std_eval)

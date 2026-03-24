@@ -177,9 +177,9 @@ class TeamCosEnv(gym.Env):
 
     AGENT_DAMPING_XY = 20  # 10 # 30.0
     AGENT_DAMPING_Z = 20  # 16.0
-    AGENT_DAMPING_ROT = 15
+    AGENT_DAMPING_ROT = 30
     AGENT_ACTUATOR_FWD = 2000  # 700
-    AGENT_ACTUATOR_TURN_GAIN = 200
+    AGENT_ACTUATOR_TURN_GAIN = 180
     AGENT_BOTTOM_MASS = 20.0
     AGENT_HEAD_MASS = 10.0
     AGENT_Z_MIN = -0.05
@@ -230,6 +230,7 @@ class TeamCosEnv(gym.Env):
         debug_mode=False,
         debug_console=True,
         action_repeat=16,
+        learnable_turn_scale=1.0,
     ):
         super().__init__()
         self.n_seekers = int(n_seekers)
@@ -248,12 +249,16 @@ class TeamCosEnv(gym.Env):
         self._debug_mode = bool(debug_mode)
         self.debug_logger = DebugLogger(enabled=self._debug_mode, console=bool(debug_console), log_interval_steps=dbg_log_interval_steps)
         self.action_repeat = action_repeat
+        # multiplier applied to the learnable agent's turn channel (runtime-only)
+        self.learnable_turn_scale = float(learnable_turn_scale)
         # preserve flags passed for backward compatibility / debugging
         self.policy_source_log = bool(policy_source_log)
         self.policy_src_log_each_reset = bool(policy_src_log_each_reset)
         # temporal caches for visibility / being-hit freshness
         self._prev_vis = {}
         self._prev_being_hit = {}
+        # render disabled flag (set if passive viewer cannot be launched on macOS)
+        self._render_disabled = False
         # counters for persisting BEING_HIT in observations
         self.being_hit_persist = 3
         self._being_hit_counters = {}
@@ -1551,11 +1556,13 @@ class TeamCosEnv(gym.Env):
                 f_env = float(f)
 
             applied_forward_env = f_env
+            # Turn channel: no env-side scaling — let学習で回転を学ばせる
+            t_env = float(t)
             cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = (
                 f_env,
-                t,
+                t_env,
             )
-            self.last_debug_ctrl[ak] = (f_env, t)
+            self.last_debug_ctrl[ak] = (f_env, t_env)
 
         self.data.ctrl[:] = cv
         # --- capture pre-physics visibility / being-hit state (used as 'previous' freshness) ---
@@ -2085,8 +2092,18 @@ class TeamCosEnv(gym.Env):
         return o
 
     def render(self):  # noqa: C901
+        if getattr(self, "_render_disabled", False):
+            return
+
         if self.viewer is None:
-            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            try:
+                self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            except RuntimeError as e:
+                # On macOS `launch_passive` requires running under mjpython;
+                # avoid raising repeatedly and disable rendering for this process.
+                logger.warning("mujoco.viewer.launch_passive failed: %s; disabling rendering for this process. Run under mjpython on macOS to enable passive viewer.", e)
+                self._render_disabled = True
+                return
             with self.viewer.lock():
                 self.viewer.cam.lookat[:] = [0, 0, 0.8]
                 self.viewer.cam.distance = 18.0

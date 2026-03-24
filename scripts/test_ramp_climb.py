@@ -281,6 +281,49 @@ def main():
                             pass
                 except Exception:
                     pass
+                # --- per-step trace: action, obs, yaw_rate, qpos/qvel, cfrc_ext ---
+                try:
+                    iso = datetime.datetime.utcnow().isoformat()
+                    try:
+                        act_str = np.array2string(action, precision=3)
+                    except Exception:
+                        act_str = repr(action)
+                    try:
+                        obs_str = np.array2string(obs, precision=3)
+                    except Exception:
+                        obs_str = repr(obs)
+                    # qpos snapshot for agent (x,y,z,rot)
+                    try:
+                        qpos_agent = tuple(env.data.qpos[adr_x : adr_x + 4])
+                    except Exception:
+                        qpos_agent = None
+                    # try to read a few qvel entries (x,y,rot) via joint dof addresses
+                    qvel_map = {}
+                    try:
+                        jid_x = env.model.joint_name2id(f"{ak}_x")
+                        dad_x = int(env.model.jnt_dofadr[jid_x])
+                        qvel_map["x"] = float(env.data.qvel[dad_x])
+                    except Exception:
+                        qvel_map["x"] = None
+                    try:
+                        jid_y = env.model.joint_name2id(f"{ak}_y")
+                        dad_y = int(env.model.jnt_dofadr[jid_y])
+                        qvel_map["y"] = float(env.data.qvel[dad_y])
+                    except Exception:
+                        qvel_map["y"] = None
+                    try:
+                        jid_r = env.model.joint_name2id(f"{ak}_rot")
+                        dad_r = int(env.model.jnt_dofadr[jid_r])
+                        qvel_map["rot"] = float(env.data.qvel[dad_r])
+                    except Exception:
+                        qvel_map["rot"] = None
+                    try:
+                        cfrc_agent = tuple(env.data.cfrc_ext[agent_bid])
+                    except Exception:
+                        cfrc_agent = None
+                    contact_log.write(f"{iso} STEP={step} TRACE action={act_str} obs={obs_str} qpos_agent={qpos_agent} qvel_map={qvel_map} cfrc_ext={cfrc_agent}\n")
+                except Exception:
+                    pass
             prev_boost = boost
 
             # render to the viewer (if available) so we can observe behavior live

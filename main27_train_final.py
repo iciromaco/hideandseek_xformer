@@ -330,7 +330,7 @@ RW_IDLE_PENALTY = _cfg("rw_idle_penalty", "0.03", float, RUNTIME_OVERRIDES)  # �
 RW_TURN_INCENTIVE = _cfg("rw_turn_incentive", "0.01", float, RUNTIME_OVERRIDES)  # 敵が見えていない時の回転インセンティブ（デフォルト0）
 RW_WALL_AVOID_PENALTY = _cfg("rw_wall_avoid_penalty", "0.15", float, RUNTIME_OVERRIDES)  # 壁回避ペナルティ（全エージェント共通、壁に近いほどペナルティ大）
 
-RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.15", float, RUNTIME_OVERRIDES)  # 壁に張り付いていると判断された場合のペナルティ（全エージェント共通）
+RW_WALL_STICK_PENALTY = _cfg("rw_wall_stick_penalty", "0.25", float, RUNTIME_OVERRIDES)  # 壁に張り付いていると判断された場合のペナルティ（全エージェント共通）
 RW_HIDE_VISIBLE_NEAR_PENALTY = _cfg("rw_hide_visible_near_penalty", "0.05", float, RUNTIME_OVERRIDES)  # HiderがSeekerに近くて見えている場合のペナルティ（Hider専用、距離が近いほどペナルティ大）
 
 RW_HIDE_SEEKER_GAZE_PENALTY = _cfg(
@@ -1272,6 +1272,10 @@ def run_train_vector(
     lr_init = float(hp.get("learning_rate", 3e-4))
     lr_final = float(hp.get("learning_rate_final", lr_init * 0.5))
     lr_schedule = str(hp.get("learning_rate_schedule", "linear"))
+    # action penalty (policy-side) to discourage large turn outputs (default 0.0 = disabled)
+    # NOTE: disabled by default to avoid changing policy loss definition; enable explicitly in hp if desired
+    action_penalty_coef = float(hp.get("action_penalty_coef", 0.0))
+    action_penalty_coef = 0.0
 
     try:
         wall_distance_buffer = []
@@ -1522,6 +1526,16 @@ def run_train_vector(
                     v_loss = 0.5 * ((new_value.view(-1) - b_ret[mb_idx]) ** 2).mean()
                     ent_loss = entropy.mean()
                     loss = pg_loss + hp["vf_coef"] * v_loss - hp["ent_coef"] * ent_loss
+                    # policy-side penalty on predicted turn magnitude (deterministic mean)
+                    if action_penalty_coef and action_penalty_coef > 0.0:
+                        try:
+                            action_mean, _, _, _ = agent.get_deterministic_action_and_value(b_obs[mb_idx])
+                            # action_mean shape: (batch, act_dim)
+                            turn_mean = action_mean[:, 1]
+                            action_penalty = action_penalty_coef * (turn_mean * turn_mean).mean()
+                            loss = loss + action_penalty
+                        except Exception:
+                            pass
                     entropy_sum += float(ent_loss.detach().cpu().item())
                     entropy_count += 1
 
@@ -1556,6 +1570,22 @@ def run_train_vector(
                 # last_ramp_eval = ramp_eval  # 未使用のため削除
 
             if wandb_run is not None:
+                # diagnostic: average actor std and average turn magnitude over recent rollout
+                try:
+                    actor_std_mean = float(torch.exp(agent.actor_logstd).mean().detach().cpu().item())
+                except Exception:
+                    try:
+                        actor_std_mean = float(torch.exp(agent.module.actor_logstd).mean().detach().cpu().item())
+                    except Exception:
+                        actor_std_mean = 0.0
+                try:
+                    avg_turn = float(torch.mean(torch.abs(rollout_actions[:, :, 1])).detach().cpu().item())
+                except Exception:
+                    try:
+                        avg_turn = float(np.mean(np.abs(rollout_actions[:, :, 1].cpu().numpy())))
+                    except Exception:
+                        avg_turn = 0.0
+
                 payload = {
                     "global_step": global_step,
                     "train/update": update,
@@ -1563,6 +1593,8 @@ def run_train_vector(
                     "train/hide_rate": hide_rate,
                     "train/avg_reward": avg_reward,
                     "train/entropy": avg_entropy,
+                    "train/actor_std_mean": actor_std_mean,
+                    "train/avg_turn": avg_turn,
                     "train/learnable_seen_rate": learnable_seen_rate,
                     "train/wall_stick_ratio": wall_stick_ratio,
                     "train/wall_stick_seen_ratio": wall_stick_seen_ratio,

@@ -25,16 +25,22 @@ use_custom_reward = true
 # 前進飽和抑制（常時前進ボーナスは使わない）
 rw_move_sat_penalty = 0.02
 # 壁張り付き対策（全エージェント共通）
-rw_wall_stick_penalty = 0.15
+# 壁に張り付く（スタック）を抑制するため罰則を増やす（実験用）
+rw_wall_stick_penalty = 0.40
 agent_head_clearance = 0.2  # 壁近判定閾値（全エージェント共通）
 wall_near_margin = 0.4  # 壁近マージン（エージェント表面からの近接閾値）
 rw_still_speed_threshold = 0.1  # 静止判定速度閾値（全エージェント共通）
 rw_hide_visible_near_penalty = 0.05
 rw_hide_seeker_gaze_penalty = 0.03
 rw_seek_gaze_reward = 0.03
-# 敵が見えていないときの回転インセンティブ（小さな正の値を設定）
-rw_turn_incentive = 0.01
-rw_wall_avoid_penalty = 0.15
+# 敵が見えていないときの回転インセンティブ（まずは誘引を無効化）
+rw_turn_incentive = 0.0
+# 回転行動の飽和ペナルティ（過剰回転を抑えるため軽めに増加）
+rw_turn_sat_penalty = 0.05
+## 小さな回転ボーナス: 適度な回転を学習で促す（過度な回転は既存のsat_penaltyで抑制）
+rw_turn_bonus = 0.01
+## 壁回避の罰則も強める（実験用）
+rw_wall_avoid_penalty = 0.30
 ramp_check_enabled = false
 ramp_check_viewer = false
 ramp_check_force_uphill = false
@@ -136,9 +142,8 @@ use_custom_reward = true
 npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 100_000_000
-wandb_run_name = "wall_only_confirm_100K"
+wandb_run_name = "wall_only_confirm_1M"
 # rw_move_sat_penalty = 0.02
-
 # w_wall_avoid_penalty = 0.0
 # rw_wall_stick_penalty = 0.15 # 壁張り付き対策（全エージェント共通）
 # rw_wall_near_threshold = 0.4  # 壁近判定閾値（全エージェント共通）
@@ -169,7 +174,7 @@ clip_coef = 0.20
 # Value loss 係数
 vf_coef = 0.5
 # Entropy 係数（探索強度）
-ent_coef = 0.001
+ent_coef = 0.003
 # --- スケジューリング設定 ---
 ent_coef_schedule = "linear"
 ent_coef_final = 0.0001
