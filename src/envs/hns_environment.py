@@ -223,6 +223,15 @@ class TeamCosEnv(gym.Env):
     WALL_REPULSION_ALPHA = 0.3
     # maximum repulsion force (N)
     WALL_REPULSION_FMAX = 800.0
+    # --- Runtime defaults for smoothing/scaling/clamping (recommended safe defaults) ---
+    # Global multiplier applied to the estimate-based repulsion (0 = disable)
+    WALL_REPULSION_CTRL_SCALE = 0.05
+    # EMA low-pass coefficient applied to the repulsion estimate (0..1)
+    WALL_REPULSION_CTRL_LP = 0.2
+    # Optional explicit upper clip on smoothed ctrl (None disables)
+    WALL_REPULSION_CTRL_CLIP = 50.0
+    # Optional per-step accumulated force clamp applied before writing data.xfrc_applied
+    WALL_REPULSION_ACCUM_CLAMP_MAX = 100.0
     # world-z above which ramp-based repulsion suppression is considered
     WALL_REPULSION_SUPPRESS_Z = 0.5 + 0.2  # z margin below which suppression is applied even if not currently climbing
 
@@ -1809,6 +1818,13 @@ class TeamCosEnv(gym.Env):
                     f_rep_scaled = f_rep * ctrl_scale
                     # low-pass (EMA) smoothing to avoid step jumps
                     f_rep_sm = prev_rep * (1.0 - ctrl_lp) + f_rep_scaled * ctrl_lp
+                    # optional explicit clip on the smoothed ctrl (runtime override)
+                    try:
+                        ctrl_clip = getattr(self, "WALL_REPULSION_CTRL_CLIP", None)
+                        if ctrl_clip is not None:
+                            f_rep_sm = min(float(ctrl_clip), float(f_rep_sm))
+                    except Exception:
+                        pass
                     # write back smoothed value for next step
                     self._prev_wall_rep[self.learnable_agent_key] = float(f_rep_sm)
                     ctrl_fx = f_rep_sm * float(nx)
@@ -1824,10 +1840,24 @@ class TeamCosEnv(gym.Env):
                 fx_tot = fb_fx + ctrl_fx
                 fy_tot = fb_fy + ctrl_fy
                 f_tot = math.hypot(fx_tot, fy_tot)
-                if f_tot > f_max and f_tot > 0.0:
-                    scale = f_max / f_tot
-                    fx_tot *= scale
-                    fy_tot *= scale
+                # optional per-step accumulation clamp (runtime override)
+                try:
+                    accum_max = getattr(self, "WALL_REPULSION_ACCUM_CLAMP_MAX", None)
+                    if accum_max is not None:
+                        if f_tot > float(accum_max) and f_tot > 0.0:
+                            scale = float(accum_max) / f_tot
+                            fx_tot *= scale
+                            fy_tot *= scale
+                    else:
+                        if f_tot > f_max and f_tot > 0.0:
+                            scale = f_max / f_tot
+                            fx_tot *= scale
+                            fy_tot *= scale
+                except Exception:
+                    if f_tot > f_max and f_tot > 0.0:
+                        scale = f_max / f_tot
+                        fx_tot *= scale
+                        fy_tot *= scale
 
                 bid = int(learnable_agent_body_id)
                 # data.xfrc_applied stores [Fx,Fy,Fz, Mx,My,Mz]
