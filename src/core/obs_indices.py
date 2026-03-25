@@ -83,4 +83,11 @@ class ObsIdx:
             self.OTHERS.append(AgentSchema(cursor))
             cursor += 8
 
+        # Wall / proximity schema: (3) [dist_norm, norm_x_local, norm_y_local]
+        self.WALL_SLICE = slice(cursor, cursor + 3)
+        self.WALL_DIST = cursor + 0
+        self.WALL_NORM_X = cursor + 1
+        self.WALL_NORM_Y = cursor + 2
+        cursor += 3
+
         self.total_dim = cursor

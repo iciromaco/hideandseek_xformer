@@ -132,7 +132,25 @@ class RuleBasedSeeker:
                 target_angle = math.atan2(self.last_known_rel_pos_y, self.last_known_rel_pos_x)
                 fwd = 0.55 * max(0.1, math.cos(target_angle)) * speed_scale
             else:
-                self.wander_timer -= 1
+                # wall-follow heuristic for seekers: prefer sliding along wall when close
+                try:
+                    wall_dist = float(obs[idx.WALL_DIST])
+                    nx_loc = float(obs[idx.WALL_NORM_X])
+                    ny_loc = float(obs[idx.WALL_NORM_Y])
+                except Exception:
+                    wall_dist = 1.0
+                    nx_loc = 0.0
+                    ny_loc = 0.0
+                if wall_dist < 0.9 and (abs(nx_loc) > 1e-6 or abs(ny_loc) > 1e-6):
+                    tx, ty = -ny_loc, nx_loc
+                    if tx < 0:
+                        tx, ty = -tx, -ty
+                    desired_angle = math.atan2(ty, tx)
+                    fwd = max(fwd, 0.35 * speed_scale)
+                    trn = np.clip(desired_angle * 2.2, -0.9, 0.9)
+                    target_angle = None
+                else:
+                    self.wander_timer -= 1
                 if avoid_w > 0.5:
                     self.wander_timer = 0
                 if self.wander_timer <= 0:
@@ -144,7 +162,11 @@ class RuleBasedSeeker:
                 target_angle = (self.wander_angle - cur_rot + np.pi) % (2 * np.pi) - np.pi
                 fwd = 0.45 * speed_scale
 
-            trn = np.clip(target_angle * 2.8 + avoid_torque * avoid_w, -0.9, 0.9)
+            if target_angle is not None:
+                trn = np.clip(target_angle * 2.8 + avoid_torque * avoid_w, -0.9, 0.9)
+            else:
+                # target_angle None indicates wall-follow branch already set trn
+                trn = np.clip(trn + avoid_torque * avoid_w, -0.9, 0.9)
 
         chase_priority = len(visible_enemies) > 0
         lck, grb, self.interact_cooldown, self.interact_focus_steps = _interaction_buttons(
@@ -225,17 +247,33 @@ class RuleBasedHider:
                 else:
                     fwd = 0.8 * fwd_val * speed_scale
             else:  # 非可視時はランダムに徘徊
-                self.wander_timer -= 1
-                if avoid_w > 0.5:
-                    self.wander_timer = 0
-                if self.wander_timer <= 0:
-                    if l_gap > r_gap:
-                        self.wander_angle = cur_rot + np.random.uniform(0.3, np.pi)
-                    else:
-                        self.wander_angle = cur_rot + np.random.uniform(-np.pi, -0.3)
-                    self.wander_timer = np.random.randint(200, 500)
-                target_angle = (self.wander_angle - cur_rot + np.pi) % (2 * np.pi) - np.pi
-                fwd = 0.45 * speed_scale
+                # wall-follow: prefer sliding along wall when close
+                try:
+                    wall_dist = float(obs[idx.WALL_DIST])
+                    nx_loc = float(obs[idx.WALL_NORM_X])
+                    ny_loc = float(obs[idx.WALL_NORM_Y])
+                except Exception:
+                    wall_dist = 1.0
+                    nx_loc = 0.0
+                    ny_loc = 0.0
+                if wall_dist < 0.85 and (abs(nx_loc) > 1e-6 or abs(ny_loc) > 1e-6):
+                    tx, ty = -ny_loc, nx_loc
+                    if tx < 0:
+                        tx, ty = -tx, -ty
+                    target_angle = math.atan2(ty, tx)
+                    fwd = 0.5 * speed_scale
+                else:
+                    self.wander_timer -= 1
+                    if avoid_w > 0.5:
+                        self.wander_timer = 0
+                    if self.wander_timer <= 0:
+                        if l_gap > r_gap:
+                            self.wander_angle = cur_rot + np.random.uniform(0.3, np.pi)
+                        else:
+                            self.wander_angle = cur_rot + np.random.uniform(-np.pi, -0.3)
+                        self.wander_timer = np.random.randint(200, 500)
+                    target_angle = (self.wander_angle - cur_rot + math.pi) % (2 * math.pi) - math.pi
+                    fwd = 0.45 * speed_scale
 
             trn = np.clip(target_angle * 2.8 + avoid_torque * avoid_w, -0.9, 0.9)
 
