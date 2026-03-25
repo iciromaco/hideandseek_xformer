@@ -175,10 +175,10 @@ class TeamCosEnv(gym.Env):
     R_BOX = 0.95
     R_RAMP = 1.30
 
-    AGENT_DAMPING_XY = 20  # 10 # 30.0
+    AGENT_DAMPING_XY = 25  # 10 # 30.0
     AGENT_DAMPING_Z = 20  # 16.0
-    AGENT_DAMPING_ROT = 30
-    AGENT_ACTUATOR_FWD = 2000  # 700
+    AGENT_DAMPING_ROT = 20
+    AGENT_ACTUATOR_FWD = 1800  # 700
     AGENT_ACTUATOR_TURN_GAIN = 180
     AGENT_BOTTOM_MASS = 20.0
     AGENT_HEAD_MASS = 10.0
@@ -211,6 +211,13 @@ class TeamCosEnv(gym.Env):
     # or -1.0 to flip the forward direction at apply-time. Keeping this as a
     # tunable class attribute avoids editing code logic elsewhere.
     INFERENCE_FORWARD_SIGN = 1.0
+    # --- Wall repulsion parameters ---
+    # radius within which repulsion is applied (meters)
+    WALL_REPULSION_RADIUS = 0.6
+    # scaling factor for repulsion relative to estimated agent forward force
+    WALL_REPULSION_ALPHA = 1.0
+    # maximum repulsion force (N)
+    WALL_REPULSION_FMAX = 1500.0
 
     def __init__(
         self,
@@ -470,10 +477,18 @@ class TeamCosEnv(gym.Env):
     <geom name="wall_s" type="box" size="{s + 0.15} 0.1 2.0" pos="0 -6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
     <geom name="wall_e" type="box" size="0.1 {s} 2.0" pos="6.1 0 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
     <geom name="wall_w" type="box" size="0.1 {s} 2.0" pos="-6.1 0 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
-    <geom name="maze_w0" type="box" size="1.5 0.2 0.5" pos="3.0 1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
-    <geom name="maze_w1" type="box" size="1.5 0.2 0.5" pos="-3.0 -1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
-    <geom name="maze_w2" type="box" size="0.2 1.5 0.5" pos="0.0 -3.0 0.5" rgba="0 0.7 0.7 1" {attr}/>
-    <geom name="maze_w3" type="box" size="0.2 1.5 0.5" pos="0.0 3.0 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_w0" type="box" size="1.4 0.2 0.5" pos="3.0 1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_w1" type="box" size="1.4 0.2 0.5" pos="-3.0 -1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_w2" type="box" size="0.2 1.4 0.5" pos="0.0 -3.0 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_w3" type="box" size="0.2 1.4 0.5" pos="0.0 3.0 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_corner0" type="cylinder" size="0.2 0.5" pos="1.6 1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_corner1" type="cylinder" size="0.2 0.5" pos="4.4 1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_corner2" type="cylinder" size="0.2 0.5" pos="-4.4 -1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_corner3" type="cylinder" size="0.2 0.5" pos="-1.6 -1.5 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_corner4" type="cylinder" size="0.2 0.5" pos="0 -4.4 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_corner5" type="cylinder" size="0.2 0.5" pos="0 -1.6 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_corner6" type="cylinder" size="0.2 0.5" pos="0 1.6 0.5" rgba="0 0.7 0.7 1" {attr}/>
+    <geom name="maze_corner7" type="cylinder" size="0.2 0.5" pos="0 4.4 0.5" rgba="0 0.7 0.7 1" {attr}/>
 """
 
     def _xml_ramp(self, i, xy, rot):
@@ -1685,6 +1700,34 @@ class TeamCosEnv(gym.Env):
         last_ctrl = self.last_debug_ctrl.get(self.learnable_agent_key, (0.0, 0.0))
         last_ctrl_f = float(last_ctrl[0])
         last_ctrl_t = float(last_ctrl[1])
+        # Apply wall repulsion proportional to agent's current forward effort
+        try:
+            dist, nx, ny = self.vis_engine.sample_sdf_with_normal(learnable_agent_pos[0], learnable_agent_pos[1])
+            r = float(self.WALL_REPULSION_RADIUS)
+            if dist < r and (abs(last_ctrl_f) > 1e-6):
+                # estimate agent forward force from control magnitude
+                f_agent_est = abs(last_ctrl_f) * float(self.AGENT_ACTUATOR_FWD)
+                s = (r - dist) / r
+                f_rep = min(float(self.WALL_REPULSION_ALPHA) * f_agent_est * s, float(self.WALL_REPULSION_FMAX))
+                fx = f_rep * float(nx)
+                fy = f_rep * float(ny)
+                bid = int(learnable_agent_body_id)
+                # data.xfrc_applied stores [Fx,Fy,Fz, Mx,My,Mz]
+                try:
+                    self.data.xfrc_applied[bid, 0] += fx
+                    self.data.xfrc_applied[bid, 1] += fy
+                except Exception:
+                    # best-effort: ignore if structure differs
+                    pass
+                if self.debug_mode:
+                    self.debug_logger.print_throttled(
+                        "wall_repulsion",
+                        f"repulse: agent={self.learnable_agent_key} dist={dist:.3f} f_rep={f_rep:.1f} nx={nx:.3f} ny={ny:.3f}",
+                        self.current_step,
+                    )
+        except Exception:
+            pass
+
         obs = self._normalize_obs(self._get_obs(idx_to_obs))
         reward = float(rb if self.target == "hider" else -rb)
         done = self.current_step >= self.max_episode_steps
@@ -1918,7 +1961,7 @@ class TeamCosEnv(gym.Env):
                     gaze_cos_front_max = max(gaze_cos_front_max, frontness)
                     gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, capture_reward)
 
-            total_hider_reward += h_reward
+            total_hider_reward -= h_reward  # += h_reward
 
         return (
             total_hider_reward / len(self.hider_keys),

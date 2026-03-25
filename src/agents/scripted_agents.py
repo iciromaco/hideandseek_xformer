@@ -198,18 +198,18 @@ class RuleBasedHider:
         seeker_vis = obs[idx.OTHERS[0].VISIBLE] > 0.5
         fwd, trn, lck, grb = 0.0, 0.0, 0.0, 0.0
 
-        if self.reflex_timer > 0:
-            self.reflex_timer -= 1
+        if self.reflex_timer > 0:  # スタック回避のための緊急後退行動
+            self.reflex_timer -= 1  # タイマーが0になるまで回転を固定して後退を続ける。タイマーの長さは状況に応じて変化させる。
             if self.reflex_timer > 8:
                 fwd, trn = 0.6 * self.escape_fwd_dir, 0.0
             else:
                 fwd, trn = 0.2 * self.escape_fwd_dir, 0.85 * self.escape_turn_dir
-        elif self.stuck_counter > 20 or front_min < 0.42:
-            self.reflex_timer, self.stuck_counter = 14, 0
+        elif self.stuck_counter > 5 or front_min < 0.45:
+            self.reflex_timer, self.stuck_counter = 10, 0
             self.escape_fwd_dir = -1.0 if front_min < back_min else 1.0
             self.escape_turn_dir = 1.0 if l_gap >= r_gap else -1.0
-        else:
-            if seeker_vis:
+        else:  # 通常行動
+            if seeker_vis:  # 追跡されている場合はシーカーから逃げる
                 tx, ty = (
                     obs[idx.OTHERS[0].REL_X] * p_scale,
                     obs[idx.OTHERS[0].REL_Y] * p_scale,
@@ -224,7 +224,7 @@ class RuleBasedHider:
                     fwd = 0.0
                 else:
                     fwd = 0.8 * fwd_val * speed_scale
-            else:
+            else:  # 非可視時はランダムに徘徊
                 self.wander_timer -= 1
                 if avoid_w > 0.5:
                     self.wander_timer = 0

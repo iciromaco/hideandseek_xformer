@@ -318,7 +318,7 @@ RESET_MODEL_ON_TRAIN = _cfg(
 HPARAMS_CONFIG_PATH = CONFIG_PATH  # ハイパーパラメータの設定ファイルパス（学習再開時に前回と同じハイパーパラメータで再開するために使用）
 
 # 報酬形成係数
-RW_SEEK_VISIBLE_BONUS = _cfg("rw_seek_visible_bonus", "0.03", float, RUNTIME_OVERRIDES)  # SeekerがHiderを視界に捉えている場合の報酬（Seeker専用、視界に入っているほど報酬大）
+RW_SEEK_VISIBLE_BONUS = _cfg("rw_seek_visible_bonus", "0.05", float, RUNTIME_OVERRIDES)  # SeekerがHiderを視界に捉えている場合の報酬（Seeker専用、視界に入っているほど報酬大）
 RW_STILL_SPEED_THRESHOLD = _cfg("rw_still_speed_threshold", "0.1", float, RUNTIME_OVERRIDES)  # 静止判定速度閾値（全エージェント共通）
 
 RW_MOVE_SAT_PENALTY = _cfg("rw_move_sat_penalty", "0.02", float, RUNTIME_OVERRIDES)  # 移動行動の飽和ペナルティ（全エージェント共通、速度の絶対値が閾値を超えるとペナルティ発生）
