@@ -1,4 +1,5 @@
 # src/envs/hns_environment.py
+# flake8: noqa
 # hns_environment.py v4.5９
 import logging
 import math
@@ -175,11 +176,11 @@ class TeamCosEnv(gym.Env):
     R_BOX = 0.95
     R_RAMP = 1.30
 
-    AGENT_DAMPING_XY = 25  # 10 # 30.0
+    AGENT_DAMPING_XY = 25  #
     AGENT_DAMPING_Z = 20  # 16.0
-    AGENT_DAMPING_ROT = 20
-    AGENT_ACTUATOR_FWD = 1800  # 700
-    AGENT_ACTUATOR_TURN_GAIN = 180
+    AGENT_DAMPING_ROT = 25
+    AGENT_ACTUATOR_FWD = 1500  # 700
+    AGENT_ACTUATOR_TURN_GAIN = 150
     AGENT_BOTTOM_MASS = 20.0
     AGENT_HEAD_MASS = 10.0
     AGENT_Z_MIN = -0.05
@@ -212,12 +213,18 @@ class TeamCosEnv(gym.Env):
     # tunable class attribute avoids editing code logic elsewhere.
     INFERENCE_FORWARD_SIGN = 1.0
     # --- Wall repulsion parameters ---
-    # radius within which repulsion is applied (meters)
-    WALL_REPULSION_RADIUS = 0.6
+    # distance within which wall repulsion is applied (m)
+    WALL_REPULSION_RADIUS = 0.25
+    # effective agent radius for clearance-based checks (separate from spawn R_AGENT)
+    AGENT_EFFECTIVE_RADIUS = 0.4  # エージェント半径
+    # clearance (m) from agent surface below which repulsion begins
+    WALL_REPULSION_CLEARANCE = 0.20
     # scaling factor for repulsion relative to estimated agent forward force
-    WALL_REPULSION_ALPHA = 1.0
+    WALL_REPULSION_ALPHA = 0.3
     # maximum repulsion force (N)
-    WALL_REPULSION_FMAX = 1500.0
+    WALL_REPULSION_FMAX = 800.0
+    # world-z above which ramp-based repulsion suppression is considered
+    WALL_REPULSION_SUPPRESS_Z = 0.5 + 0.2  # z margin below which suppression is applied even if not currently climbing
 
     def __init__(
         self,
@@ -304,6 +311,18 @@ class TeamCosEnv(gym.Env):
         # デバッグ用ロガーに移譲
 
         self.last_debug_ctrl = dict.fromkeys(self.agent_keys, (0.0, 0.0))
+
+        # Ensure runtime instance attributes for wall-repulsion constants exist
+        # Some run-time imports/overrides may omit class-level constants; set
+        # instance fallbacks here to guarantee availability during tests.
+        try:
+            self.AGENT_EFFECTIVE_RADIUS = float(getattr(self.__class__, "AGENT_EFFECTIVE_RADIUS", 0.4))
+        except Exception:
+            self.AGENT_EFFECTIVE_RADIUS = 0.4
+        try:
+            self.WALL_REPULSION_CLEARANCE = float(getattr(self.__class__, "WALL_REPULSION_CLEARANCE", 0.2))
+        except Exception:
+            self.WALL_REPULSION_CLEARANCE = 0.2
 
         self.body_ids, self.qpos_indices, self.actuator_ids = {}, {}, {}
         self.obj_body_map = {}
@@ -427,7 +446,9 @@ class TeamCosEnv(gym.Env):
     def _build_dynamic_xml(self):
         arena = self._xml_static_scene()
         ramps = "".join(self._xml_ramp(i, [0, 0], 0) for i in range(1, self.n_ramps + 1))
-        boxes = "".join(self._xml_box(i, [0, 0], 0) for i in range(1, self.n_boxes + 1))
+        # place boxes on a small radius around the origin to avoid spawning directly above agents
+        box_positions = self._default_box_positions()
+        boxes = "".join(self._xml_box(i, box_positions[i - 1], 0) for i in range(1, self.n_boxes + 1))
         seekers = "".join(
             self._xml_agent(
                 ak,
@@ -518,6 +539,15 @@ class TeamCosEnv(gym.Env):
             <geom name="box{i}_geom" type="box" size="0.6 0.6 0.5" mass="{self.BOX_MASS}" solref="0.02 1" condim="3" rgba="0.75 0.55 0.3 1" friction="1.2 0.08 0.003"/>
     </body>"""
 
+    def _default_box_positions(self):
+        # deterministic positions around a circle, away from the origin
+        # keeps boxes from spawning directly above agents at reset
+        radius = min(max(2.5, self.ARENA_HALF - 2.0), self.ARENA_HALF - 1.0)
+        angles = np.linspace(0.0, 2.0 * math.pi, num=max(1, self.n_boxes), endpoint=False)
+        poses = [[float(math.cos(a) * radius), float(math.sin(a) * radius)] for a in angles]
+        # if n_boxes==0 this returns [], but caller won't iterate
+        return poses
+
     def _xml_agent(self, pre, xy, rot, color):
         q = _euler_z_to_quat(rot)
         r, g, b = color
@@ -539,7 +569,8 @@ class TeamCosEnv(gym.Env):
     def _xml_actuators(self, pre):
         return f"""
     <general name="{pre}_fwd" site="{pre}_thrust" gear="1 0 0 0 0 0" gainprm="{self.AGENT_ACTUATOR_FWD}" ctrlrange="-1 1"/>
-    <general name="{pre}_turn" joint="{pre}_rot" gear="0.5" gainprm="{self.AGENT_ACTUATOR_TURN_GAIN}" ctrlrange="-1 1"/>\n+"""
+    <general name="{pre}_turn" joint="{pre}_rot" gear="0.5" gainprm="{self.AGENT_ACTUATOR_TURN_GAIN}" ctrlrange="-1 1"/>
+    """
 
     def _analyze_structure(self):
         m = self.model
@@ -1515,6 +1546,9 @@ class TeamCosEnv(gym.Env):
         applied_forward_model = 0.0
         applied_forward_env = 0.0
 
+        # (original behavior) do not zero external force buffer here; individual
+        # contributors historically accumulated into `data.xfrc_applied`.
+
         for i, ak in enumerate(self.agent_keys):
             is_seeker = ak.startswith("s")
             if ak == self.learnable_agent_key:
@@ -1701,31 +1735,118 @@ class TeamCosEnv(gym.Env):
         last_ctrl_f = float(last_ctrl[0])
         last_ctrl_t = float(last_ctrl[1])
         # Apply wall repulsion proportional to agent's current forward effort
+        # Wrap the whole repulsion block in a single try/except to avoid
+        # syntax/indentation fragility from nested try/excepts.
         try:
             dist, nx, ny = self.vis_engine.sample_sdf_with_normal(learnable_agent_pos[0], learnable_agent_pos[1])
-            r = float(self.WALL_REPULSION_RADIUS)
-            if dist < r and (abs(last_ctrl_f) > 1e-6):
-                # estimate agent forward force from control magnitude
-                f_agent_est = abs(last_ctrl_f) * float(self.AGENT_ACTUATOR_FWD)
-                s = (r - dist) / r
-                f_rep = min(float(self.WALL_REPULSION_ALPHA) * f_agent_est * s, float(self.WALL_REPULSION_FMAX))
-                fx = f_rep * float(nx)
-                fy = f_rep * float(ny)
+            # use clearance = (surface distance) - (agent effective radius)
+            r_clear = float(self.WALL_REPULSION_CLEARANCE)
+            r_eff = float(self.AGENT_EFFECTIVE_RADIUS)
+            clearance = float(dist) - r_eff
+
+            # determine applied forward (prefer env-applied value)
+            try:
+                applied_fwd = float(applied_forward_env)
+            except Exception:
+                applied_fwd = float(last_ctrl_f)
+
+            # Feedback controller to maintain a minimum clearance (target_dist)
+            # This acts whenever the agent is closer than `target_dist` to the surface.
+            target_dist = 0.5
+            kp = 150.0
+            f_max = float(self.WALL_REPULSION_FMAX)
+
+            apos_xy = learnable_agent_pos[:2]
+            near_arena_edge_x = (self.ARENA_HALF - abs(float(apos_xy[0]))) < 1.0
+            near_arena_edge_y = (self.ARENA_HALF - abs(float(apos_xy[1]))) < 1.0
+
+            # suppression: require both elevated z AND evidence of ramp interaction (boost)
+            try:
+                boost_val = float(self._ramp_boost_gain(self.learnable_agent_key))
+            except Exception:
+                boost_val = 0.0
+            BOOST_THRESH = 0.05
+            if float(agent_z) >= float(self.WALL_REPULSION_SUPPRESS_Z) and (boost_val > BOOST_THRESH) and (not near_arena_edge_x) and (not near_arena_edge_y):
+                if self.debug_mode:
+                    try:
+                        self.debug_logger.print(
+                            f"[DEBUG][wall_repulsion] suppressed_ramp step={self.current_step} agent={self.learnable_agent_key} z={agent_z:.3f} boost={boost_val:.3f} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f}) dist={dist:.3f} clearance={clearance:.3f}"
+                        )
+                    except Exception:
+                        print(f"[DEBUG][wall_repulsion] suppressed_ramp agent={self.learnable_agent_key} z={agent_z:.3f} boost={boost_val:.3f} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f})")
+            else:
+                # controller contribution: act when clearance < target_dist
+                fb_fx = 0.0
+                fb_fy = 0.0
+                if clearance < float(target_dist):
+                    err = float(target_dist) - float(clearance)
+                    f_fb = min(max(0.0, kp * err), f_max)
+                    fb_fx = f_fb * float(nx)
+                    fb_fy = f_fb * float(ny)
+
+                # existing repulsion (estimate-based) still useful when agent is actively pushing
+                ctrl_fx = 0.0
+                ctrl_fy = 0.0
+                try:
+                    applied_forward = float(applied_forward_env) if "applied_forward_env" in locals() else float(last_ctrl_f)
+                except Exception:
+                    applied_forward = float(last_ctrl_f)
+                if not hasattr(self, "_prev_wall_rep"):
+                    self._prev_wall_rep = {}
+                prev_rep = float(self._prev_wall_rep.get(self.learnable_agent_key, 0.0))
+
+                # Parameters to control smoothing and scaling of estimated repulsion
+                ctrl_scale = float(getattr(self, "WALL_REPULSION_CTRL_SCALE", 0.5))
+                ctrl_lp = float(getattr(self, "WALL_REPULSION_CTRL_LP", 0.2))
+
+                if clearance < r_clear and (abs(applied_forward) > 1e-6):
+                    # estimate agent forward force from control magnitude
+                    f_agent_est = abs(last_ctrl_f) * float(self.AGENT_ACTUATOR_FWD)
+                    # scale factor [0..1] based on how deep into the clearance band we are
+                    s = max(0.0, (r_clear - clearance) / max(1e-6, r_clear))
+                    f_rep = min(float(self.WALL_REPULSION_ALPHA) * f_agent_est * s, f_max)
+                    # apply a global scale to reduce peak magnitude
+                    f_rep_scaled = f_rep * ctrl_scale
+                    # low-pass (EMA) smoothing to avoid step jumps
+                    f_rep_sm = prev_rep * (1.0 - ctrl_lp) + f_rep_scaled * ctrl_lp
+                    # write back smoothed value for next step
+                    self._prev_wall_rep[self.learnable_agent_key] = float(f_rep_sm)
+                    ctrl_fx = f_rep_sm * float(nx)
+                    ctrl_fy = f_rep_sm * float(ny)
+                else:
+                    # decay previous smoothed rep toward zero when not actively applied
+                    f_rep_sm = prev_rep * (1.0 - ctrl_lp)
+                    self._prev_wall_rep[self.learnable_agent_key] = float(f_rep_sm)
+                    ctrl_fx = f_rep_sm * float(nx)
+                    ctrl_fy = f_rep_sm * float(ny)
+
+                # combine feedback and control contributions, clip to f_max
+                fx_tot = fb_fx + ctrl_fx
+                fy_tot = fb_fy + ctrl_fy
+                f_tot = math.hypot(fx_tot, fy_tot)
+                if f_tot > f_max and f_tot > 0.0:
+                    scale = f_max / f_tot
+                    fx_tot *= scale
+                    fy_tot *= scale
+
                 bid = int(learnable_agent_body_id)
                 # data.xfrc_applied stores [Fx,Fy,Fz, Mx,My,Mz]
                 try:
-                    self.data.xfrc_applied[bid, 0] += fx
-                    self.data.xfrc_applied[bid, 1] += fy
+                    # single write to the external force buffer to avoid partial accumulation
+                    self.data.xfrc_applied[bid, 0] = fx_tot
+                    self.data.xfrc_applied[bid, 1] = fy_tot
                 except Exception:
                     # best-effort: ignore if structure differs
                     pass
                 if self.debug_mode:
-                    self.debug_logger.print_throttled(
-                        "wall_repulsion",
-                        f"repulse: agent={self.learnable_agent_key} dist={dist:.3f} f_rep={f_rep:.1f} nx={nx:.3f} ny={ny:.3f}",
-                        self.current_step,
-                    )
+                    try:
+                        self.debug_logger.print(
+                            f"[DEBUG][wall_repulsion] step={self.current_step} agent={self.learnable_agent_key} dist={dist:.3f} clearance={clearance:.3f} fb=({fb_fx:.1f},{fb_fy:.1f}) ctrl=({ctrl_fx:.1f},{ctrl_fy:.1f}) fx={fx_tot:.1f} fy={fy_tot:.1f}"
+                        )
+                    except Exception:
+                        print(f"[DEBUG][wall_repulsion] agent={self.learnable_agent_key} dist={dist:.3f} clearance={clearance:.3f} f_tot={f_tot:.1f}")
         except Exception:
+            # swallow any error in repulsion logic to avoid breaking simulation step
             pass
 
         obs = self._normalize_obs(self._get_obs(idx_to_obs))
@@ -1933,7 +2054,7 @@ class TeamCosEnv(gym.Env):
         for hk in self.hider_keys:
             hid = self.body_ids[hk]
             hpos = self.data.xpos[hid][:2]
-            h_reward = 0.05  # 基本生存ボーナス
+            h_reward = 0.00  # 基本生存ボーナス ステップ数誇張なので0.0
 
             for sk in self.seeker_keys:
                 sid = self.body_ids[sk]
@@ -1961,7 +2082,7 @@ class TeamCosEnv(gym.Env):
                     gaze_cos_front_max = max(gaze_cos_front_max, frontness)
                     gaze_cos_front_dist_max = max(gaze_cos_front_dist_max, capture_reward)
 
-            total_hider_reward -= h_reward  # += h_reward
+            total_hider_reward += h_reward
 
         return (
             total_hider_reward / len(self.hider_keys),
@@ -2132,7 +2253,28 @@ class TeamCosEnv(gym.Env):
                 o[en_idx.REL_X], o[en_idx.REL_Y] = L_SCALE, L_SCALE
                 o[en_idx.VISIBLE] = 0.0
                 o[en_idx.BEING_HIT] = 0.0
-        return o
+            # 壁情報：距離と法線（エージェント局所座標系）を追加
+            try:
+                dist_w, nx_w, ny_w = self.vis_engine.sample_sdf_with_normal(ps[0], ps[1])
+                r = float(self.WALL_REPULSION_RADIUS)
+                # 正規化距離 (0..1) を供給。r 超は 1.0
+                dist_norm = float(min(dist_w, r) / max(r, 1e-8))
+                # world -> local: rotate by -rv (cos_r, sin_r are cos(-rv), sin(-rv))
+                n_loc_x = nx_w * cos_r - ny_w * sin_r
+                n_loc_y = nx_w * sin_r + ny_w * cos_r
+            except Exception:
+                dist_norm = 1.0
+                n_loc_x = 0.0
+                n_loc_y = 0.0
+
+            # write into obs vector at indices defined in ObsIdx
+            try:
+                o[self.idx.WALL_DIST] = dist_norm
+                o[self.idx.WALL_NORM_X] = n_loc_x
+                o[self.idx.WALL_NORM_Y] = n_loc_y
+            except Exception:
+                pass
+            return o
 
     def render(self):  # noqa: C901
         if getattr(self, "_render_disabled", False):

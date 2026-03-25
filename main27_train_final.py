@@ -819,12 +819,12 @@ def build_env(mode, target, config, render_mode=None):
     """環境を構築"""
     config = dict(config)  # 破壊的変更を避ける
     config.pop("num_envs", None)
-    return TeamCosEnv(
-        mode=mode,
-        target=target,
-        render_mode=render_mode,
-        **config,
-    )
+    # unify all constructor args into a single dict to avoid duplicate-value errors
+    cfg = dict(config)
+    cfg["mode"] = mode
+    cfg["target"] = target
+    cfg["render_mode"] = render_mode
+    return TeamCosEnv(**cfg)
 
 
 class SingleVecWrapper:
