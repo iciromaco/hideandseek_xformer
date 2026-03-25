@@ -353,8 +353,9 @@ WALL_SAFE = _cfg("wall_safe", "1.0", float, RUNTIME_OVERRIDES)
 # エージェント半径を設定ファイルから取得（デフォルト 0.4）
 AGENT_RADIUS = _cfg("agentl_radius", "0.4", float, RUNTIME_OVERRIDES)
 # 壁近マージン（エージェント表面からの近接閾値; デフォルト 0.4）
-WALL_NEAR_MARGIN = _cfg("wall_near_margin", "0.4", float, RUNTIME_OVERRIDES)
+WALL_NEAR_MARGIN = _cfg("wall_near_margin", "0.6", float, RUNTIME_OVERRIDES)
 AGENT_HEAD_CLEARANCE = _cfg("agent_head_clearance", "0.2", float, RUNTIME_OVERRIDES)  # 壁近判定閾値（全エージェント共通）
+WALL_REPULSION_RADIUS_DEFAULT = 0.25
 
 # ============================================================================
 # 観測履歴・ユーティリティクラス
@@ -482,15 +483,25 @@ def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None,
     if key in _wall_stick_state_cache:
         # print(f"[DEBUG] wall_stick_state_cache hit: {key} -> {_wall_stick_state_cache[key]}")
         return _wall_stick_state_cache[key]
-    # まずinfo['wall_distance']があればそれを使う
+    # まず観測内の WALL_DIST を優先して使う（正規化距離: 0..1）。なければ info を参照し、それもなければ LiDAR で代替
     wall_near = None
-    if info is not None and "wall_distance" in info:
-        wall_distance = info["wall_distance"]  # infoから壁距離を取得 これは正規化されていない生の距離値
-        if isinstance(wall_distance, (list, tuple, np.ndarray)):
-            wall_distance = float(np.min(wall_distance))
-        else:
-            wall_distance = float(wall_distance)
-        wall_near = (wall_distance - AGENT_RADIUS) < WALL_NEAR_MARGIN
+    try:
+        # obs は 1D 観測ベクトル。idx.WALL_DIST が定義されていれば利用
+        if hasattr(idx, "WALL_DIST"):
+            wall_dist_norm = float(obs[int(idx.WALL_DIST)])
+            # 正規化距離 -> 実距離の近似（env の既定半径を使う）
+            wall_distance = wall_dist_norm * WALL_REPULSION_RADIUS_DEFAULT
+            wall_near = (wall_distance - AGENT_RADIUS) < WALL_NEAR_MARGIN
+    except Exception:
+        wall_near = None
+    if wall_near is None:
+        if info is not None and "wall_distance" in info:
+            wall_distance = info["wall_distance"]
+            if isinstance(wall_distance, (list, tuple, np.ndarray)):
+                wall_distance = float(np.min(wall_distance))
+            else:
+                wall_distance = float(wall_distance)
+            wall_near = (wall_distance - AGENT_RADIUS) < WALL_NEAR_MARGIN
     if wall_near is None:
         cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
         lidar_indices = cache["lidar"]
@@ -543,7 +554,8 @@ def _compute_custom_reward_batch_numba(
     move_incentive,
     idle_penalty,
     wall_avoid_penalty,
-    wall_distance_batch,
+    wall_dist_idx,
+    wall_repulsion_radius,
     idle_speed_threshold,
     move_incentive_speed_threshold,
     move_sat_threshold,
@@ -612,22 +624,31 @@ def _compute_custom_reward_batch_numba(
         is_on_ramp_climbing = agent_vz_batch[i] > 0.02
 
         if not is_on_ramp_climbing:
-            # wall_distance_batch: infoから渡される壁までの正確な距離
-            # agent_radius: エージェントの半径
-            dist_from_surface = wall_distance_batch[i] - agent_radius
-            wall_near_margin = 0.2  # ペナルティ開始境界
+            # WALL_DIST が観測内にあれば正規化距離を使って実距離に復元
+            wall_distance = np.nan
+            if wall_dist_idx >= 0:
+                try:
+                    wall_distance = float(obs_batch[i, wall_dist_idx]) * float(wall_repulsion_radius)
+                except Exception:
+                    wall_distance = np.nan
 
-            if dist_from_surface < wall_near_margin:
-                # 0.0（境界）から 1.0（接触）に向かって線形に増加する比率
-                ratio = 1.0 - (max(0.0, dist_from_surface) / wall_near_margin)
+            if not np.isnan(wall_distance):
+                dist_from_surface = wall_distance - agent_radius
+                wall_near_margin = 0.2  # ペナルティ開始境界
 
-                # A. 基本の接近ペナルティ
-                bonus -= wall_avoid_penalty * ratio
+                if dist_from_surface < wall_near_margin:
+                    # 0.0（境界）から 1.0（接触）に向かって線形に増加する比率
+                    m = dist_from_surface
+                    if m < 0.0:
+                        m = 0.0
+                    ratio = 1.0 - (m / wall_near_margin)
 
-                # B. 張り付き判定
-                # ジョイント修正により next_speed が正確なため、これだけでスタックを検知可能
-                if next_speed < still_speed_threshold:
-                    bonus -= wall_stick_penalty * ratio
+                    # A. 基本の接近ペナルティ
+                    bonus -= wall_avoid_penalty * ratio
+
+                    # B. 張り付き判定
+                    if next_speed < still_speed_threshold:
+                        bonus -= wall_stick_penalty * ratio
 
             # BEING_HIT ブロックはランプ登り中でも有効にするため、ここでは処理を行わない
 
@@ -705,15 +726,15 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
         amount = (2.0 - dist) / 2.0 if dist < 2.0 else 0.0
         return dx, dy, dist, amount, idx_x, idx_y, idx_vis
 
-    # wall_distance_batchの生成（infoから取得、なければnan）
-    if info is not None and "wall_distance" in info:
-        wd = info["wall_distance"]
-        if isinstance(wd, (list, tuple, np.ndarray)):
-            wall_distance_batch = np.asarray([float(wd[0])], dtype=np.float32)
-        else:
-            wall_distance_batch = np.asarray([float(wd)], dtype=np.float32)
+    # WALL_DIST が観測内にあればそのインデックスを numba に渡す（正規化距離 -> 実距離は numba 側で復元）
+    if hasattr(idx, "WALL_DIST"):
+        try:
+            wall_dist_idx = int(idx.WALL_DIST)
+        except Exception:
+            wall_dist_idx = -1
     else:
-        wall_distance_batch = np.full((obs_batch.shape[0],), np.nan, dtype=np.float32)
+        wall_dist_idx = -1
+    wall_repulsion_radius_value = float(WALL_REPULSION_RADIUS_DEFAULT)
     # agent_vz_batchの生成（infoから取得、なければ0.0）
     if info is not None and "agent_vz" in info:
         vz = info["agent_vz"]
@@ -741,8 +762,9 @@ def compute_custom_reward(obs, next_obs, action, base_reward, idx, target, info,
             float(RW_MOVE_CTRL_COST),
             float(RW_MOVE_INCENTIVE),
             float(RW_IDLE_PENALTY),
-            float(RW_WALL_AVOID_PENALTY),
-            wall_distance_batch,
+            0.0,
+            int(wall_dist_idx),
+            wall_repulsion_radius_value,
             float(IDLE_SPEED_THRESHOLD),
             float(MOVE_INCENTIVE_SPEED_THRESHOLD),
             float(MOVE_SAT_THRESHOLD),
@@ -1353,27 +1375,19 @@ def run_train_vector(
                 done_last = done_np
 
                 reward_np = np.asarray(base_r, dtype=np.float32).copy()
-                # infoがリストの場合は各環境ごとにwall_distanceを抽出
-                wall_distance_batch = np.full((action_np.shape[0],), np.nan, dtype=np.float32)
+                # WALL_DIST インデックスを numba に渡す（観測から正規化距離を参照）
+                if hasattr(idx, "WALL_DIST"):
+                    try:
+                        wall_dist_idx = int(idx.WALL_DIST)
+                    except Exception:
+                        wall_dist_idx = -1
+                else:
+                    wall_dist_idx = -1
+                wall_repulsion_radius_value = float(WALL_REPULSION_RADIUS_DEFAULT)
                 reward_t0 = time.perf_counter()
                 if USE_CUSTOM_REWARD:
                     if isinstance(info, (list, tuple)):
-                        for i in range(action_np.shape[0]):
-                            info_i = info[i] if len(info) > i else None
-                            if info_i is not None and "wall_distance" in info_i:
-                                wd = info_i["wall_distance"]
-                                if isinstance(wd, (list, tuple, np.ndarray)):
-                                    wall_distance_batch[i] = float(wd[0])
-                                else:
-                                    wall_distance_batch[i] = float(wd)
-                    elif isinstance(info, dict) and "wall_distance" in info:
-                        wd = info["wall_distance"]
-                        if isinstance(wd, (list, tuple, np.ndarray)):
-                            for i in range(action_np.shape[0]):
-                                wall_distance_batch[i] = float(_info_at(info, "wall_distance", i, np.nan))
-                        else:
-                            for i in range(action_np.shape[0]):
-                                wall_distance_batch[i] = float(wd)
+                        pass
                     reward_np = _compute_custom_reward_batch_numba(
                         np.asarray(obs, dtype=np.float32).reshape(action_np.shape[0], -1),
                         np.asarray(next_obs, dtype=np.float32).reshape(action_np.shape[0], -1),
@@ -1390,7 +1404,8 @@ def run_train_vector(
                         float(RW_MOVE_INCENTIVE),
                         float(RW_IDLE_PENALTY),
                         float(RW_WALL_AVOID_PENALTY),
-                        wall_distance_batch,
+                        int(wall_dist_idx),
+                        wall_repulsion_radius_value,
                         float(IDLE_SPEED_THRESHOLD),
                         float(MOVE_INCENTIVE_SPEED_THRESHOLD),
                         float(MOVE_SAT_THRESHOLD),
