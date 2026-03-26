@@ -3,12 +3,24 @@
 # hns_environment.py v4.5９
 import logging
 import math
+import os
+import select
+import sys
+import termios
+import tty
+from typing import Any, Dict, Optional
 
 import gymnasium as gym
 import mujoco
 import mujoco.viewer
 import numpy as np
 import torch
+
+# optional global keyboard listener
+try:
+    from pynput import keyboard as _pynput_keyboard  # type: ignore
+except Exception:
+    _pynput_keyboard = None
 from gymnasium import spaces
 from numba import njit
 
@@ -232,8 +244,30 @@ class TeamCosEnv(gym.Env):
     WALL_REPULSION_CTRL_CLIP = 50.0
     # Optional per-step accumulated force clamp applied before writing data.xfrc_applied
     WALL_REPULSION_ACCUM_CLAMP_MAX = 100.0
+    # Debug: when True, always print sampled SDF and normal each step (for debugging only)
+    FORCE_WALL_SDF_DEBUG = True
+    # Expanded application distance for wall feedback (m). Raised from 0.5 to 0.9 by default.
+    WALL_REPULSION_TARGET_DIST = 0.9
+    # Facing-dot threshold for applying feedback force: require agent forward to be
+    # approximately directed into the wall (dot with normal < WALL_REPULSION_FB_FWD_DOT)
+    WALL_REPULSION_FB_FWD_DOT = -0.2
+    # Passive repulsion applied when not actively pushing into the wall
+    WALL_REPULSION_PASSIVE_KP = 40.0
+    WALL_REPULSION_PASSIVE_FMAX = 30.0
+    # When agent is very close to wall, attenuate forward actuator to avoid
+    # being stuck due to actuator overpowering repulsion.
+    WALL_REPULSION_ATTENUATE_CLEARANCE = 0.25
+    WALL_REPULSION_ATTENUATE_FACTOR = 0.25
     # world-z above which ramp-based repulsion suppression is considered
     WALL_REPULSION_SUPPRESS_Z = 0.5 + 0.2  # z margin below which suppression is applied even if not currently climbing
+    # When contacting a wall, apply angular damping (torque) to resist spinning
+    # and attenuate turn control to avoid rotating into the wall and becoming
+    # perpendicular. Tune these to your feel; conservative defaults below.
+    WALL_CONTACT_ROT_DAMP_K = 30.0
+    # チョイス A: ターン入力を完全抑制する（壁接触時）
+    WALL_CONTACT_TURN_ATTENUATE_FACTOR = 0.0
+    # 反トルク Mz のクリップ上限（絶対値）。過大なトルクで振動するのを防ぐ。
+    WALL_CONTACT_MZ_CLIP = 50.0
 
     def __init__(
         self,
@@ -254,6 +288,9 @@ class TeamCosEnv(gym.Env):
         debug_console=True,
         action_repeat=16,
         learnable_turn_scale=1.0,
+        control_mode: str = "auto",
+        USE_VIEWER: bool = False,
+        human_key_bindings: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.n_seekers = int(n_seekers)
@@ -278,13 +315,13 @@ class TeamCosEnv(gym.Env):
         self.policy_source_log = bool(policy_source_log)
         self.policy_src_log_each_reset = bool(policy_src_log_each_reset)
         # temporal caches for visibility / being-hit freshness
-        self._prev_vis = {}
-        self._prev_being_hit = {}
+        self._prev_vis: Dict[Any, Any] = {}
+        self._prev_being_hit: Dict[Any, Any] = {}
         # render disabled flag (set if passive viewer cannot be launched on macOS)
         self._render_disabled = False
         # counters for persisting BEING_HIT in observations
         self.being_hit_persist = 3
-        self._being_hit_counters = {}
+        self._being_hit_counters: Dict[Any, int] = {}
         # cached last observation returned for the learnable agent
         self._cached_obs = None
         self._init_debug_stats()
@@ -307,19 +344,77 @@ class TeamCosEnv(gym.Env):
         )
         self.viewer = None
         self.inference_policies = inference_policies or {}
-        self._inference_models = {}
-        self._inference_seq_lens = {}
+        self._inference_models: Dict[str, Any] = {}
+        self._inference_seq_lens: Dict[str, int] = {}
         self.shared_team_policy = False
         self.shared_policy_model = None
         self.shared_policy_seq_len = 8
         self.shared_policy_hdim = 128
         self.shared_team_prefix = "h" if self.learnable_agent_key.startswith("h") else "s"
-        self._policy_histories = {}
+        self._policy_histories: Dict[Any, Any] = {}
         self.override_learnable_policy = False
         self.model_policy_deterministic = True
         # デバッグ用ロガーに移譲
 
         self.last_debug_ctrl = dict.fromkeys(self.agent_keys, (0.0, 0.0))
+
+        # (previously had ad-hoc per-geom friction override state; removed)
+
+        # Human-control mode settings
+        # control_mode: 'auto'|'rule'|'model'|'learn'|'human'
+        self.control_mode = str(control_mode)
+        # If True and control_mode=='human', env will attempt to enable viewer
+        # and read WASD/J/K keys from the terminal for manual control.
+        self.USE_VIEWER = bool(USE_VIEWER)
+        self._human_action = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        self._orig_term_settings = None
+        # Whether to use a global pynput listener (captures keys even when
+        # the viewer window has focus). Default: False (opt-in).
+        self.human_use_pynput = False
+        self._pynput_listener = None
+        # If True, print received key events from pynput for debugging
+        self.human_debug_keys = False
+        # If True, make lock/grab buttons toggle on press instead of momentary
+        self.human_toggle_buttons = False
+        # Human key bindings: mapping of action name -> key (single char)
+        # actions: forward, back, left, right, lock, grab
+        # Use arrow keys as defaults for movement (escape sequences).
+        default_bindings = {
+            "forward": "\x1b[A",  # Up arrow
+            "back": "\x1b[B",  # Down arrow
+            "left": "\x1b[D",  # Left arrow
+            "right": "\x1b[C",  # Right arrow
+            "lock": "o",
+            "grab": "p",
+        }
+        self.human_key_bindings = human_key_bindings or default_bindings
+        # internal reverse map: key -> (index, value)
+        # index: 0=forward/back,1=turn left/right,2=lock,3=grab
+        self._human_key_map = {}
+        try:
+            # allow multi-char sequences (arrow keys) as mapping keys
+            fwd = self.human_key_bindings.get("forward")
+            back = self.human_key_bindings.get("back")
+            left = self.human_key_bindings.get("left")
+            right = self.human_key_bindings.get("right")
+            lock = self.human_key_bindings.get("lock")
+            grab = self.human_key_bindings.get("grab")
+
+            if fwd is not None:
+                self._human_key_map[fwd] = (0, 1.0)
+            if back is not None:
+                self._human_key_map[back] = (0, -1.0)
+            if left is not None:
+                self._human_key_map[left] = (1, 1.0)
+            if right is not None:
+                self._human_key_map[right] = (1, -1.0)
+            if lock is not None:
+                self._human_key_map[lock] = (2, 1.0)
+            if grab is not None:
+                self._human_key_map[grab] = (3, 1.0)
+        except Exception:
+            # fall back to safe static mapping (single-char defaults)
+            self._human_key_map = {"t": (0, 1.0), "g": (0, -1.0), "f": (1, 1.0), "h": (1, -1.0), "o": (2, 1.0), "p": (3, 1.0)}
 
         # Ensure runtime instance attributes for wall-repulsion constants exist
         # Some run-time imports/overrides may omit class-level constants; set
@@ -333,10 +428,12 @@ class TeamCosEnv(gym.Env):
         except Exception:
             self.WALL_REPULSION_CLEARANCE = 0.2
 
-        self.body_ids, self.qpos_indices, self.actuator_ids = {}, {}, {}
-        self.obj_body_map = {}
-        self.obj_geom_ids = {}
-        self.obj_default_rgba = {}
+        self.body_ids: Dict[str, int] = {}
+        self.qpos_indices: Dict[str, Any] = {}
+        self.actuator_ids: Dict[str, int] = {}
+        self.obj_body_map: Dict[Any, Any] = {}
+        self.obj_geom_ids: Dict[Any, Any] = {}
+        self.obj_default_rgba: Dict[Any, Any] = {}
         self.maze_walls = [
             (3, 1.5, 1.5, 0.2),
             (-3, -1.5, 1.5, 0.2),
@@ -410,6 +507,20 @@ class TeamCosEnv(gym.Env):
 
     def set_model_policy_deterministic(self, enabled):
         self.model_policy_deterministic = bool(enabled)
+        return True
+
+    def set_human_action(self, action):
+        """外部ランナーが呼ぶための簡易 API: human action を注入する。
+
+        action: 長さ4の iterable -> [forward, turn, lock, grab]
+        """
+        try:
+            arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        except Exception:
+            raise ValueError("action must be iterable of 4 numeric values")
+        if arr.shape[0] != 4:
+            raise ValueError("human action must have length 4")
+        self._human_action = arr.copy()
         return True
 
     def _ensure_policy_history(self, agent_key, seq_len):
@@ -500,7 +611,8 @@ class TeamCosEnv(gym.Env):
 
     def _xml_static_scene(self):
         s = self.ARENA_HALF
-        attr = 'friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"'
+        # reduce wall/maze friction temporarily to ease sliding along walls
+        attr = 'friction="0.01 0.01 0.0001" solref="0.01 1" solimp="0.95 0.99 0.001"'
         return f"""
     <geom name="floor" type="plane" size="{s} {s} 0.1" material="grid" friction="1.0 0.05 0.0001"/>
     <geom name="wall_n" type="box" size="{s + 0.15} 0.1 2.0" pos="0 6.1 2.0" rgba="0.65 0.65 0.65 0.35" {attr}/>
@@ -568,7 +680,7 @@ class TeamCosEnv(gym.Env):
     <joint name="{pre}_rot" type="hinge" axis="0 0 1" damping="{self.AGENT_DAMPING_ROT}" armature="3.0"/>
       <body name="{pre}_body">
         <site name="{pre}_thrust" pos="0 0 0"/>
-        <geom name="{pre}_btm" type="sphere" size="0.4" pos="0 0 -0.1" mass="{self.AGENT_BOTTOM_MASS}" friction="1.2 0.12 0.003"/>
+        <geom name="{pre}_btm" type="sphere" size="0.4" pos="0 0 -0.05" mass="{self.AGENT_BOTTOM_MASS}" friction="0.2 0.06 0.001"/>
         <geom name="{pre}_capsule" type="capsule" size="0.3 0.2" rgba="{r} {g} {b} 1" mass="{self.AGENT_HEAD_MASS}" contype="0" conaffinity="0"/>
         <geom name="{pre}_nose" type="capsule" fromto="0 0 0.3 0.3 0 0.3" size="0.09" rgba="1 1 1 1" contype="0" conaffinity="0"/>
         <geom name="{pre}_tail" type="capsule" fromto="0 0 0 -0.45 0 -0.3" size="0.05" rgba="{r} {g} {b} 1" contype="0" conaffinity="0"/>
@@ -580,6 +692,14 @@ class TeamCosEnv(gym.Env):
     <general name="{pre}_fwd" site="{pre}_thrust" gear="1 0 0 0 0 0" gainprm="{self.AGENT_ACTUATOR_FWD}" ctrlrange="-1 1"/>
     <general name="{pre}_turn" joint="{pre}_rot" gear="0.5" gainprm="{self.AGENT_ACTUATOR_TURN_GAIN}" ctrlrange="-1 1"/>
     """
+
+    def _xml_actuators_fixed(self, pre):
+        """Fallback / mypy-friendly variant of actuator XML builder.
+
+        Kept for compatibility with dynamic-attachment code paths; by
+        default delegate to `_xml_actuators`.
+        """
+        return self._xml_actuators(pre)
 
     def _analyze_structure(self):
         m = self.model
@@ -1123,11 +1243,57 @@ class TeamCosEnv(gym.Env):
             return False, False
         if lock_edge:
             lock_evt = self._toggle_lock(ak)
-            self.btn_cooldown[ak] = self.BTN_COOLDOWN
+            # only apply cooldown on successful event to allow retries on failure
+            if lock_evt:
+                self.btn_cooldown[ak] = self.BTN_COOLDOWN
+            else:
+                # do not mutate runner-owned human_action; allow runner to
+                # control momentary/toggle state. Fall through to debug output.
+                # debug: list candidate reasons
+                if getattr(self, "human_debug_keys", False):
+                    try:
+                        apos = self.data.xpos[self.body_ids[ak]][:2]
+                        out = []
+                        for tk, bid in self.obj_body_map.items():
+                            opos = self.data.xpos[bid][:2]
+                            rel = opos - apos
+                            dist = float(np.linalg.norm(rel))
+                            wall_block = bool(self._interaction_blocked_by_static_walls(apos, opos))
+                            vis = bool(self.vis_engine.is_visible(apos, opos, body_exclude=self.body_ids[ak], target_body_id=bid))
+                            out.append(f"{tk}:dist={dist:.3f},in_range={dist<=self.INTERACT_RANGE},vis={vis},wall_block={wall_block}")
+                        print(f"[human_debug][LOCK_FAIL] ak={ak} candidates=[{';'.join(out)}]")
+                    except Exception:
+                        pass
             return lock_evt, False
         if grab_edge:
             grab_evt = self._toggle_grab(ak)
-            self.btn_cooldown[ak] = self.BTN_COOLDOWN
+            if grab_evt:
+                self.btn_cooldown[ak] = self.BTN_COOLDOWN
+            else:
+                # do not mutate runner-owned human_action; allow runner to
+                # control momentary/toggle state. Fall through to debug output.
+                if getattr(self, "human_debug_keys", False):
+                    try:
+                        apos = self.data.xpos[self.body_ids[ak]][:2]
+                        out = []
+                        for tk, bid in self.obj_body_map.items():
+                            opos = self.data.xpos[bid][:2]
+                            rel = opos - apos
+                            dist = float(np.linalg.norm(rel))
+                            wall_block = bool(self._interaction_blocked_by_static_walls(apos, opos))
+                            vis = bool(self.vis_engine.is_visible(apos, opos, body_exclude=self.body_ids[ak], target_body_id=bid))
+                            forward_dot = float(
+                                np.dot(
+                                    np.array(
+                                        [math.cos(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]]), math.sin(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]])]
+                                    ),
+                                    rel,
+                                )
+                            )
+                            out.append(f"{tk}:dist={dist:.3f},in_range={dist<=self.INTERACT_RANGE},vis={vis},wall_block={wall_block},fwd_dot={forward_dot:.3f}")
+                        print(f"[human_debug][GRAB_FAIL] ak={ak} candidates=[{';'.join(out)}]")
+                    except Exception:
+                        pass
             return False, grab_evt
         return False, False
 
@@ -1177,8 +1343,48 @@ class TeamCosEnv(gym.Env):
                     st["owner"] = None
                     self.data.qvel[vadr : vadr + vel_size][XY_VEL_START:XY_VEL_STOP] *= 0.5
                     continue
-                err_xy = opos - cur_xy
-                self.data.qvel[vadr : vadr + vel_size][XY_VEL_START:XY_VEL_STOP] = err_xy  # 速度を直接目標方向に
+                # 変更: オブジェクトをエージェント中心に移動させない。
+                #       エージェント前方のホールド位置 (GRAB_OFFSET) へ追従させる。
+                #       速度は比例ゲインで計算し、最大速度でクリップする。
+                # compute owner's forward direction
+                try:
+                    owner_rot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[owner]["rot"]]])
+                    afwd = np.array([math.cos(owner_rot), math.sin(owner_rot)], dtype=np.float32)
+                except Exception:
+                    afwd = np.array([1.0, 0.0], dtype=np.float32)
+
+                # desired hold position is in front of owner by GRAB_OFFSET
+                hold_pos = opos + afwd * float(getattr(self, "GRAB_OFFSET", 1.45))
+                err_xy = hold_pos - cur_xy
+
+                # 一時的デバッグ: grab状態での owner の入力・距離とホールド位置を出力
+                if getattr(self, "human_debug_grab", False):
+                    try:
+                        try:
+                            owner_ctrl_fwd = float(self.data.ctrl[self.actuator_ids[f"{owner}_fwd"]])
+                            owner_ctrl_turn = float(self.data.ctrl[self.actuator_ids[f"{owner}_turn"]])
+                        except Exception:
+                            owner_ctrl_fwd = None
+                            owner_ctrl_turn = None
+                        last_ctrl = self.last_debug_ctrl.get(owner)
+                        if hasattr(self, "debug_logger") and getattr(self, "debug_mode", False):
+                            self.debug_logger.print(
+                                f"[DEBUG][grab] tk={tk} owner={owner} grab_dist={grab_dist:.3f} opos={opos.tolist()} hold_pos={hold_pos.tolist()} cur_xy={cur_xy.tolist()} err_xy={err_xy.tolist()} owner_ctrl_fwd={owner_ctrl_fwd} owner_ctrl_turn={owner_ctrl_turn} last_debug_ctrl={last_ctrl}"
+                            )
+                        else:
+                            print(
+                                f"[DEBUG][grab] tk={tk} owner={owner} grab_dist={grab_dist:.3f} opos={opos.tolist()} hold_pos={hold_pos.tolist()} cur_xy={cur_xy.tolist()} err_xy={err_xy.tolist()} owner_ctrl_fwd={owner_ctrl_fwd} owner_ctrl_turn={owner_ctrl_turn} last_debug_ctrl={last_ctrl}"
+                            )
+                    except Exception:
+                        pass
+
+                # proportional follow velocity with clip on speed
+                v = float(getattr(self, "GRAB_FOLLOW_GAIN", 8.0)) * err_xy
+                vnorm = float(np.linalg.norm(v))
+                vmax = float(getattr(self, "GRAB_MAX_SPEED", 2.6))
+                if vnorm > vmax and vnorm > 1e-9:
+                    v = v * (vmax / vnorm)
+                self.data.qvel[vadr : vadr + vel_size][XY_VEL_START:XY_VEL_STOP] = v
                 # Z 軸速度（垂直 or hinge 回転）を 0 にする
                 self.data.qvel[vadr : vadr + vel_size][Z_VEL_IDX] = 0.0
                 # 角速度ブロックがある場合は 0 にする（boxes: indices 3..6、ramps は短い範囲）
@@ -1512,6 +1718,10 @@ class TeamCosEnv(gym.Env):
 
         self._cache_planar_object_pose()
 
+        # NOTE: human input I/O (terminal raw mode, pynput listener) has been
+        # moved out of the environment to keep `step()` pure. Runners should
+        # collect keys and call `env.set_human_action()` to inject human inputs.
+
         for i, ak in enumerate(self.agent_keys):
             if ak == self.learnable_agent_key and not self.override_learnable_policy:
                 continue
@@ -1561,6 +1771,10 @@ class TeamCosEnv(gym.Env):
         for i, ak in enumerate(self.agent_keys):
             is_seeker = ak.startswith("s")
             if ak == self.learnable_agent_key:
+                # priority: prep_steps -> override model -> external action
+                # Note: environment does not branch on whether the action came
+                # from a human or a runner; the runner should pass the
+                # appropriate action vector to `step()`.
                 if is_seeker and self.current_step <= self.prep_steps:
                     f, t, lck, grb = 0.0, 0.0, 0.0, 0.0
                 elif self.override_learnable_policy:
@@ -1603,6 +1817,14 @@ class TeamCosEnv(gym.Env):
             lock_evt, grab_evt = self._handle_buttons(ak, lck, grb)
             any_lock_event = any_lock_event or lock_evt
             any_grab_event = any_grab_event or grab_evt
+            if getattr(self, "human_debug_keys", False):
+                try:
+                    if lock_evt:
+                        print(f"[human_debug] lock event for {ak}: {lock_evt}")
+                    if grab_evt:
+                        print(f"[human_debug] grab event for {ak}: {grab_evt}")
+                except Exception:
+                    pass
 
             # For inference-only compatibility: some checkpoints were trained with the
             # opposite sign convention for the forward channel. Apply a runtime-only
@@ -1648,8 +1870,11 @@ class TeamCosEnv(gym.Env):
             pass
         for _ in range(self.action_repeat):
             mujoco.mj_step(self.model, self.data)
-            self._apply_object_constraints()
-            self._stabilize_agent_vertical_motion()
+        # Do not perform any human-specific I/O/side-effects here; the runner
+        # is responsible for supplying momentary button clears. Apply object
+        # constraints and stabilization deterministically.
+        self._apply_object_constraints()
+        self._stabilize_agent_vertical_motion()
         mujoco.mj_forward(self.model, self.data)
         if self.debug_mode:
             try:
@@ -1748,6 +1973,17 @@ class TeamCosEnv(gym.Env):
         # syntax/indentation fragility from nested try/excepts.
         try:
             dist, nx, ny = self.vis_engine.sample_sdf_with_normal(learnable_agent_pos[0], learnable_agent_pos[1])
+            # force debug output when requested by runtime flag
+            try:
+                if getattr(self, "FORCE_WALL_SDF_DEBUG", False):
+                    mnx = getattr(self.vis_engine, "_mode4_min_x", None)
+                    mny = getattr(self.vis_engine, "_mode4_min_y", None)
+                    cell = getattr(self.vis_engine, "_mode4_cell_size", None)
+                    print(
+                        f"[FORCE_WALL_SDF] step={self.current_step} pos=({learnable_agent_pos[0]:.3f},{learnable_agent_pos[1]:.3f}) dist={dist:.3f} normal=({nx:.3f},{ny:.3f}) grid_min=({mnx},{mny}) cell={cell}"
+                    )
+            except Exception:
+                pass
             # use clearance = (surface distance) - (agent effective radius)
             r_clear = float(self.WALL_REPULSION_CLEARANCE)
             r_eff = float(self.AGENT_EFFECTIVE_RADIUS)
@@ -1758,10 +1994,18 @@ class TeamCosEnv(gym.Env):
                 applied_fwd = float(applied_forward_env)
             except Exception:
                 applied_fwd = float(last_ctrl_f)
+            # defensive facing_dot computation (for debugging)
+            try:
+                arot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[self.learnable_agent_key]["rot"]]])
+                afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
+                # vis_engine normal points toward the wall; define outward = -normal
+                facing_dot = float(np.dot(afwd, np.array([-nx, -ny], dtype=np.float32)))
+            except Exception:
+                facing_dot = 0.0
 
             # Feedback controller to maintain a minimum clearance (target_dist)
             # This acts whenever the agent is closer than `target_dist` to the surface.
-            target_dist = 0.5
+            target_dist = float(getattr(self, "WALL_REPULSION_TARGET_DIST", 0.9))
             kp = 150.0
             f_max = float(self.WALL_REPULSION_FMAX)
 
@@ -1784,14 +2028,54 @@ class TeamCosEnv(gym.Env):
                     except Exception:
                         print(f"[DEBUG][wall_repulsion] suppressed_ramp agent={self.learnable_agent_key} z={agent_z:.3f} boost={boost_val:.3f} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f})")
             else:
+                # debug: when agent is near arena edge, log sampled SDF and normal
+                try:
+                    if getattr(self, "debug_mode", False) and (near_arena_edge_x or near_arena_edge_y):
+                        mnx = getattr(self.vis_engine, "_mode4_min_x", None)
+                        mny = getattr(self.vis_engine, "_mode4_min_y", None)
+                        cell = getattr(self.vis_engine, "_mode4_cell_size", None)
+                        print(
+                            f"[DEBUG][wall_edge] step={self.current_step} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f}) dist={dist:.3f} normal=({nx:.3f},{ny:.3f}) clearance={clearance:.3f} grid_min=({mnx},{mny}) cell={cell}"
+                        )
+                except Exception:
+                    pass
                 # controller contribution: act when clearance < target_dist
                 fb_fx = 0.0
                 fb_fy = 0.0
                 if clearance < float(target_dist):
-                    err = float(target_dist) - float(clearance)
-                    f_fb = min(max(0.0, kp * err), f_max)
-                    fb_fx = f_fb * float(nx)
-                    fb_fy = f_fb * float(ny)
+                    # Apply strong feedback only when agent is (roughly) pushing into the wall.
+                    # This prevents symmetric pushes from both sides in narrow corridors.
+                    try:
+                        afwd = np.array(
+                            [
+                                math.cos(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[self.learnable_agent_key]["rot"]]]),
+                                math.sin(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[self.learnable_agent_key]["rot"]]]),
+                            ],
+                            dtype=np.float32,
+                        )
+                    except Exception:
+                        afwd = np.array([1.0, 0.0], dtype=np.float32)
+                    facing_dot = float(np.dot(afwd, np.array([-nx, -ny], dtype=np.float32)))
+                    # require forward-facing into wall (dot < threshold) and some forward effort
+                    fb_allowed = (facing_dot < float(getattr(self, "WALL_REPULSION_FB_FWD_DOT", -0.2))) and (abs(applied_fwd) > 1e-6)
+                    if fb_allowed:
+                        err = float(target_dist) - float(clearance)
+                        f_fb = min(max(0.0, kp * err), f_max)
+                        # apply force away from wall (outward = -normal)
+                        fb_fx = f_fb * float(nx)
+                        fb_fy = f_fb * float(ny)
+                    else:
+                        # apply a small passive repulsion even when not actively
+                        # pushing into the wall (e.g., turning or being nudged).
+                        err = float(target_dist) - float(clearance)
+                        kp_pass = float(getattr(self, "WALL_REPULSION_PASSIVE_KP", 40.0))
+                        fmax_pass = float(getattr(self, "WALL_REPULSION_PASSIVE_FMAX", 30.0))
+                        f_fb_pass = min(max(0.0, kp_pass * err), fmax_pass)
+                        # scale passive by a small factor relative to active max
+                        scale = 0.25
+                        # passive (TEST): inverted sign -> push toward wall
+                        fb_fx = f_fb_pass * scale * float(nx)
+                        fb_fy = f_fb_pass * scale * float(ny)
 
                 # existing repulsion (estimate-based) still useful when agent is actively pushing
                 ctrl_fx = 0.0
@@ -1827,18 +2111,28 @@ class TeamCosEnv(gym.Env):
                         pass
                     # write back smoothed value for next step
                     self._prev_wall_rep[self.learnable_agent_key] = float(f_rep_sm)
+                    # control contribution (TEST): inverted sign -> towards wall
                     ctrl_fx = f_rep_sm * float(nx)
                     ctrl_fy = f_rep_sm * float(ny)
                 else:
                     # decay previous smoothed rep toward zero when not actively applied
                     f_rep_sm = prev_rep * (1.0 - ctrl_lp)
                     self._prev_wall_rep[self.learnable_agent_key] = float(f_rep_sm)
+                    # decayed ctrl contribution (TEST: toward wall)
                     ctrl_fx = f_rep_sm * float(nx)
                     ctrl_fy = f_rep_sm * float(ny)
 
                 # combine feedback and control contributions, clip to f_max
                 fx_tot = fb_fx + ctrl_fx
                 fy_tot = fb_fy + ctrl_fy
+                # debug: if normal is zeroed near wall, emit diagnostic to help root-cause
+                try:
+                    if abs(nx) < 1e-8 and abs(ny) < 1e-8 and float(dist) < 1.0:
+                        print(
+                            f"[DEBUG][wall_sdf] step={self.current_step} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f}) dist={dist:.3f} normal=({nx:.3f},{ny:.3f}) grid_min=({getattr(self.vis_engine,'_mode4_min_x',None)},{getattr(self.vis_engine,'_mode4_min_y',None)}) cell={getattr(self.vis_engine,'_mode4_cell_size',None)}"
+                        )
+                except Exception:
+                    pass
                 f_tot = math.hypot(fx_tot, fy_tot)
                 # optional per-step accumulation clamp (runtime override)
                 try:
@@ -1862,19 +2156,310 @@ class TeamCosEnv(gym.Env):
                 bid = int(learnable_agent_body_id)
                 # data.xfrc_applied stores [Fx,Fy,Fz, Mx,My,Mz]
                 try:
+                    # Runtime test: allow forcing an extreme outward repulsion
+                    # without changing surrounding logic. Use attributes to
+                    # control magnitude and clearance threshold.
+                    override_force = float(getattr(self, "WALL_REPULSION_FORCE_OVERRIDE", 2000.0))
+                    override_clear = float(getattr(self, "WALL_REPULSION_OVERRIDE_CLEARANCE", 0.25))
+                    # log the override check unconditionally to verify it's seen
+                    try:
+                        msg = f"[DEBUG][wall_override_check] step={self.current_step} override_force={override_force} override_clear={override_clear} clearance={clearance:.3f} normal=({nx:.3f},{ny:.3f})"
+                        if self.debug_mode:
+                            try:
+                                self.debug_logger.print(msg)
+                            except Exception:
+                                print(msg)
+                        else:
+                            print(msg)
+                    except Exception:
+                        pass
+                    # if override is enabled and agent is within override_clear, apply strong outward force
+                    if override_force != 0.0 and float(clearance) < override_clear:
+                        # outward = -normal (normal points toward wall)
+                        fx_tot = -float(nx) * override_force
+                        fy_tot = -float(ny) * override_force
+                        # always log when applying override
+                        try:
+                            msg2 = f"[DEBUG][wall_override] step={self.current_step} APPLY OVERRIDE force=({fx_tot:.1f},{fy_tot:.1f}) clearance={clearance:.3f}"
+                            if self.debug_mode:
+                                try:
+                                    self.debug_logger.print(msg2)
+                                except Exception:
+                                    print(msg2)
+                            else:
+                                print(msg2)
+                        except Exception:
+                            pass
+                    # Immediate debug force: when running in debug_mode and an override
+                    # magnitude is provided, force-apply outward force permissively
+                    # so diagnostics can immediately observe the effect.
+                    try:
+                        if getattr(self, "debug_mode", False) and float(override_force) != 0.0:
+                            debug_clear_thresh = max(override_clear, 1.0)
+                            if float(clearance) < float(debug_clear_thresh):
+                                fx_tot = -float(nx) * float(override_force)
+                                fy_tot = -float(ny) * float(override_force)
+                                try:
+                                    msg_dbg = f"[DEBUG][wall_override_force_now] step={self.current_step} FORCE_NOW APPLY force=({fx_tot:.1f},{fy_tot:.1f}) clearance={clearance:.3f}"
+                                    if self.debug_mode:
+                                        try:
+                                            self.debug_logger.print(msg_dbg)
+                                        except Exception:
+                                            print(msg_dbg)
+                                    else:
+                                        print(msg_dbg)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    # Testing multiplier (kept for backward experiments)
+                    test_scale = float(getattr(self, "WALL_REPULSION_TEST_SCALE", 1.0))
+                    if test_scale != 1.0:
+                        fx_tot *= test_scale
+                        fy_tot *= test_scale
+                    # Debug: unconditional force-write when enabled (bypass clearance)
+                    if getattr(self, "WALL_REPULSION_FORCE_WRITE_NOW", False):
+                        try:
+                            force_val = float(getattr(self, "WALL_REPULSION_FORCE_OVERRIDE", 2000.0))
+                        except Exception:
+                            force_val = 2000.0
+                        fx_tot = -float(nx) * force_val
+                        fy_tot = -float(ny) * force_val
+                        # When forcing the external force for diagnostics, also zero
+                        # the agent's forward/turn actuators so the external force
+                        # is not immediately cancelled by control outputs.
+                        try:
+                            fwd_aid = self.actuator_ids.get(f"{self.learnable_agent_key}_fwd")
+                            turn_aid = self.actuator_ids.get(f"{self.learnable_agent_key}_turn")
+                            if fwd_aid is not None and fwd_aid < self.data.ctrl.shape[0]:
+                                self.data.ctrl[fwd_aid] = 0.0
+                            if turn_aid is not None and turn_aid < self.data.ctrl.shape[0]:
+                                self.data.ctrl[turn_aid] = 0.0
+                        except Exception:
+                            pass
+                        try:
+                            msg3 = f"[DEBUG][wall_force_write_now] step={self.current_step} WRITE_NOW force=({fx_tot:.1f},{fy_tot:.1f})"
+                            if self.debug_mode:
+                                try:
+                                    self.debug_logger.print(msg3)
+                                except Exception:
+                                    print(msg3)
+                            else:
+                                print(msg3)
+                        except Exception:
+                            pass
                     # single write to the external force buffer to avoid partial accumulation
                     self.data.xfrc_applied[bid, 0] = fx_tot
                     self.data.xfrc_applied[bid, 1] = fy_tot
                 except Exception:
                     # best-effort: ignore if structure differs
                     pass
+                # Attenuate forward actuator when extremely close and still pushing
+                try:
+                    atten_th = float(getattr(self, "WALL_REPULSION_ATTENUATE_CLEARANCE", 0.25))
+                    atten_factor = float(getattr(self, "WALL_REPULSION_ATTENUATE_FACTOR", 0.25))
+                    # applied_forward (estimated) defined earlier as `applied_forward`
+                    applied_forward = float(applied_forward_env) if "applied_forward_env" in locals() else float(last_ctrl_f)
+                    # require being closer than atten_th and forward effort into wall
+                    if float(clearance) < atten_th and applied_forward > 1e-6:
+                        # facing_dot computed earlier as facing_dot if available; recompute defensively
+                        try:
+                            arot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[self.learnable_agent_key]["rot"]]])
+                            afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
+                            facing_dot = float(np.dot(afwd, np.array([-nx, -ny], dtype=np.float32)))
+                        except Exception:
+                            facing_dot = -1.0
+                        if facing_dot < float(getattr(self, "WALL_REPULSION_FB_FWD_DOT", -0.2)):
+                            try:
+                                aid = self.actuator_ids.get(f"{self.learnable_agent_key}_fwd")
+                                if aid is not None:
+                                    # scale down current ctrl value to reduce push
+                                    self.data.ctrl[aid] = float(self.data.ctrl[aid]) * atten_factor
+                                    if self.debug_mode:
+                                        try:
+                                            self.debug_logger.print(
+                                                f"[DEBUG][wall_attenuate] step={self.current_step} agent={self.learnable_agent_key} clearance={clearance:.3f} old_ctrl={float(self.data.ctrl[aid])/atten_factor:.3f} new_ctrl={float(self.data.ctrl[aid]):.3f}"
+                                            )
+                                        except Exception:
+                                            print(f"[DEBUG][wall_attenuate] agent={self.learnable_agent_key} clearance={clearance:.3f}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 if self.debug_mode:
                     try:
                         self.debug_logger.print(
-                            f"[DEBUG][wall_repulsion] step={self.current_step} agent={self.learnable_agent_key} dist={dist:.3f} clearance={clearance:.3f} fb=({fb_fx:.1f},{fb_fy:.1f}) ctrl=({ctrl_fx:.1f},{ctrl_fy:.1f}) fx={fx_tot:.1f} fy={fy_tot:.1f}"
+                            f"[DEBUG][wall_repulsion] step={self.current_step} agent={self.learnable_agent_key} dist={dist:.3f} clearance={clearance:.3f} facing_dot={facing_dot:.3f} applied_fwd={applied_fwd:.3f} fb=({fb_fx:.1f},{fb_fy:.1f}) ctrl=({ctrl_fx:.1f},{ctrl_fy:.1f}) fx={fx_tot:.1f} fy={fy_tot:.1f}"
                         )
                     except Exception:
-                        print(f"[DEBUG][wall_repulsion] agent={self.learnable_agent_key} dist={dist:.3f} clearance={clearance:.3f} f_tot={f_tot:.1f}")
+                        print(
+                            f"[DEBUG][wall_repulsion] agent={self.learnable_agent_key} dist={dist:.3f} clearance={clearance:.3f} facing_dot={facing_dot:.3f} applied_fwd={applied_fwd:.3f} f_tot={f_tot:.1f}"
+                        )
+                    try:
+                        # additional low-level debug: actuator ctrl, written xfrc, contacts, and local velocity
+                        aid = self.actuator_ids.get(f"{self.learnable_agent_key}_fwd")
+                        ctrl_val = float(self.data.ctrl[aid]) if (aid is not None and aid < self.data.ctrl.shape[0]) else None
+                        xfrc_written = tuple([float(self.data.xfrc_applied[bid, 0]), float(self.data.xfrc_applied[bid, 1])])
+                        ncon = int(getattr(self.data, "ncon", 0)) if hasattr(self.data, "ncon") else -1
+                        # agent planar velocity
+                        try:
+                            vadr = self.model.jnt_dofadr[self.qpos_indices[self.learnable_agent_key]["x"]]
+                            qlen = self.data.qvel.shape[0]
+                            avx = float(self.data.qvel[vadr]) if vadr < qlen else 0.0
+                            avy = float(self.data.qvel[vadr + 1]) if (vadr + 1) < qlen else 0.0
+                        except Exception:
+                            avx = 0.0
+                            avy = 0.0
+                        self.debug_logger.print(
+                            f"[DEBUG][wall_lowlevel] step={self.current_step} agent={self.learnable_agent_key} ctrl_fwd={ctrl_val} xfrc_applied={xfrc_written} vel=({avx:.3f},{avy:.3f}) ncon={ncon}"
+                        )
+                    except Exception:
+                        pass
+                # 接触時の回転（壁方向へ回り込む）を抑制する追加処理:
+                # - ターン入力を減衰させる
+                # - 回転角速度に応じた反トルクを Mz に付加する
+                try:
+                    ncon = int(getattr(self.data, "ncon", 0)) if hasattr(self.data, "ncon") else 0
+                    rot_atten_th = float(getattr(self, "WALL_REPULSION_ATTENUATE_CLEARANCE", 0.25))
+                    if ncon > 0 and float(clearance) < rot_atten_th:
+                        # ターン入力を減衰
+                        try:
+                            turn_aid = self.actuator_ids.get(f"{self.learnable_agent_key}_turn")
+                            if turn_aid is not None:
+                                self.data.ctrl[turn_aid] = float(self.data.ctrl[turn_aid]) * float(getattr(self, "WALL_CONTACT_TURN_ATTENUATE_FACTOR", 0.2))
+                        except Exception:
+                            pass
+                        # 回転速度に比例した反トルクを与える（Mz に追加）
+                        try:
+                            rot_jid = self.qpos_indices[self.learnable_agent_key]["rot"]
+                            rot_vadr = int(self.model.jnt_dofadr[rot_jid])
+                            qlen = self.data.qvel.shape[0]
+                            ang_vel_z = float(self.data.qvel[rot_vadr]) if rot_vadr < qlen else 0.0
+                            k = float(getattr(self, "WALL_CONTACT_ROT_DAMP_K", 30.0))
+                            mz = -k * ang_vel_z
+                            # クリップして過大値を防ぐ
+                            try:
+                                mz_clip = float(getattr(self, "WALL_CONTACT_MZ_CLIP", 50.0))
+                                if mz > mz_clip:
+                                    mz = mz_clip
+                                elif mz < -mz_clip:
+                                    mz = -mz_clip
+                            except Exception:
+                                pass
+                            # data.xfrc_applied の Mz (index 5) に加算
+                            try:
+                                if self.data.xfrc_applied.shape[1] > 5:
+                                    self.data.xfrc_applied[bid, 5] = float(self.data.xfrc_applied[bid, 5]) + mz
+                            except Exception:
+                                pass
+                            if self.debug_mode:
+                                try:
+                                    self.debug_logger.print(f"[DEBUG][wall_rot] step={self.current_step} agent={self.learnable_agent_key} ncon={ncon} ang_vel_z={ang_vel_z:.3f} mz={mz:.3f}")
+                                except Exception:
+                                    print(f"[DEBUG][wall_rot] agent={self.learnable_agent_key}")
+                        except Exception:
+                            pass
+                    # 接触ごとの詳細ダンプ（デバッグ用、属性が存在するものだけ安全に取得）
+                    try:
+                        if self.debug_mode and ncon > 0:
+                            detail_lines = []
+                            max_dump = min(int(ncon), 32)
+                            for ci in range(max_dump):
+                                try:
+                                    c = self.data.contact[ci]
+                                except Exception:
+                                    break
+                                try:
+                                    g1 = getattr(c, "geom1", None)
+                                except Exception:
+                                    g1 = None
+                                try:
+                                    g2 = getattr(c, "geom2", None)
+                                except Exception:
+                                    g2 = None
+                                # try to resolve geom id -> name for easier debugging
+                                try:
+                                    g1_name = None if g1 is None else self.model.geom(g1).name
+                                except Exception:
+                                    try:
+                                        g1_name = None if g1 is None else self.model.geom(g1).id
+                                    except Exception:
+                                        g1_name = None
+                                try:
+                                    g2_name = None if g2 is None else self.model.geom(g2).name
+                                except Exception:
+                                    try:
+                                        g2_name = None if g2 is None else self.model.geom(g2).id
+                                    except Exception:
+                                        g2_name = None
+                                try:
+                                    dist_c = float(getattr(c, "dist", float("nan")))
+                                except Exception:
+                                    dist_c = None
+                                try:
+                                    pos_attr = getattr(c, "pos", None)
+                                    pos_c = tuple(float(x) for x in pos_attr) if pos_attr is not None else None
+                                except Exception:
+                                    pos_c = None
+                                try:
+                                    frame_attr = getattr(c, "frame", None)
+                                    frame0 = tuple(float(x) for x in frame_attr[:3]) if frame_attr is not None else None
+                                except Exception:
+                                    frame0 = None
+                                detail_lines.append(f"ci={ci} g1={g1}({g1_name}) g2={g2}({g2_name}) dist={dist_c} pos={pos_c} frame0={frame0}")
+                            if detail_lines:
+                                try:
+                                    self.debug_logger.print(f"[DEBUG][contacts] step={self.current_step} agent={self.learnable_agent_key} ncon={ncon} " + " | ".join(detail_lines))
+                                except Exception:
+                                    print(f"[DEBUG][contacts] agent={self.learnable_agent_key} ncon={ncon}")
+                            # 出現したジオムの定義をダンプして、どのパーツが接触しているか確認する
+                            try:
+                                geom_ids = set()
+                                for dl in detail_lines:
+                                    # extract "g1=ID(name)" patterns
+                                    try:
+                                        parts = dl.split()
+                                        for p in parts:
+                                            if p.startswith("g1=") or p.startswith("g2="):
+                                                gid_part = p.split("=")[1]
+                                                # strip possible "(name)"
+                                                if "(" in gid_part:
+                                                    gid = int(gid_part.split("(")[0])
+                                                else:
+                                                    gid = int(gid_part)
+                                                geom_ids.add(gid)
+                                    except Exception:
+                                        continue
+                                for gid in sorted(list(geom_ids)):
+                                    try:
+                                        g = self.model.geom(gid)
+                                        g_name = getattr(g, "name", None)
+                                        g_type = getattr(g, "type", None)
+                                        g_size = None
+                                        try:
+                                            g_size = tuple(float(x) for x in getattr(g, "size"))
+                                        except Exception:
+                                            g_size = None
+                                        g_pos = None
+                                        try:
+                                            g_pos = tuple(float(x) for x in getattr(g, "pos"))
+                                        except Exception:
+                                            g_pos = None
+                                        g_fromto = None
+                                        try:
+                                            g_fromto = tuple(float(x) for x in getattr(g, "fromto"))
+                                        except Exception:
+                                            g_fromto = None
+                                        self.debug_logger.print(f"[DEBUG][geom_info] step={self.current_step} gid={gid} name={g_name} type={g_type} size={g_size} pos={g_pos} fromto={g_fromto}")
+                                    except Exception:
+                                        continue
+                                # (per-geom friction override removed; keeping only geom info dump)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
         except Exception:
             # swallow any error in repulsion logic to avoid breaking simulation step
             pass
@@ -2063,6 +2648,8 @@ class TeamCosEnv(gym.Env):
                         del self._being_hit_counters[k]
         except Exception:
             pass
+
+        # (removed friction-override TTL restore logic)
 
         return obs, reward, False, done, info
 
@@ -2435,15 +3022,6 @@ class TeamCosEnv(gym.Env):
             self.viewer.close()
 
 
-# Provide a fixed actuator XML generator and attach it to the class so
-# _build_dynamic_xml can safely call it even if the original method
-# contained malformed content during edits.
-def _xml_actuators_fixed(self, pre):
-    return f"""
-    <general name="{pre}_fwd" site="{pre}_thrust" gear="1 0 0 0 0 0" gainprm="{self.AGENT_ACTUATOR_FWD}" ctrlrange="-1 1"/>
-    <general name="{pre}_turn" joint="{pre}_rot" gear="0.5" gainprm="{self.AGENT_ACTUATOR_TURN_GAIN}" ctrlrange="-1 1"/>
-    """
-
-
-# Attach to class
-TeamCosEnv._xml_actuators_fixed = _xml_actuators_fixed
+# Note: `_xml_actuators_fixed` is implemented as a method on `TeamCosEnv`
+# earlier in this file to satisfy static analysis and provide a stable
+# fallback for actuator XML generation.
