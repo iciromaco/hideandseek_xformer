@@ -198,7 +198,7 @@ class TeamCosEnv(gym.Env):
     AGENT_Z_MIN = -0.05
     AGENT_Z_MAX = 1.20
     AGENT_MAX_VZ = 2.2
-    RAMP_JOINT_DAMPING = 100.0
+    RAMP_JOINT_DAMPING = 80.0
     BOX_JOINT_DAMPING = 100.0
     RAMP_MASS = 60.0
     RAMP_INNER_WEIGHT_MASS = 30.0
@@ -210,7 +210,7 @@ class TeamCosEnv(gym.Env):
     GRAB_FOLLOW_GAIN = 8.0
     GRAB_MAX_SPEED = 2.6
     GRAB_BREAK_DIST = 2.8
-    RAMP_BOOST_FWD = 0.35
+    RAMP_BOOST_FWD = 0.5
     # number of simulation steps to hold a previously-engaged boost when a
     # transient CLEAR condition is observed (mitigates brief overshoots/noise)
     RAMP_BOOST_HOLD_STEPS = 8
@@ -245,7 +245,10 @@ class TeamCosEnv(gym.Env):
     # Optional per-step accumulated force clamp applied before writing data.xfrc_applied
     WALL_REPULSION_ACCUM_CLAMP_MAX = 100.0
     # Debug: when True, always print sampled SDF and normal each step (for debugging only)
-    FORCE_WALL_SDF_DEBUG = True
+    FORCE_WALL_SDF_DEBUG = False
+    # When True, enable verbose wall-related debug logging even when debug_mode is True.
+    # Default False to keep debug output minimal.
+    WALL_DEBUG_VERBOSE = False
     # Expanded application distance for wall feedback (m). Raised from 0.5 to 0.9 by default.
     WALL_REPULSION_TARGET_DIST = 0.9
     # Facing-dot threshold for applying feedback force: require agent forward to be
@@ -1975,13 +1978,16 @@ class TeamCosEnv(gym.Env):
             dist, nx, ny = self.vis_engine.sample_sdf_with_normal(learnable_agent_pos[0], learnable_agent_pos[1])
             # force debug output when requested by runtime flag
             try:
-                if getattr(self, "FORCE_WALL_SDF_DEBUG", False):
+                if getattr(self, "FORCE_WALL_SDF_DEBUG", False) and self.debug_mode:
                     mnx = getattr(self.vis_engine, "_mode4_min_x", None)
                     mny = getattr(self.vis_engine, "_mode4_min_y", None)
                     cell = getattr(self.vis_engine, "_mode4_cell_size", None)
-                    print(
-                        f"[FORCE_WALL_SDF] step={self.current_step} pos=({learnable_agent_pos[0]:.3f},{learnable_agent_pos[1]:.3f}) dist={dist:.3f} normal=({nx:.3f},{ny:.3f}) grid_min=({mnx},{mny}) cell={cell}"
-                    )
+                    try:
+                        self.debug_logger.print(
+                            f"[FORCE_WALL_SDF] step={self.current_step} pos=({learnable_agent_pos[0]:.3f},{learnable_agent_pos[1]:.3f}) dist={dist:.3f} normal=({nx:.3f},{ny:.3f}) grid_min=({mnx},{mny}) cell={cell}"
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # use clearance = (surface distance) - (agent effective radius)
@@ -2020,23 +2026,26 @@ class TeamCosEnv(gym.Env):
                 boost_val = 0.0
             BOOST_THRESH = 0.05
             if float(agent_z) >= float(self.WALL_REPULSION_SUPPRESS_Z) and (boost_val > BOOST_THRESH) and (not near_arena_edge_x) and (not near_arena_edge_y):
-                if self.debug_mode:
+                if self.debug_mode and getattr(self, "WALL_DEBUG_VERBOSE", False):
                     try:
                         self.debug_logger.print(
                             f"[DEBUG][wall_repulsion] suppressed_ramp step={self.current_step} agent={self.learnable_agent_key} z={agent_z:.3f} boost={boost_val:.3f} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f}) dist={dist:.3f} clearance={clearance:.3f}"
                         )
                     except Exception:
-                        print(f"[DEBUG][wall_repulsion] suppressed_ramp agent={self.learnable_agent_key} z={agent_z:.3f} boost={boost_val:.3f} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f})")
+                        pass
             else:
                 # debug: when agent is near arena edge, log sampled SDF and normal
                 try:
-                    if getattr(self, "debug_mode", False) and (near_arena_edge_x or near_arena_edge_y):
+                    if getattr(self, "debug_mode", False) and (near_arena_edge_x or near_arena_edge_y) and getattr(self, "WALL_DEBUG_VERBOSE", False):
                         mnx = getattr(self.vis_engine, "_mode4_min_x", None)
                         mny = getattr(self.vis_engine, "_mode4_min_y", None)
                         cell = getattr(self.vis_engine, "_mode4_cell_size", None)
-                        print(
-                            f"[DEBUG][wall_edge] step={self.current_step} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f}) dist={dist:.3f} normal=({nx:.3f},{ny:.3f}) clearance={clearance:.3f} grid_min=({mnx},{mny}) cell={cell}"
-                        )
+                        try:
+                            self.debug_logger.print(
+                                f"[DEBUG][wall_edge] step={self.current_step} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f}) dist={dist:.3f} normal=({nx:.3f},{ny:.3f}) clearance={clearance:.3f} grid_min=({mnx},{mny}) cell={cell}"
+                            )
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 # controller contribution: act when clearance < target_dist
@@ -2127,10 +2136,13 @@ class TeamCosEnv(gym.Env):
                 fy_tot = fb_fy + ctrl_fy
                 # debug: if normal is zeroed near wall, emit diagnostic to help root-cause
                 try:
-                    if abs(nx) < 1e-8 and abs(ny) < 1e-8 and float(dist) < 1.0:
-                        print(
-                            f"[DEBUG][wall_sdf] step={self.current_step} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f}) dist={dist:.3f} normal=({nx:.3f},{ny:.3f}) grid_min=({getattr(self.vis_engine,'_mode4_min_x',None)},{getattr(self.vis_engine,'_mode4_min_y',None)}) cell={getattr(self.vis_engine,'_mode4_cell_size',None)}"
-                        )
+                    if abs(nx) < 1e-8 and abs(ny) < 1e-8 and float(dist) < 1.0 and self.debug_mode and getattr(self, "WALL_DEBUG_VERBOSE", False):
+                        try:
+                            self.debug_logger.print(
+                                f"[DEBUG][wall_sdf] step={self.current_step} pos=({apos_xy[0]:.3f},{apos_xy[1]:.3f}) dist={dist:.3f} normal=({nx:.3f},{ny:.3f}) grid_min=({getattr(self.vis_engine,'_mode4_min_x',None)},{getattr(self.vis_engine,'_mode4_min_y',None)}) cell={getattr(self.vis_engine,'_mode4_cell_size',None)}"
+                            )
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 f_tot = math.hypot(fx_tot, fy_tot)
@@ -2164,13 +2176,11 @@ class TeamCosEnv(gym.Env):
                     # log the override check unconditionally to verify it's seen
                     try:
                         msg = f"[DEBUG][wall_override_check] step={self.current_step} override_force={override_force} override_clear={override_clear} clearance={clearance:.3f} normal=({nx:.3f},{ny:.3f})"
-                        if self.debug_mode:
+                        if self.debug_mode and getattr(self, "WALL_DEBUG_VERBOSE", False):
                             try:
                                 self.debug_logger.print(msg)
                             except Exception:
-                                print(msg)
-                        else:
-                            print(msg)
+                                pass
                     except Exception:
                         pass
                     # if override is enabled and agent is within override_clear, apply strong outward force
@@ -2181,13 +2191,11 @@ class TeamCosEnv(gym.Env):
                         # always log when applying override
                         try:
                             msg2 = f"[DEBUG][wall_override] step={self.current_step} APPLY OVERRIDE force=({fx_tot:.1f},{fy_tot:.1f}) clearance={clearance:.3f}"
-                            if self.debug_mode:
+                            if self.debug_mode and getattr(self, "WALL_DEBUG_VERBOSE", False):
                                 try:
                                     self.debug_logger.print(msg2)
                                 except Exception:
-                                    print(msg2)
-                            else:
-                                print(msg2)
+                                    pass
                         except Exception:
                             pass
                     # Immediate debug force: when running in debug_mode and an override
@@ -2201,13 +2209,11 @@ class TeamCosEnv(gym.Env):
                                 fy_tot = -float(ny) * float(override_force)
                                 try:
                                     msg_dbg = f"[DEBUG][wall_override_force_now] step={self.current_step} FORCE_NOW APPLY force=({fx_tot:.1f},{fy_tot:.1f}) clearance={clearance:.3f}"
-                                    if self.debug_mode:
+                                    if self.debug_mode and getattr(self, "WALL_DEBUG_VERBOSE", False):
                                         try:
                                             self.debug_logger.print(msg_dbg)
                                         except Exception:
-                                            print(msg_dbg)
-                                    else:
-                                        print(msg_dbg)
+                                            pass
                                 except Exception:
                                     pass
                     except Exception:
@@ -2239,13 +2245,11 @@ class TeamCosEnv(gym.Env):
                             pass
                         try:
                             msg3 = f"[DEBUG][wall_force_write_now] step={self.current_step} WRITE_NOW force=({fx_tot:.1f},{fy_tot:.1f})"
-                            if self.debug_mode:
+                            if self.debug_mode and getattr(self, "WALL_DEBUG_VERBOSE", False):
                                 try:
                                     self.debug_logger.print(msg3)
                                 except Exception:
-                                    print(msg3)
-                            else:
-                                print(msg3)
+                                    pass
                         except Exception:
                             pass
                     # single write to the external force buffer to avoid partial accumulation
@@ -2275,26 +2279,24 @@ class TeamCosEnv(gym.Env):
                                 if aid is not None:
                                     # scale down current ctrl value to reduce push
                                     self.data.ctrl[aid] = float(self.data.ctrl[aid]) * atten_factor
-                                    if self.debug_mode:
+                                    if self.debug_mode and getattr(self, "WALL_DEBUG_VERBOSE", False):
                                         try:
                                             self.debug_logger.print(
                                                 f"[DEBUG][wall_attenuate] step={self.current_step} agent={self.learnable_agent_key} clearance={clearance:.3f} old_ctrl={float(self.data.ctrl[aid])/atten_factor:.3f} new_ctrl={float(self.data.ctrl[aid]):.3f}"
                                             )
                                         except Exception:
-                                            print(f"[DEBUG][wall_attenuate] agent={self.learnable_agent_key} clearance={clearance:.3f}")
+                                            pass
                             except Exception:
                                 pass
                 except Exception:
                     pass
-                if self.debug_mode:
+                if self.debug_mode and getattr(self, "WALL_DEBUG_VERBOSE", False):
                     try:
                         self.debug_logger.print(
                             f"[DEBUG][wall_repulsion] step={self.current_step} agent={self.learnable_agent_key} dist={dist:.3f} clearance={clearance:.3f} facing_dot={facing_dot:.3f} applied_fwd={applied_fwd:.3f} fb=({fb_fx:.1f},{fb_fy:.1f}) ctrl=({ctrl_fx:.1f},{ctrl_fy:.1f}) fx={fx_tot:.1f} fy={fy_tot:.1f}"
                         )
                     except Exception:
-                        print(
-                            f"[DEBUG][wall_repulsion] agent={self.learnable_agent_key} dist={dist:.3f} clearance={clearance:.3f} facing_dot={facing_dot:.3f} applied_fwd={applied_fwd:.3f} f_tot={f_tot:.1f}"
-                        )
+                        pass
                     try:
                         # additional low-level debug: actuator ctrl, written xfrc, contacts, and local velocity
                         aid = self.actuator_ids.get(f"{self.learnable_agent_key}_fwd")
@@ -2310,9 +2312,13 @@ class TeamCosEnv(gym.Env):
                         except Exception:
                             avx = 0.0
                             avy = 0.0
-                        self.debug_logger.print(
-                            f"[DEBUG][wall_lowlevel] step={self.current_step} agent={self.learnable_agent_key} ctrl_fwd={ctrl_val} xfrc_applied={xfrc_written} vel=({avx:.3f},{avy:.3f}) ncon={ncon}"
-                        )
+                        if getattr(self, "WALL_DEBUG_VERBOSE", False):
+                            try:
+                                self.debug_logger.print(
+                                    f"[DEBUG][wall_lowlevel] step={self.current_step} agent={self.learnable_agent_key} ctrl_fwd={ctrl_val} xfrc_applied={xfrc_written} vel=({avx:.3f},{avy:.3f}) ncon={ncon}"
+                                )
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                 # 接触時の回転（壁方向へ回り込む）を抑制する追加処理:
@@ -2352,16 +2358,16 @@ class TeamCosEnv(gym.Env):
                                     self.data.xfrc_applied[bid, 5] = float(self.data.xfrc_applied[bid, 5]) + mz
                             except Exception:
                                 pass
-                            if self.debug_mode:
+                            if self.debug_mode and getattr(self, "WALL_DEBUG_VERBOSE", False):
                                 try:
                                     self.debug_logger.print(f"[DEBUG][wall_rot] step={self.current_step} agent={self.learnable_agent_key} ncon={ncon} ang_vel_z={ang_vel_z:.3f} mz={mz:.3f}")
                                 except Exception:
-                                    print(f"[DEBUG][wall_rot] agent={self.learnable_agent_key}")
+                                    pass
                         except Exception:
                             pass
                     # 接触ごとの詳細ダンプ（デバッグ用、属性が存在するものだけ安全に取得）
                     try:
-                        if self.debug_mode and ncon > 0:
+                        if self.debug_mode and ncon > 0 and getattr(self, "WALL_DEBUG_VERBOSE", False):
                             detail_lines = []
                             max_dump = min(int(ncon), 32)
                             for ci in range(max_dump):
