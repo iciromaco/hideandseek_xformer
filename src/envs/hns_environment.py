@@ -32,6 +32,15 @@ from models.ppo_transformer_v2 import AgentV2
 
 # module logger
 logger = logging.getLogger(__name__)
+# Central log level control via environment variable HNS_LOG_LEVEL
+# Example: export HNS_LOG_LEVEL=DEBUG
+try:
+    _hns_level = os.environ.get("HNS_LOG_LEVEL", "").strip().upper()
+    if _hns_level:
+        if hasattr(logging, _hns_level):
+            logger.setLevel(getattr(logging, _hns_level))
+except Exception:
+    pass
 
 # Pylint: mujoco C-extension exposes members dynamically; suppress no-member and
 # broad-exception warnings here to reduce false positives from static analysis.
@@ -51,21 +60,48 @@ class DebugLogger:
         self._policy_src_logged = set()
 
     def print(self, message):
-        if self.console:
-            print(message)
+        # Route debug messages through Python logging so output obeys
+        # centralized log level (`HNS_LOG_LEVEL`). Only emit when enabled.
+        if not self.enabled:
+            return
+        try:
+            # Prefer structured logging levels: messages starting with
+            # '[DEBUG]' are emitted at DEBUG level, others at INFO.
+            if isinstance(message, str) and message.startswith("[DEBUG]"):
+                logger.debug(message)
+            else:
+                logger.info(message)
+        except Exception:
+            try:
+                logger.exception("DebugLogger.print failed")
+            except Exception:
+                pass
 
     def print_throttled(self, key, message, current_step, force=False):
         # preserve previous behavior: suppressed unless logger enabled
         if not self.enabled and not force:
             return
-        # original implementation had no-op; keep suppressed behaviour
-        return
+        try:
+            if isinstance(message, str) and message.startswith("[DEBUG]"):
+                logger.debug(message)
+            else:
+                logger.info(message)
+        except Exception:
+            try:
+                logger.exception("DebugLogger.print_throttled failed")
+            except Exception:
+                pass
 
     def log_policy_src(self, agent_key, source, current_step, force=False):
         if not self.enabled and not force:
             return
-        # preserved as no-op for now (external sinks may implement later)
-        return
+        try:
+            logger.debug(f"[POLICY_SRC] step={current_step} agent={agent_key} src={source}")
+        except Exception:
+            try:
+                logger.exception("DebugLogger.log_policy_src failed")
+            except Exception:
+                pass
 
     def clear_policy_src_log(self):
         self._policy_src_logged.clear()
