@@ -2304,6 +2304,17 @@ class TeamCosEnv(gym.Env):
                     afwd_x, afwd_y = 1.0, 0.0
                 ctrl_fx = ctrl_force * afwd_x
                 ctrl_fy = ctrl_force * afwd_y
+                # 推定ベースの反発は、エージェントが壁に向いていてかつ
+                # 十分近い場合にのみ適用する（既存実装と整合するためのゲート）
+                try:
+                    facing_dot = float(np.dot([afwd_x, afwd_y], [nx, ny]))
+                    target_dist = float(getattr(self, "WALL_REPULSION_TARGET_DIST", 0.9))
+                    fb_dot_th = float(getattr(self, "WALL_REPULSION_FB_FWD_DOT", -0.2))
+                    if not (facing_dot < fb_dot_th and float(dist) < target_dist):
+                        ctrl_fx = 0.0
+                        ctrl_fy = 0.0
+                except Exception:
+                    pass
             except Exception:
                 ctrl_fx = ctrl_fy = 0.0
 
