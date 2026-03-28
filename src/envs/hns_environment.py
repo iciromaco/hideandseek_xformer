@@ -2051,70 +2051,16 @@ class TeamCosEnv(gym.Env):
         dbg_ramp_rpos = None
         try:
             # _ramp_boost_gain が高いとランプ上にいる可能性が高いのでそれをフィルタに使う
-            boost = float(self._ramp_boost_gain(self.learnable_agent_key))
-            if boost > 0.0:
-                # agent の位置・高さ — qpos の z ではなく body の world z を使う
-                # (qpos.z はジョイント制約で AGENT_Z_MIN にクリップされるため、
-                #  実際のボディ高さを使う方がランプ接触の指標として有用)
-                agent_body_id = learnable_agent_body_id
-                agent_z = float(self.data.xpos[agent_body_id][2])
-                apos2 = learnable_agent_pos[:2]
-                # 学習対象の回転角（z）を取得して facing 計算に使う
-                arot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[self.learnable_agent_key]["rot"]]]
-                # 進捗正規化に使う範囲はランプごとの実ジオメトリから算出
-                for _i, rid in enumerate(self.ramp_ids, start=1):
-                    rpos = self.data.xpos[rid][:2]
-                    up = self._ramp_uphill_dir(rid)
-                    side = np.array([-up[1], up[0]], dtype=np.float32)
-                    rel = apos2 - rpos
-                    lx = float(np.dot(rel, up))
-                    ly = float(np.dot(rel, side))
-                    # 横ずれが大きければ無視
-                    if abs(ly) > 1.5:
-                        continue
-                    try:
-                        lx_min, lx_max, _ = self._compute_ramp_lx_bounds(rid, up)
-                    except Exception:
-                        lx_min, lx_max = -1.15, 0.666
-                    # 正規化された進捗（clamp 0..1）
-                    prog = (lx - lx_min) / max(1e-6, (lx_max - lx_min))
-                    prog = max(0.0, min(1.0, prog))
-                    # ランプの高さはブースト判定には関係しないため、
-                    # `dbg_agent_z` にはエージェントの world z をそのまま記録する。
-                    # 最も進捗が大きいランプを採用
-                    if dbg_ramp_progress is None or prog > dbg_ramp_progress:
-                        dbg_ramp_progress = float(prog)
-                        dbg_agent_z = float(agent_z)
-                        dbg_ramp_lx = float(lx)
-                        dbg_ramp_ly = float(ly)
-                        # facing はエージェント向きとランプ上り方向のコサイン
-                        afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
-                        dbg_ramp_facing = float(np.dot(afwd, up))
-                        dbg_ramp_rpos = rpos.copy()
-                        dbg_ramp_rid = rid
-                # end per-ramp loop
-                # If boost suggests a ramp but we didn't select any, emit per-ramp diagnostics
-                # to help tune filters (temporary verbose diagnostic).
-                if dbg_ramp_progress is None:
-                    try:
-                        details = []
-                        afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
-                        for i2, rid2 in enumerate(self.ramp_ids, start=1):
-                            rkey2 = f"ramp{i2}"
-                            st2 = self.object_state.get(rkey2, {})
-                            rpos2 = self.data.xpos[rid2][:2]
-                            up2 = self._ramp_uphill_dir(rid2)
-                            side2 = np.array([-up2[1], up2[0]], dtype=np.float32)
-                            rel2 = apos2 - rpos2
-                            lx2 = float(np.dot(rel2, up2))
-                            ly2 = float(np.dot(rel2, side2))
-                            facing2 = float(np.dot(afwd, up2))
-                            details.append(f"{rkey2}(mode={st2.get('mode')},owner={st2.get('owner')}," f"lx={lx2:.3f},ly={ly2:.3f},f={facing2:.3f},rpos=({rpos2[0]:.3f},{rpos2[1]:.3f}))")
-                        s = ", ".join(details)
-                        if getattr(self, "debug_mode", False):
-                            print(f"[RAMP_DBG_REJECT] step={getattr(self,'current_step',-1)} ak={self.learnable_agent_key} " f"boost={boost:.3f} candidates=[{s}]")
-                    except Exception:
-                        pass
+            rep = self._compute_ramp_debug(learnable_agent_pos, learnable_agent_body_id)
+            dbg_ramp_progress = rep.get("dbg_ramp_progress")
+            dbg_agent_z = rep.get("dbg_agent_z")
+            dbg_ramp_lx = rep.get("dbg_ramp_lx")
+            dbg_ramp_ly = rep.get("dbg_ramp_ly")
+            dbg_ramp_facing = rep.get("dbg_ramp_facing")
+            dbg_ramp_rpos = rep.get("dbg_ramp_rpos")
+            dbg_ramp_rid = rep.get("dbg_ramp_rid")
+            dbg_ramp_climbing = rep.get("dbg_ramp_climbing", False)
+            dbg_ramp_reached_top = rep.get("dbg_ramp_reached_top", False)
             # detect climbing (agent z increasing while on/near ramp) and reaching top
             prev_z = self._prev_agent_z.get(self.learnable_agent_key, None)
             dbg_ramp_climbing = False
