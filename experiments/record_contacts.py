@@ -1,11 +1,13 @@
+import json
 import os
 import sys
-import json
+
 import numpy as np
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.envs.hns_environment import TeamCosEnv
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from experiments.utils import prepare_env
+from src.envs.hns_environment import TeamCosEnv
+
 try:
     import tomllib as _tomlib
 except Exception:
@@ -16,13 +18,13 @@ except Exception:
 
 
 def _load_action_repeat_from_config():
-    cfg_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'hparams_main27.toml')
+    cfg_path = os.path.join(os.path.dirname(__file__), "..", "configs", "hparams_main27.toml")
     if _tomlib is None:
         return None
     try:
-        with open(cfg_path, 'rb') as f:
+        with open(cfg_path, "rb") as f:
             cfg = _tomlib.load(f)
-        return int(cfg.get('runtime', {}).get('common', {}).get('action_repeat', 0) or 0)
+        return int(cfg.get("runtime", {}).get("common", {}).get("action_repeat", 0) or 0)
     except Exception:
         return None
 
@@ -36,8 +38,17 @@ def dump_contacts(env, step):
             g1 = env.model.geom(c.geom1).name
             g2 = env.model.geom(c.geom2).name
         except Exception:
-            g1 = int(c.geom1); g2 = int(c.geom2)
-        out.append({'i': i, 'geom1': g1, 'geom2': g2, 'pos': list(c.pos), 'frame': list(c.frame)})
+            g1 = int(c.geom1)
+            g2 = int(c.geom2)
+        out.append(
+            {
+                "i": i,
+                "geom1": g1,
+                "geom2": g2,
+                "pos": list(c.pos),
+                "frame": list(c.frame),
+            }
+        )
     return out
 
 
@@ -65,8 +76,8 @@ def dump_cfrc(env, body_name):
             return None
 
 
-def main(steps=500, out_json='experiments/contact_trace.json'):
-    os.makedirs(os.path.dirname(out_json) or '.', exist_ok=True)
+def main(steps=500, out_json="experiments/contact_trace.json"):
+    os.makedirs(os.path.dirname(out_json) or ".", exist_ok=True)
     env = TeamCosEnv(debug_mode=False, target="seeker")
     ar = _load_action_repeat_from_config()
     if ar:
@@ -77,7 +88,7 @@ def main(steps=500, out_json='experiments/contact_trace.json'):
     # warm
     env.step(env.action_space.sample())
 
-    wait_steps = getattr(env, 'prep_steps', 80)
+    wait_steps = getattr(env, "prep_steps", 80)
     for _ in range(wait_steps):
         env.step(env.action_space.sample() * 0.0)
 
@@ -87,7 +98,7 @@ def main(steps=500, out_json='experiments/contact_trace.json'):
         obs, rew, term, trunc, info = env.step(a)
         # basic kinematics
         # Prefer body linear velocity (xvelp) to match how batch runner measures vx.
-        v = [float(info.get('agent_vx', 0.0)), float(info.get('agent_vy', 0.0)), 0.0]
+        v = [float(info.get("agent_vx", 0.0)), float(info.get("agent_vy", 0.0)), 0.0]
         qv = None
         try:
             name = env.learnable_agent_key
@@ -98,31 +109,31 @@ def main(steps=500, out_json='experiments/contact_trace.json'):
         except Exception:
             # fall back to joint-based qvel if xvelp unavailable
             try:
-                qmap = getattr(env, 'qpos_indices', {})
+                qmap = getattr(env, "qpos_indices", {})
                 name = env.learnable_agent_key
                 if name in qmap:
-                    jx = qmap[name].get('x')
+                    jx = qmap[name].get("x")
                     if jx is not None:
                         dof_adr = int(env.model.jnt_dofadr[jx])
                         vx = float(env.data.qvel[dof_adr])
-                        vy = float(env.data.qvel[dof_adr+1])
+                        vy = float(env.data.qvel[dof_adr + 1])
                         v = [vx, vy, 0.0]
-                        qv = env.data.qvel[dof_adr:dof_adr+6].tolist()
+                        qv = env.data.qvel[dof_adr : dof_adr + 6].tolist()
             except Exception:
                 pass
         # contacts and forces
         contacts = dump_contacts(env, i)
         # keep cfrc dump but use anchor/body if present
-        cfrc = dump_cfrc(env, f"{env.learnable_agent_key}_body" )
+        cfrc = dump_cfrc(env, f"{env.learnable_agent_key}_body")
         # also capture applied joint/generalized forces for the agent
         qfrc_agent = None
         xfrc_agent = None
         try:
             # joint-space applied forces/torques (signed)
-            qmap = getattr(env, 'qpos_indices', {})
+            qmap = getattr(env, "qpos_indices", {})
             name = env.learnable_agent_key
             if name in qmap:
-                jx = qmap[name].get('x')
+                jx = qmap[name].get("x")
                 if jx is not None:
                     dof_adr = int(env.model.jnt_dofadr[jx])
                     qlen = env.data.qfrc_applied.shape[0]
@@ -157,36 +168,38 @@ def main(steps=500, out_json='experiments/contact_trace.json'):
         signed = None
         try:
             yaw = 0.0
-            rot_jid = env.qpos_indices[env.learnable_agent_key]['rot']
+            rot_jid = env.qpos_indices[env.learnable_agent_key]["rot"]
             qadr = env.model.jnt_qposadr[rot_jid]
             yaw = float(env.data.qpos[qadr])
             signed = float(v[0] * np.cos(yaw) + v[1] * np.sin(yaw))
         except Exception:
             try:
-                signed = float(info.get('agent_vx', 0.0))
+                signed = float(info.get("agent_vx", 0.0))
             except Exception:
                 signed = None
 
-        records.append({
-            'step': i,
-            'applied': float(applied_val) if applied_val is not None else float(info.get('applied_forward', 0.0)),
-            'vx': float(v[0]),
-            'vy': float(v[1]),
-            'signed_forward': signed,
-            'qvel_slice': qv,
-            'qfrc_applied': qfrc_agent,
-            'xfrc_applied': xfrc_agent,
-            'contacts': contacts,
-            'cfrc_body': cfrc,
-            'actuator_forces': actuator_forces,
-        })
+        records.append(
+            {
+                "step": i,
+                "applied": (float(applied_val) if applied_val is not None else float(info.get("applied_forward", 0.0))),
+                "vx": float(v[0]),
+                "vy": float(v[1]),
+                "signed_forward": signed,
+                "qvel_slice": qv,
+                "qfrc_applied": qfrc_agent,
+                "xfrc_applied": xfrc_agent,
+                "contacts": contacts,
+                "cfrc_body": cfrc,
+                "actuator_forces": actuator_forces,
+            }
+        )
         if term or trunc:
             env.reset()
-    out = {'records': records}
-    with open(out_json, 'w') as f:
+    out = {"records": records}
+    with open(out_json, "w") as f:
         json.dump(out, f, indent=2)
-    print('Saved', out_json)
+    print("Saved", out_json)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

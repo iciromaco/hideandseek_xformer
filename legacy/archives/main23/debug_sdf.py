@@ -5,10 +5,11 @@ SDF場のデバッグプログラム
 """
 
 import os
-import sys
-import numpy as np
 import pickle
+import sys
 from pathlib import Path
+
+import numpy as np
 
 # パスの設定
 current_script_abs_path_val = os.path.abspath(__file__)
@@ -33,7 +34,7 @@ except ImportError as e:
     raise
 
 import mujoco
-from main23_sightmap_optimized import VisibilityEngine, LIDAR_MAX_DIST
+from main23_sightmap_optimized import LIDAR_MAX_DIST, VisibilityEngine
 
 # ============================================
 # 初期化
@@ -45,9 +46,9 @@ mujoco.mj_resetData(model, data)
 
 # エージェント位置
 agent_positions = {
-    'seeker_body': np.array([3.0, 3.0]),
-    'hider1_body': np.array([1.0, 1.0]),
-    'hider2_body': np.array([5.0, 5.0])
+    "seeker_body": np.array([3.0, 3.0]),
+    "hider1_body": np.array([1.0, 1.0]),
+    "hider2_body": np.array([5.0, 5.0]),
 }
 
 # visibility engineの初期化
@@ -64,17 +65,29 @@ ramp_body = model.body("ramp_body").id
 visibility_engine.set_bodies(s0_body, h1_body, h2_body, box1_body, box2_body, ramp_body)
 
 # 動的オブジェクト位置
-visibility_engine.dynamic_positions[0] = agent_positions['seeker_body']
-visibility_engine.dynamic_positions[1] = agent_positions['hider1_body']
-visibility_engine.dynamic_positions[2] = agent_positions['hider2_body']
+visibility_engine.dynamic_positions[0] = agent_positions["seeker_body"]
+visibility_engine.dynamic_positions[1] = agent_positions["hider1_body"]
+visibility_engine.dynamic_positions[2] = agent_positions["hider2_body"]
 visibility_engine.dynamic_positions[3] = np.array([2.0, -2.0])
 visibility_engine.dynamic_positions[4] = np.array([-2.0, 2.0])
 visibility_engine.dynamic_positions[5] = np.array([0.0, 0.0])
 
 # エージェント位置を data に反映
-data.qpos[0:3] = [agent_positions['seeker_body'][0], agent_positions['seeker_body'][1], 0.5]
-data.qpos[3:6] = [agent_positions['hider1_body'][0], agent_positions['hider1_body'][1], 0.5]
-data.qpos[6:9] = [agent_positions['hider2_body'][0], agent_positions['hider2_body'][1], 0.5]
+data.qpos[0:3] = [
+    agent_positions["seeker_body"][0],
+    agent_positions["seeker_body"][1],
+    0.5,
+]
+data.qpos[3:6] = [
+    agent_positions["hider1_body"][0],
+    agent_positions["hider1_body"][1],
+    0.5,
+]
+data.qpos[6:9] = [
+    agent_positions["hider2_body"][0],
+    agent_positions["hider2_body"][1],
+    0.5,
+]
 
 mujoco.mj_forward(model, data)
 
@@ -106,99 +119,99 @@ print("-" * 80)
 if visibility_engine.sdf_field is not None:
     grid_size = visibility_engine.sdf_field.shape
     print(f"SDF field shape: {grid_size}")
-    
+
     # cell_sizeの計算
     # SDF場は (-6, 6) の範囲をカバーしているはず
     # つまり幅は 12.0
     cell_size = 12.0 / (grid_size[0] - 1)
     print(f"Cell size (calculated): {cell_size:.6f}")
-    
+
     # テスト点1: (-4, -4) - 視点
     p_x, p_y = -4.0, -4.0
     grid_x = (p_x + 6.0) / cell_size
     grid_y = (p_y + 6.0) / cell_size
-    print(f"\nPoint (-4.0, -4.0):")
+    print("\nPoint (-4.0, -4.0):")
     print(f"  Grid coords: ({grid_x:.2f}, {grid_y:.2f})")
-    
+
     x = int(grid_x + 0.5)
     y = int(grid_y + 0.5)
     print(f"  Rounded grid indices: ({x}, {y})")
-    
+
     if 0 <= x < grid_size[0] and 0 <= y < grid_size[1]:
         sdf_val = visibility_engine.sdf_field[x, y]
         print(f"  SDF value: {sdf_val:.4f}")
     else:
-        print(f"  Out of bounds!")
-    
+        print("  Out of bounds!")
+
     # テスト点2: (0, 0)
     p_x, p_y = 0.0, 0.0
     grid_x = (p_x + 6.0) / cell_size
     grid_y = (p_y + 6.0) / cell_size
-    print(f"\nPoint (0.0, 0.0):")
+    print("\nPoint (0.0, 0.0):")
     print(f"  Grid coords: ({grid_x:.2f}, {grid_y:.2f})")
-    
+
     x = int(grid_x + 0.5)
     y = int(grid_y + 0.5)
     print(f"  Rounded grid indices: ({x}, {y})")
-    
+
     if 0 <= x < grid_size[0] and 0 <= y < grid_size[1]:
         sdf_val = visibility_engine.sdf_field[x, y]
         print(f"  SDF value: {sdf_val:.4f}")
     else:
-        print(f"  Out of bounds!")
-    
+        print("  Out of bounds!")
+
     # テスト点3: (3.0, 3.0) - seeker位置
     p_x, p_y = 3.0, 3.0
     grid_x = (p_x + 6.0) / cell_size
     grid_y = (p_y + 6.0) / cell_size
-    print(f"\nPoint (3.0, 3.0) - Seeker position:")
+    print("\nPoint (3.0, 3.0) - Seeker position:")
     print(f"  Grid coords: ({grid_x:.2f}, {grid_y:.2f})")
-    
+
     x = int(grid_x + 0.5)
     y = int(grid_y + 0.5)
     print(f"  Rounded grid indices: ({x}, {y})")
-    
+
     if 0 <= x < grid_size[0] and 0 <= y < grid_size[1]:
         sdf_val = visibility_engine.sdf_field[x, y]
         print(f"  SDF value: {sdf_val:.4f}")
     else:
-        print(f"  Out of bounds!")
-    
+        print("  Out of bounds!")
+
     # テスト点4: (6.0, 6.0) - 境界
     p_x, p_y = 6.0, 6.0
     grid_x = (p_x + 6.0) / cell_size
     grid_y = (p_y + 6.0) / cell_size
-    print(f"\nPoint (6.0, 6.0) - Boundary:")
+    print("\nPoint (6.0, 6.0) - Boundary:")
     print(f"  Grid coords: ({grid_x:.2f}, {grid_y:.2f})")
-    
+
     x = int(grid_x + 0.5)
     y = int(grid_y + 0.5)
     print(f"  Rounded grid indices: ({x}, {y})")
-    
+
     if 0 <= x < grid_size[0] and 0 <= y < grid_size[1]:
         sdf_val = visibility_engine.sdf_field[x, y]
         print(f"  SDF value: {sdf_val:.4f}")
     else:
-        print(f"  Out of bounds!")
-    
+        print("  Out of bounds!")
+
     # ============================================
     # SDF場の統計情報
     # ============================================
-    print(f"\n" + "=" * 80)
+    print("\n" + "=" * 80)
     print("SDF Field Statistics:")
     print("=" * 80)
     print(f"Min value: {visibility_engine.sdf_field.min():.4f}")
     print(f"Max value: {visibility_engine.sdf_field.max():.4f}")
     print(f"Mean value: {visibility_engine.sdf_field.mean():.4f}")
     print(f"Std value: {visibility_engine.sdf_field.std():.4f}")
-    
+
     # 負の値（内部）の割合
     negative_count = np.sum(visibility_engine.sdf_field < 0)
     positive_count = np.sum(visibility_engine.sdf_field > 0)
     total_count = visibility_engine.sdf_field.size
     print(f"\nNegative (inside): {negative_count} ({100*negative_count/total_count:.1f}%)")
     print(f"Positive (outside): {positive_count} ({100*positive_count/total_count:.1f}%)")
-    
+
     print("\n" + "=" * 80)
 
 else:

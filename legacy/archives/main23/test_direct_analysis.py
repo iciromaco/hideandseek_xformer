@@ -4,13 +4,10 @@
 """
 
 import numpy as np
-from main23_sightmap_optimized import (
-    VisibilityEngine,
-    cast_ray_direct_numba
-)
 
 # セットアップ（前と同じ）
 from hideandseek import create_env
+from main23_sightmap_optimized import VisibilityEngine, cast_ray_direct_numba
 
 model, data = create_env()
 visibility_engine = VisibilityEngine(model, data)
@@ -30,17 +27,24 @@ for beam_idx in range(12):
     angle = lidar_angles[beam_idx]
     dir_x = np.cos(seeker_yaw + angle)
     dir_y = np.sin(seeker_yaw + angle)
-    
+
     dist, hit = cast_ray_direct_numba(
-        seeker_x, seeker_y, dir_x, dir_y,
-        visibility_engine.positions, visibility_engine.radii,
-        visibility_engine.body_ids, visibility_engine.num_objects,
-        visibility_engine.wall_segments, visibility_engine.num_walls,
-        seeker_body_id, -1,
-        15.0
+        seeker_x,
+        seeker_y,
+        dir_x,
+        dir_y,
+        visibility_engine.positions,
+        visibility_engine.radii,
+        visibility_engine.body_ids,
+        visibility_engine.num_objects,
+        visibility_engine.wall_segments,
+        visibility_engine.num_walls,
+        seeker_body_id,
+        -1,
+        15.0,
     )
-    
+
     print(f"\nBeam {beam_idx:2d} (angle={np.degrees(angle):6.1f}°): direction=({dir_x:7.4f}, {dir_y:7.4f}) -> {dist:7.4f}")
-    
+
     if dist >= 15.0:
-        print(f"  → 交点なし（15.0以上）")
+        print("  → 交点なし（15.0以上）")

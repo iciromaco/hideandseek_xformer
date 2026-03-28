@@ -6,10 +6,10 @@ Lidar Raycast Methods Validation
 
 import os
 import sys
-import ctypes
-import numpy as np
+
 import matplotlib.pyplot as plt
 import mujoco
+import numpy as np
 
 # main18_optimization をインポートしてbase_configとして使用
 current_script_abs_path_val = os.path.abspath(__file__)
@@ -35,8 +35,10 @@ except ImportError as e:
     raise
 
 from main23_sightmap_optimized import (
-    VisibilityEngine, cast_ray_direct_numba, cast_ray_numba,
-    LIDAR_MAX_DIST
+    LIDAR_MAX_DIST,
+    VisibilityEngine,
+    cast_ray_direct_numba,
+    cast_ray_numba,
 )
 
 # ============================================
@@ -54,16 +56,16 @@ mujoco.mj_resetData(model, data)
 # ============================================
 
 # 視点を迷路内部に設定（障害物の外側）
-viewpoint = np.array([-2.0, -.0], dtype=np.float32)  # 部屋の内部に移動
+viewpoint = np.array([-2.0, -0.0], dtype=np.float32)  # 部屋の内部に移動
 yaw = np.pi / 3  # 60度
 SEEKER_BODY_ID = -1  # seekerも検出対象に含める
 EXCLUDE_BODY_ID = -1  # テスト用: 何も除外しない
 
 # エージェントの位置を設定（検証用）
 agent_positions = {
-    'seeker_body': np.array([3.0, 3.0]),
-    'hider1_body': np.array([1.0, 1.0]),
-    'hider2_body': np.array([5.0, 5.0])
+    "seeker_body": np.array([3.0, 3.0]),
+    "hider1_body": np.array([1.0, 1.0]),
+    "hider2_body": np.array([5.0, 5.0]),
 }
 
 print("[DEBUG] Agent positions (before visibility_engine):")
@@ -84,12 +86,12 @@ ramp_body = model.body("ramp_body").id
 visibility_engine.set_bodies(s0_body, h1_body, h2_body, box1_body, box2_body, ramp_body)
 
 # 手動で動的オブジェクト位置を設定
-visibility_engine.dynamic_positions[0] = agent_positions['seeker_body']
-visibility_engine.dynamic_positions[1] = agent_positions['hider1_body']
-visibility_engine.dynamic_positions[2] = agent_positions['hider2_body']
+visibility_engine.dynamic_positions[0] = agent_positions["seeker_body"]
+visibility_engine.dynamic_positions[1] = agent_positions["hider1_body"]
+visibility_engine.dynamic_positions[2] = agent_positions["hider2_body"]
 visibility_engine.dynamic_positions[3] = np.array([2.0, -2.0])  # box1
 visibility_engine.dynamic_positions[4] = np.array([-2.0, 2.0])  # box2
-visibility_engine.dynamic_positions[5] = np.array([0.0, 0.0])   # ramp
+visibility_engine.dynamic_positions[5] = np.array([0.0, 0.0])  # ramp
 
 print("\n[DEBUG] visibility_engine positions AFTER manual set:")
 for i in range(6):
@@ -105,23 +107,23 @@ for i in range(6):
 #   maze_w3: pos=(0.0, 3.0), size=(0.2, 1.5)  → 縦長 x=[-0.1,0.1], y=[1.5,4.5]
 wall_segments = [
     # 外壁 4本
-    ((-6.0, 6.0), (6.0, 6.0)),    # 北壁
+    ((-6.0, 6.0), (6.0, 6.0)),  # 北壁
     ((-6.0, -6.0), (6.0, -6.0)),  # 南壁
-    ((6.0, -6.0), (6.0, 6.0)),    # 東壁
+    ((6.0, -6.0), (6.0, 6.0)),  # 東壁
     ((-6.0, -6.0), (-6.0, 6.0)),  # 西壁
     # 内壁 8本（4壁の上下/左右の辺）
     # maze_w0: 横長 x=[1.5,4.5], y=[1.3,1.7] → 上下の辺
-    ((1.5, 1.7), (4.5, 1.7)),     # maze_w0 上辺
-    ((1.5, 1.3), (4.5, 1.3)),     # maze_w0 下辺
+    ((1.5, 1.7), (4.5, 1.7)),  # maze_w0 上辺
+    ((1.5, 1.3), (4.5, 1.3)),  # maze_w0 下辺
     # maze_w1: 横長 x=[-4.5,-1.5], y=[-1.7,-1.3] → 上下の辺
-    ((-4.5, -1.3), (-1.5, -1.3)), # maze_w1 上辺
-    ((-4.5, -1.7), (-1.5, -1.7)), # maze_w1 下辺
+    ((-4.5, -1.3), (-1.5, -1.3)),  # maze_w1 上辺
+    ((-4.5, -1.7), (-1.5, -1.7)),  # maze_w1 下辺
     # maze_w2: 縦長 x=[-0.1,0.1], y=[-4.5,-1.5] → 左右の辺
-    ((-0.1, -4.5), (-0.1, -1.5)), # maze_w2 左辺
-    ((0.1, -4.5), (0.1, -1.5)),   # maze_w2 右辺
+    ((-0.1, -4.5), (-0.1, -1.5)),  # maze_w2 左辺
+    ((0.1, -4.5), (0.1, -1.5)),  # maze_w2 右辺
     # maze_w3: 縦長 x=[-0.1,0.1], y=[1.5,4.5] → 左右の辺
-    ((-0.1, 1.5), (-0.1, 4.5)),   # maze_w3 左辺
-    ((0.1, 1.5), (0.1, 4.5))      # maze_w3 右辺
+    ((-0.1, 1.5), (-0.1, 4.5)),  # maze_w3 左辺
+    ((0.1, 1.5), (0.1, 4.5)),  # maze_w3 右辺
 ]
 
 visibility_engine.static_walls = wall_segments
@@ -146,8 +148,9 @@ print(f"num_dynamic_objects: {visibility_engine.num_dynamic_objects}")
 
 # SDF距離場の読み込み
 try:
-    from pathlib import Path
     import pickle
+    from pathlib import Path
+
     cache_file = Path("sdf_distance_field.pkl")
     if cache_file.exists():
         with open(cache_file, "rb") as f:
@@ -164,9 +167,21 @@ print("\nLaunching MuJoCo Viewer...")
 print("Close the viewer window to continue with validation.")
 
 # エージェント位置を data に反映
-data.qpos[0:3] = [agent_positions['seeker_body'][0], agent_positions['seeker_body'][1], 0.5]   # seeker
-data.qpos[3:6] = [agent_positions['hider1_body'][0], agent_positions['hider1_body'][1], 0.5]   # hider1
-data.qpos[6:9] = [agent_positions['hider2_body'][0], agent_positions['hider2_body'][1], 0.5]   # hider2
+data.qpos[0:3] = [
+    agent_positions["seeker_body"][0],
+    agent_positions["seeker_body"][1],
+    0.5,
+]  # seeker
+data.qpos[3:6] = [
+    agent_positions["hider1_body"][0],
+    agent_positions["hider1_body"][1],
+    0.5,
+]  # hider1
+data.qpos[6:9] = [
+    agent_positions["hider2_body"][0],
+    agent_positions["hider2_body"][1],
+    0.5,
+]  # hider2
 
 mujoco.mj_forward(model, data)
 
@@ -193,15 +208,15 @@ print(f"Viewpoint: {viewpoint}")
 if visibility_engine.sdf_field is not None:
     grid_size = visibility_engine.sdf_field.shape
     cell_size = 12.0 / (grid_size[0] - 1)
-    
+
     # グリッド座標を計算
     grid_x = (viewpoint[0] + 6.0) / cell_size
     grid_y = (viewpoint[1] + 6.0) / cell_size
-    
+
     print(f"Grid coordinates: ({grid_x:.2f}, {grid_y:.2f})")
     print(f"Grid size: {grid_size}")
     print(f"Cell size: {cell_size:.4f}")
-    
+
     # 最近傍のグリッドポイントでの SDF 値
     x = int(grid_x + 0.5)
     y = int(grid_y + 0.5)
@@ -209,7 +224,7 @@ if visibility_engine.sdf_field is not None:
         sdf_val = visibility_engine.sdf_field[x, y]
         print(f"SDF value at viewpoint: {sdf_val:.4f}")
         print(f"  -> Positive (outside): {sdf_val > 0}, Negative (inside): {sdf_val < 0}")
-    
+
 print()
 
 # ============================================
@@ -217,8 +232,8 @@ print()
 # ============================================
 
 # Lidar設定（main18と同じ）
-surround = np.linspace(0, 2*np.pi, 8, endpoint=False)  # 45度ごとの8方向
-front = np.linspace(-np.pi/6, np.pi/6, 5)  # 前方±30度の5方向
+surround = np.linspace(0, 2 * np.pi, 8, endpoint=False)  # 45度ごとの8方向
+front = np.linspace(-np.pi / 6, np.pi / 6, 5)  # 前方±30度の5方向
 lidar_angles = np.unique(np.concatenate([surround, front]))
 n_beams = len(lidar_angles)
 
@@ -247,14 +262,14 @@ print("ENVIRONMENT DEBUG INFO:")
 print("=" * 80)
 print(f"Number of wall segments: {len(visibility_engine.static_walls) if visibility_engine.static_walls else 0}")
 if visibility_engine.static_walls:
-    print(f"All wall segments:")
+    print("All wall segments:")
     for i, seg in enumerate(visibility_engine.static_walls):
         print(f"  Segment {i}: ({seg[0][0]:.2f}, {seg[0][1]:.2f}) -> ({seg[1][0]:.2f}, {seg[1][1]:.2f})")
 
 print(f"\nNumber of dynamic objects: {visibility_engine.num_dynamic_objects}")
 print(f"Dynamic radii: {visibility_engine.dynamic_radii[:visibility_engine.num_dynamic_objects]}")
 if visibility_engine.num_dynamic_objects > 0:
-    print(f"Dynamic objects:")
+    print("Dynamic objects:")
     for i in range(visibility_engine.num_dynamic_objects):
         pos = visibility_engine.dynamic_positions[i]
         radius = visibility_engine.dynamic_radii[i]
@@ -274,7 +289,7 @@ distances_mujoco = []
 print("\n[BEAM DIRECTION DEBUG]")
 print(f"Lidar angles (degrees): {np.degrees(lidar_angles)}")
 for i in range(min(3, n_beams)):
-    dir_mag = np.sqrt(beam_cos[i]**2 + beam_sin[i]**2)
+    dir_mag = np.sqrt(beam_cos[i] ** 2 + beam_sin[i] ** 2)
     beam_angle = np.arctan2(beam_sin[i], beam_cos[i])
     print(f"Beam {i}: direction=({beam_cos[i]:.4f}, {beam_sin[i]:.4f}), magnitude={dir_mag:.4f}, angle={np.degrees(beam_angle):.2f}°")
 
@@ -285,7 +300,7 @@ for geom_id in range(model.ngeom):
     geom = model.geom(geom_id)
     if geom.name == "box1_geom":
         box1_geom = geom
-        print(f"box1_geom found:")
+        print("box1_geom found:")
         print(f"  Body ID: {geom.bodyid}")
         print(f"  Body name: {model.body(int(geom.bodyid)).name}")
         print(f"  Geom position (relative to body): {geom.pos}")
@@ -302,7 +317,7 @@ for geom_id in range(model.ngeom):
 print("\n[BEAM 1 ANALYSIS]")
 print(f"Viewpoint: {viewpoint}")
 print(f"Beam 1 direction (normalized): ({beam_cos[1]:.4f}, {beam_sin[1]:.4f})")
-print(f"Box1 (purple): pos=(2.0, -2.0), radius=0.85")
+print("Box1 (purple): pos=(2.0, -2.0), radius=0.85")
 # Beam 1 が箱方向を向いているか確認
 box1_from_view = np.array([2.0 - viewpoint[0], -2.0 - viewpoint[1]])
 angle_to_box = np.arctan2(box1_from_view[1], box1_from_view[0])
@@ -329,7 +344,7 @@ for i in range(n_beams):
 print("\n[BEAM 10 DETAILED ANALYSIS]")
 print(f"Beam 10 direction: ({beam_cos[10]:.4f}, {beam_sin[10]:.4f})")
 print(f"Direction angle: {np.degrees(np.arctan2(beam_sin[10], beam_cos[10])):.2f}°")
-print(f"Box1 center: (2.0, -2.0), radius: 0.85")
+print("Box1 center: (2.0, -2.0), radius: 0.85")
 print(f"Expected hit distance (to box surface): ~{np.linalg.norm(box1_from_view) - 0.85:.3f}m")
 print()
 
@@ -337,98 +352,124 @@ print()
 # 各ビームについて計測
 for i in range(n_beams):
     direction = np.array([beam_cos[i], beam_sin[i], 0.0], dtype=np.float64)
-    
+
     # Method 1: Direct Intersection
     dist_dir, _ = cast_ray_direct_numba(
-        viewpoint[0], viewpoint[1],
-        direction[0], direction[1],
+        viewpoint[0],
+        viewpoint[1],
+        direction[0],
+        direction[1],
         visibility_engine.dynamic_positions,
         visibility_engine.dynamic_radii,
         visibility_engine.dynamic_body_ids_array,
         visibility_engine.num_dynamic_objects,
         wall_segments_array,
         len(wall_segments),
-        SEEKER_BODY_ID, EXCLUDE_BODY_ID,
-        LIDAR_MAX_DIST
+        SEEKER_BODY_ID,
+        EXCLUDE_BODY_ID,
+        LIDAR_MAX_DIST,
     )
-    
+
     # DEBUG: Beam 11と6の詳細を確認
     if i == 11:
-        print(f"\n[BEAM 11 DEBUG]")
+        print("\n[BEAM 11 DEBUG]")
         print(f"Direction: ({direction[0]:.4f}, {direction[1]:.4f})")
         print(f"Direct result: {dist_dir:.3f}m")
-        print(f"Dynamic objects:")
+        print("Dynamic objects:")
         for j in range(visibility_engine.num_dynamic_objects):
             bid = visibility_engine.dynamic_body_ids_array[j]
             pos = visibility_engine.dynamic_positions[j]
             rad = visibility_engine.dynamic_radii[j]
             from main23_sightmap_optimized import ray_circle_intersection_numba
+
             dist = ray_circle_intersection_numba(
-                viewpoint[0], viewpoint[1], direction[0], direction[1],
-                pos[0], pos[1], rad
+                viewpoint[0],
+                viewpoint[1],
+                direction[0],
+                direction[1],
+                pos[0],
+                pos[1],
+                rad,
             )
             if dist < 2.0:  # 近いものだけ表示
                 print(f"  Object {j}: pos=({pos[0]:.1f},{pos[1]:.1f}), r={rad:.2f}, dist={dist:.3f}m")
-    
+
     if i == 6:
-        print(f"\n[BEAM 6 DEBUG]")
+        print("\n[BEAM 6 DEBUG]")
         print(f"Direction: ({direction[0]:.4f}, {direction[1]:.4f})")
         print(f"Direct result: {dist_dir:.3f}m, Sphere will be computed next")
-    
+
     distances_direct.append(dist_dir)
-    
+
     # Method 2: Sphere Tracing
     # SDF場がない場合はスキップ
     if visibility_engine.sdf_field is not None:
         grid_size = visibility_engine.sdf_field.shape
         cell_size = 12.0 / (grid_size[0] - 1)
-        globals()['_CELL_SIZE'] = cell_size  # グローバルに保存（プロット用）
+        globals()["_CELL_SIZE"] = cell_size  # グローバルに保存（プロット用）
         dist_sph, hit = cast_ray_numba(
-            viewpoint[0], viewpoint[1],
-            direction[0], direction[1],
-            visibility_engine.sdf_field, grid_size[0], grid_size[1], cell_size,
-            visibility_engine.dynamic_positions, visibility_engine.dynamic_radii,
+            viewpoint[0],
+            viewpoint[1],
+            direction[0],
+            direction[1],
+            visibility_engine.sdf_field,
+            grid_size[0],
+            grid_size[1],
+            cell_size,
+            visibility_engine.dynamic_positions,
+            visibility_engine.dynamic_radii,
             visibility_engine.dynamic_body_ids_array,
             visibility_engine.num_dynamic_objects,
-            SEEKER_BODY_ID, EXCLUDE_BODY_ID,
-            cell_size, 300, LIDAR_MAX_DIST  # epsilon = cell_size (セルサイズ以上必須)
+            SEEKER_BODY_ID,
+            EXCLUDE_BODY_ID,
+            cell_size,
+            300,
+            LIDAR_MAX_DIST,  # epsilon = cell_size (セルサイズ以上必須)
         )
     else:
         dist_sph = LIDAR_MAX_DIST
     distances_sphere.append(dist_sph)
-    
+
     # DEBUG: Beam 6のSphere Tracingの詳細軌跡を記録
     if i == 6 and visibility_engine.sdf_field is not None:
-        print(f"\n[BEAM 6 SPHERE TRACING DEBUG]")
+        print("\n[BEAM 6 SPHERE TRACING DEBUG]")
         print(f"Direction: ({direction[0]:.4f}, {direction[1]:.4f})")
-        
+
         # Sphere Tracingを手動で実行（デバッグ出力付き）
         grid_size = visibility_engine.sdf_field.shape
         cell_size = 12.0 / (grid_size[0] - 1)
-        
+
         # 軌跡を記録
         trajectory = []
         positions_x = []
         positions_y = []
         sdf_values = []
-        
+
         curr_x = viewpoint[0]
         curr_y = viewpoint[1]
         total_d = 0.0
         epsilon = cell_size  # ★SDF グリッドセルサイズに設定（重要: 閾値は cell_size 以上必須）
         max_steps = 300
-        
+
         print(f"Grid size: {grid_size}, Cell size: {cell_size:.6f}")
         print(f"Epsilon threshold: {epsilon:.6f}m")
         print(f"Start pos: ({curr_x:.3f}, {curr_y:.3f})")
-        
-        from main23_sightmap_optimized import sdf_lookup_numba
+
         import math
-        
+
+        from main23_sightmap_optimized import sdf_lookup_numba
+
         for step in range(max_steps):
             # SDF値を取得
-            d_static = sdf_lookup_numba(curr_x, curr_y, visibility_engine.sdf_field, grid_size[0], grid_size[1], cell_size)
-            
+            d_static = sdf_lookup_numba(
+                curr_x,
+                curr_y,
+                visibility_engine.sdf_field,
+                grid_size[0],
+                grid_size[1],
+                cell_size,
+            )
+
             # 動的SDF
             d_dynamic = 1e6
             for j in range(visibility_engine.num_dynamic_objects):
@@ -439,118 +480,110 @@ for i in range(n_beams):
                     dist = math.sqrt(dx * dx + dy * dy) - visibility_engine.dynamic_radii[j]
                     if dist < d_dynamic:
                         d_dynamic = dist
-            
+
             d = min(d_static, d_dynamic)
-            
+
             positions_x.append(curr_x)
             positions_y.append(curr_y)
             sdf_values.append(d)
-            
+
             if step < 10 or step % 30 == 0:  # 最初の10ステップと30ステップごとに表示
                 print(f"  Step {step}: pos=({curr_x:.3f}, {curr_y:.3f}), d={d:.6f}, total_d={total_d:.3f}m")
-            
+
             # 負の距離 → 障害物内部
             if d < epsilon:
                 print(f"  Step {step}: COLLISION! d={d:.6f} < epsilon={epsilon}")
                 break
-            
+
             total_d += d
-            dir_mag = math.sqrt(direction[0]**2 + direction[1]**2)
+            dir_mag = math.sqrt(direction[0] ** 2 + direction[1] ** 2)
             dir_norm_x = direction[0] / dir_mag
             dir_norm_y = direction[1] / dir_mag
-            
+
             curr_x += dir_norm_x * d
             curr_y += dir_norm_y * d
-            
+
             if total_d > LIDAR_MAX_DIST:
                 print(f"  Step {step}: EXCEEDED MAX_DIST ({total_d:.3f}m > {LIDAR_MAX_DIST}m)")
                 break
-        
+
         print(f"Final: total_d={total_d:.3f}m, final_pos=({curr_x:.3f}, {curr_y:.3f})")
-        
+
         # 軌跡をプロット用に保存
-        globals()['beam6_trajectory'] = {
-            'positions_x': positions_x,
-            'positions_y': positions_y,
-            'sdf_values': sdf_values
+        globals()["beam6_trajectory"] = {
+            "positions_x": positions_x,
+            "positions_y": positions_y,
+            "sdf_values": sdf_values,
         }
     else:
         dist_sph = LIDAR_MAX_DIST
-    
+
     # Method 3: MuJoCo mj_ray
     raycast_from = np.array([viewpoint[0], viewpoint[1], 0.5], dtype=np.float64)
-    dir_mag = np.sqrt(direction[0]**2 + direction[1]**2)
+    dir_mag = np.sqrt(direction[0] ** 2 + direction[1] ** 2)
     if dir_mag > 1e-10:
         raycast_dir = np.array([direction[0] / dir_mag, direction[1] / dir_mag, 0.0], dtype=np.float64)
     else:
         raycast_dir = np.array([direction[0], direction[1], 0.0], dtype=np.float64)
-    
+
     raycast_geomid = np.array([-1], dtype=np.int32)
-    
-    dist_muj = mujoco.mj_ray(
-        model, data, 
-        raycast_from, 
-        raycast_dir, 
-        None, 1, SEEKER_BODY_ID,
-        raycast_geomid
-    )
+
+    dist_muj = mujoco.mj_ray(model, data, raycast_from, raycast_dir, None, 1, SEEKER_BODY_ID, raycast_geomid)
     distances_mujoco.append(dist_muj if dist_muj >= 0 else LIDAR_MAX_DIST)
-    
+
     # デバッグ: すべてのビームでヒット情報を記録
     if raycast_geomid[0] >= 0:
         hit_geom = model.geom(raycast_geomid[0])
         body_id = int(hit_geom.bodyid)
         hit_body = model.body(body_id).name
-        
+
         # レイの終端を計算
         end_point = raycast_from + raycast_dir * dist_muj
-        
+
         # Beam 10 の詳細ログ
         if i == 10:
-            print(f"[BEAM 10 MuJoCo Debug]")
+            print("[BEAM 10 MuJoCo Debug]")
             print(f"  Ray from: {raycast_from}, dir: {raycast_dir}")
             print(f"  Exclude body ID: {SEEKER_BODY_ID}")
             print(f"  Hit: {hit_body} (body_id={body_id}), geom: {hit_geom.name}")
             print(f"  Hit endpoint: {end_point}")
             print(f"  Distance: {dist_muj:.3f}m")
-            
+
             # Box1の body_id を確認
             box1_body_id = model.body("box1_body").id
             print(f"  Box1 body ID: {box1_body_id}")
             print(f"  Box1 is being excluded?: {box1_body_id == SEEKER_BODY_ID}")
-            
+
             # モデルの全ジオメトリをリスト
-            print(f"  All geoms in order:")
+            print("  All geoms in order:")
             for gid in range(model.ngeom):
                 g = model.geom(gid)
                 b = model.body(int(g.bodyid)).name
                 if "box" in b or "box" in g.name:
                     print(f"    Geom {gid}: {g.name} (body: {b})")
-            
+
             # Box1 に向かうダイレクトレイテストを実行（除外なし）
-            print(f"  Testing mj_ray with no exclusion:")
+            print("  Testing mj_ray with no exclusion:")
             geomid_test = np.array([-1], dtype=np.int32)
             dist_test = mujoco.mj_ray(
-                model, data, 
-                raycast_from, 
-                raycast_dir, 
-                None, 1, -1,  # exclude_body = -1 (なし)
-                geomid_test
+                model,
+                data,
+                raycast_from,
+                raycast_dir,
+                None,
+                1,
+                -1,  # exclude_body = -1 (なし)
+                geomid_test,
             )
             if geomid_test[0] >= 0:
                 test_geom = model.geom(geomid_test[0])
                 test_body = model.body(int(test_geom.bodyid)).name
                 print(f"    No exclusion: Hit {test_body} ({test_geom.name}) at {dist_test:.3f}m")
             else:
-                print(f"    No exclusion: No hit")
+                print("    No exclusion: No hit")
 
-
-        
         # 通常のログ
         print(f"Beam {i}: Ray hit {hit_body} (geom: {hit_geom.name}) at distance {dist_muj:.3f}")
-
-
-
 
 
 distances_direct = np.array(distances_direct)
@@ -585,68 +618,85 @@ print()
 # 可視化
 # ============================================
 
+
 # グリッドプロット用の関数
 def plot_environment_with_rays(ax, distances, method_name):
-    ax.set_title(f'{method_name}\n(Avg: {distances.mean():.2f}m)', fontsize=11, fontweight='bold')
-    ax.set_xlabel('X-coordinate')
-    ax.set_ylabel('Y-coordinate')
-    
+    ax.set_title(f"{method_name}\n(Avg: {distances.mean():.2f}m)", fontsize=11, fontweight="bold")
+    ax.set_xlabel("X-coordinate")
+    ax.set_ylabel("Y-coordinate")
+
     # 環境描画（簡略版）
     # 外壁
-    ax.plot([-6, 6], [6, 6], 'k-', linewidth=2)  # North
-    ax.plot([-6, 6], [-6, -6], 'k-', linewidth=2)  # South
-    ax.plot([6, 6], [-6, 6], 'k-', linewidth=2)  # East
-    ax.plot([-6, -6], [-6, 6], 'k-', linewidth=2)  # West
-    
+    ax.plot([-6, 6], [6, 6], "k-", linewidth=2)  # North
+    ax.plot([-6, 6], [-6, -6], "k-", linewidth=2)  # South
+    ax.plot([6, 6], [-6, 6], "k-", linewidth=2)  # East
+    ax.plot([-6, -6], [-6, 6], "k-", linewidth=2)  # West
+
     # 内壁（矩形として描画）
     # maze_w0: x∈[1.5,4.5], y∈[1.3,1.7]
-    rect = plt.Rectangle((1.5, 1.3), 3.0, 0.4, fill=False, edgecolor='cyan', linewidth=1.5)
+    rect = plt.Rectangle((1.5, 1.3), 3.0, 0.4, fill=False, edgecolor="cyan", linewidth=1.5)
     ax.add_patch(rect)
     # maze_w1: x∈[-4.5,-1.5], y∈[-1.7,-1.3]
-    rect = plt.Rectangle((-4.5, -1.7), 3.0, 0.4, fill=False, edgecolor='cyan', linewidth=1.5)
+    rect = plt.Rectangle((-4.5, -1.7), 3.0, 0.4, fill=False, edgecolor="cyan", linewidth=1.5)
     ax.add_patch(rect)
     # maze_w2: x∈[-0.2,0.2], y∈[-4.5,-1.5]
-    rect = plt.Rectangle((-0.2, -4.5), 0.4, 3.0, fill=False, edgecolor='cyan', linewidth=1.5)
+    rect = plt.Rectangle((-0.2, -4.5), 0.4, 3.0, fill=False, edgecolor="cyan", linewidth=1.5)
     ax.add_patch(rect)
     # maze_w3: x∈[-0.2,0.2], y∈[1.5,4.5]
-    rect = plt.Rectangle((-0.2, 1.5), 0.4, 3.0, fill=False, edgecolor='cyan', linewidth=1.5)
+    rect = plt.Rectangle((-0.2, 1.5), 0.4, 3.0, fill=False, edgecolor="cyan", linewidth=1.5)
     ax.add_patch(rect)
-    
+
     # 動的オブジェクト
-    circle = plt.Circle((3.0, 3.0), 0.4, color='red', alpha=0.5)
+    circle = plt.Circle((3.0, 3.0), 0.4, color="red", alpha=0.5)
     ax.add_patch(circle)
-    circle = plt.Circle((1.0, 1.0), 0.4, color='green', alpha=0.5)
+    circle = plt.Circle((1.0, 1.0), 0.4, color="green", alpha=0.5)
     ax.add_patch(circle)
-    circle = plt.Circle((5.0, 5.0), 0.4, color='orange', alpha=0.5)
+    circle = plt.Circle((5.0, 5.0), 0.4, color="orange", alpha=0.5)
     ax.add_patch(circle)
-    circle = plt.Circle((2.0, -2.0), 0.85, color='purple', alpha=0.5)
+    circle = plt.Circle((2.0, -2.0), 0.85, color="purple", alpha=0.5)
     ax.add_patch(circle)
-    circle = plt.Circle((-2.0, 2.0), 0.85, color='brown', alpha=0.5)
+    circle = plt.Circle((-2.0, 2.0), 0.85, color="brown", alpha=0.5)
     ax.add_patch(circle)
-    
+
     # Ramp (0, 0), radius=0.84
-    circle = plt.Circle((0.0, 0.0), 0.84, color='gray', alpha=0.5)
+    circle = plt.Circle((0.0, 0.0), 0.84, color="gray", alpha=0.5)
     ax.add_patch(circle)
-    ax.text(0.0, 0.0, 'Ramp', fontsize=8, ha='center', va='center', color='black')
-    
+    ax.text(0.0, 0.0, "Ramp", fontsize=8, ha="center", va="center", color="black")
+
     # 視点と光線
-    ax.plot(viewpoint[0], viewpoint[1], 'ko', markersize=12, zorder=100)
-    
+    ax.plot(viewpoint[0], viewpoint[1], "ko", markersize=12, zorder=100)
+
     colors = plt.cm.rainbow(np.linspace(0, 1, n_beams))
     for i in range(n_beams):
         dist = distances[i]
         end_x = viewpoint[0] + beam_cos[i] * min(dist, LIDAR_MAX_DIST)
         end_y = viewpoint[1] + beam_sin[i] * min(dist, LIDAR_MAX_DIST)
-        ax.plot([viewpoint[0], end_x], [viewpoint[1], end_y], color=colors[i], linewidth=1, alpha=0.6)
-        ax.plot(end_x, end_y, 'o', color=colors[i], markersize=6)
+        ax.plot(
+            [viewpoint[0], end_x],
+            [viewpoint[1], end_y],
+            color=colors[i],
+            linewidth=1,
+            alpha=0.6,
+        )
+        ax.plot(end_x, end_y, "o", color=colors[i], markersize=6)
         # ビーム番号を表示
-        ax.text(end_x, end_y, str(i), fontsize=8, ha='center', va='center', 
-                color='white', weight='bold', bbox=dict(boxstyle='circle', facecolor=colors[i], edgecolor='black', linewidth=0.5))
-    
+        ax.text(
+            end_x,
+            end_y,
+            str(i),
+            fontsize=8,
+            ha="center",
+            va="center",
+            color="white",
+            weight="bold",
+            bbox=dict(boxstyle="circle", facecolor=colors[i], edgecolor="black", linewidth=0.5),
+        )
+
     ax.set_xlim(-7, 7)
     ax.set_ylim(-7, 7)
-    ax.set_aspect('equal')
+    ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
+
 
 fig = plt.figure(figsize=(18, 12))
 
@@ -664,29 +714,29 @@ plot_environment_with_rays(ax3, distances_mujoco, "MuJoCo Ray")
 ax4 = plt.subplot(2, 3, 4)
 x = np.arange(n_beams)
 width = 0.25
-ax4.bar(x - width, distances_direct, width, label='Direct', alpha=0.8)
-ax4.bar(x, distances_sphere, width, label='Sphere', alpha=0.8)
-ax4.bar(x + width, distances_mujoco, width, label='MuJoCo', alpha=0.8)
-ax4.axhline(y=LIDAR_MAX_DIST, color='r', linestyle='--', alpha=0.5)
-ax4.set_xlabel('Beam Index')
-ax4.set_ylabel('Distance (m)')
-ax4.set_title('Distance Comparison')
+ax4.bar(x - width, distances_direct, width, label="Direct", alpha=0.8)
+ax4.bar(x, distances_sphere, width, label="Sphere", alpha=0.8)
+ax4.bar(x + width, distances_mujoco, width, label="MuJoCo", alpha=0.8)
+ax4.axhline(y=LIDAR_MAX_DIST, color="r", linestyle="--", alpha=0.5)
+ax4.set_xlabel("Beam Index")
+ax4.set_ylabel("Distance (m)")
+ax4.set_title("Distance Comparison")
 ax4.set_xticks(x)
 ax4.set_xticklabels([str(i) for i in range(n_beams)], fontsize=8)
 ax4.legend()
-ax4.grid(True, alpha=0.3, axis='y')
+ax4.grid(True, alpha=0.3, axis="y")
 
 # Subplot 5: 差分比較
 ax5 = plt.subplot(2, 3, 5)
 diff_ds = np.abs(distances_direct - distances_sphere)
 diff_dm = np.abs(distances_direct - distances_mujoco)
 diff_sm = np.abs(distances_sphere - distances_mujoco)
-ax5.plot(x, diff_ds, 'o-', label='|Direct-Sphere|', linewidth=2)
-ax5.plot(x, diff_dm, 's-', label='|Direct-MuJoCo|', linewidth=2)
-ax5.plot(x, diff_sm, '^-', label='|Sphere-MuJoCo|', linewidth=2)
-ax5.set_xlabel('Beam Index')
-ax5.set_ylabel('Distance Difference (m)')
-ax5.set_title('Pairwise Differences')
+ax5.plot(x, diff_ds, "o-", label="|Direct-Sphere|", linewidth=2)
+ax5.plot(x, diff_dm, "s-", label="|Direct-MuJoCo|", linewidth=2)
+ax5.plot(x, diff_sm, "^-", label="|Sphere-MuJoCo|", linewidth=2)
+ax5.set_xlabel("Beam Index")
+ax5.set_ylabel("Distance Difference (m)")
+ax5.set_title("Pairwise Differences")
 ax5.set_xticks(x)
 ax5.set_xticklabels([str(i) for i in range(n_beams)], fontsize=8)
 ax5.legend()
@@ -694,7 +744,7 @@ ax5.grid(True, alpha=0.3)
 
 # Subplot 6: 統計情報
 ax6 = plt.subplot(2, 3, 6)
-ax6.axis('off')
+ax6.axis("off")
 stats_text = f"""
 METHOD STATISTICS
 
@@ -721,90 +771,110 @@ Mean Differences:
   |D-M|: {np.abs(distances_direct - distances_mujoco).mean():.3f}m
   |S-M|: {np.abs(distances_sphere - distances_mujoco).mean():.3f}m
 """
-ax6.text(0.1, 0.95, stats_text, transform=ax6.transAxes, fontsize=9,
-         verticalalignment='top', fontfamily='monospace',
-         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+ax6.text(
+    0.1,
+    0.95,
+    stats_text,
+    transform=ax6.transAxes,
+    fontsize=9,
+    verticalalignment="top",
+    fontfamily="monospace",
+    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+)
 
 plt.tight_layout()
-plt.savefig('lidar_validation_3methods.png', dpi=150, bbox_inches='tight')
+plt.savefig("lidar_validation_3methods.png", dpi=150, bbox_inches="tight")
 print("✓ Plot saved to 'lidar_validation_3methods.png'")
 
 # ビーム6の軌跡をプロット
-if 'beam6_trajectory' in globals():
+if "beam6_trajectory" in globals():
     print("\n[BEAM 6 TRAJECTORY PLOT]")
     fig_beam6 = plt.figure(figsize=(14, 6))
-    
-    traj = globals()['beam6_trajectory']
-    pos_x = traj['positions_x']
-    pos_y = traj['positions_y']
-    sdf_val = traj['sdf_values']
-    
+
+    traj = globals()["beam6_trajectory"]
+    pos_x = traj["positions_x"]
+    pos_y = traj["positions_y"]
+    sdf_val = traj["sdf_values"]
+
     # 軌跡プロット
     ax_traj = plt.subplot(1, 2, 1)
-    ax_traj.set_title('Beam 6 Sphere Tracing Trajectory', fontsize=12, fontweight='bold')
-    
+    ax_traj.set_title("Beam 6 Sphere Tracing Trajectory", fontsize=12, fontweight="bold")
+
     # 環境描画
-    ax_traj.plot([-6, 6], [6, 6], 'k-', linewidth=2)
-    ax_traj.plot([-6, 6], [-6, -6], 'k-', linewidth=2)
-    ax_traj.plot([6, 6], [-6, 6], 'k-', linewidth=2)
-    ax_traj.plot([-6, -6], [-6, 6], 'k-', linewidth=2)
-    
+    ax_traj.plot([-6, 6], [6, 6], "k-", linewidth=2)
+    ax_traj.plot([-6, 6], [-6, -6], "k-", linewidth=2)
+    ax_traj.plot([6, 6], [-6, 6], "k-", linewidth=2)
+    ax_traj.plot([-6, -6], [-6, 6], "k-", linewidth=2)
+
     # 内壁
-    rect = plt.Rectangle((1.5, 1.3), 3.0, 0.4, fill=False, edgecolor='cyan', linewidth=1.5)
+    rect = plt.Rectangle((1.5, 1.3), 3.0, 0.4, fill=False, edgecolor="cyan", linewidth=1.5)
     ax_traj.add_patch(rect)
-    rect = plt.Rectangle((-4.5, -1.7), 3.0, 0.4, fill=False, edgecolor='cyan', linewidth=1.5)
+    rect = plt.Rectangle((-4.5, -1.7), 3.0, 0.4, fill=False, edgecolor="cyan", linewidth=1.5)
     ax_traj.add_patch(rect)
-    rect = plt.Rectangle((-0.2, -4.5), 0.4, 3.0, fill=False, edgecolor='cyan', linewidth=1.5)
+    rect = plt.Rectangle((-0.2, -4.5), 0.4, 3.0, fill=False, edgecolor="cyan", linewidth=1.5)
     ax_traj.add_patch(rect)
-    rect = plt.Rectangle((-0.2, 1.5), 0.4, 3.0, fill=False, edgecolor='cyan', linewidth=1.5)
+    rect = plt.Rectangle((-0.2, 1.5), 0.4, 3.0, fill=False, edgecolor="cyan", linewidth=1.5)
     ax_traj.add_patch(rect)
-    
+
     # 軌跡をプロット（色はSDF値で段階的に）
     if len(pos_x) > 1:
-        ax_traj.plot(pos_x, pos_y, 'b-', linewidth=2, alpha=0.6, label='Trajectory')
-        ax_traj.plot(pos_x[0], pos_y[0], 'go', markersize=10, label='Start')
-        ax_traj.plot(pos_x[-1], pos_y[-1], 'ro', markersize=10, label='End')
-        
+        ax_traj.plot(pos_x, pos_y, "b-", linewidth=2, alpha=0.6, label="Trajectory")
+        ax_traj.plot(pos_x[0], pos_y[0], "go", markersize=10, label="Start")
+        ax_traj.plot(pos_x[-1], pos_y[-1], "ro", markersize=10, label="End")
+
         # ステップポイント（10ステップごと）
-        for i in range(0, len(pos_x), max(1, len(pos_x)//20)):
-            ax_traj.plot(pos_x[i], pos_y[i], 'b.', markersize=3, alpha=0.5)
-    
+        for i in range(0, len(pos_x), max(1, len(pos_x) // 20)):
+            ax_traj.plot(pos_x[i], pos_y[i], "b.", markersize=3, alpha=0.5)
+
     # Beam6の終点（Direct Intersection）
     beam6_end_x = viewpoint[0] + beam_cos[6] * distances_direct[6]
     beam6_end_y = viewpoint[1] + beam_sin[6] * distances_direct[6]
-    ax_traj.plot([viewpoint[0], beam6_end_x], [viewpoint[1], beam6_end_y], 'r--', linewidth=1.5, alpha=0.5, label='Direct Intersection')
-    
+    ax_traj.plot(
+        [viewpoint[0], beam6_end_x],
+        [viewpoint[1], beam6_end_y],
+        "r--",
+        linewidth=1.5,
+        alpha=0.5,
+        label="Direct Intersection",
+    )
+
     ax_traj.set_xlim(-7, 7)
     ax_traj.set_ylim(-7, 7)
-    ax_traj.set_aspect('equal')
+    ax_traj.set_aspect("equal")
     ax_traj.grid(True, alpha=0.3)
     ax_traj.legend()
-    ax_traj.set_xlabel('X-coordinate')
-    ax_traj.set_ylabel('Y-coordinate')
-    
+    ax_traj.set_xlabel("X-coordinate")
+    ax_traj.set_ylabel("Y-coordinate")
+
     # SDF値の推移
     ax_sdf = plt.subplot(1, 2, 2)
-    ax_sdf.set_title('SDF Values Along Trajectory', fontsize=12, fontweight='bold')
-    ax_sdf.plot(range(len(sdf_val)), sdf_val, 'b-', linewidth=1.5, alpha=0.7)
-    
+    ax_sdf.set_title("SDF Values Along Trajectory", fontsize=12, fontweight="bold")
+    ax_sdf.plot(range(len(sdf_val)), sdf_val, "b-", linewidth=1.5, alpha=0.7)
+
     # epsilonラインをプロット（cell_sizeから取得）
-    epsilon_val = globals().get('_CELL_SIZE', 0.020374)
-    ax_sdf.axhline(y=epsilon_val, color='r', linestyle='--', linewidth=2, label=f'epsilon={epsilon_val:.6f}m (cell_size)')
-    ax_sdf.axhline(y=0, color='k', linestyle='-', alpha=0.3)
-    ax_sdf.set_xlabel('Step')
-    ax_sdf.set_ylabel('SDF Distance (m)')
+    epsilon_val = globals().get("_CELL_SIZE", 0.020374)
+    ax_sdf.axhline(
+        y=epsilon_val,
+        color="r",
+        linestyle="--",
+        linewidth=2,
+        label=f"epsilon={epsilon_val:.6f}m (cell_size)",
+    )
+    ax_sdf.axhline(y=0, color="k", linestyle="-", alpha=0.3)
+    ax_sdf.set_xlabel("Step")
+    ax_sdf.set_ylabel("SDF Distance (m)")
     ax_sdf.grid(True, alpha=0.3)
     ax_sdf.legend()
-    
+
     plt.tight_layout()
-    plt.savefig('beam6_trajectory.png', dpi=150, bbox_inches='tight')
+    plt.savefig("beam6_trajectory.png", dpi=150, bbox_inches="tight")
     print("✓ Beam 6 trajectory plot saved to 'beam6_trajectory.png'")
     plt.close(fig_beam6)
 plt.close()
 
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("CONCLUSION:")
-print("="*80)
+print("=" * 80)
 print(f"""
 Sphere Tracing vs MuJoCo Raycast:
 
@@ -822,7 +892,5 @@ MuJoCo Ray Statistics:
 
 Mean Difference (|Sphere - MuJoCo|): {np.abs(distances_sphere - distances_mujoco).mean():.3f}m
 """)
-print("="*80)
+print("=" * 80)
 print("\nValidation complete!")
-
-

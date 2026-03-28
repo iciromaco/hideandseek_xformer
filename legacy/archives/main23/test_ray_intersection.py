@@ -5,26 +5,25 @@ ray_segment_intersection_numba のテスト
 """
 
 import numpy as np
-import math
 from numba import njit
+
 
 # 修正版 ray_segment_intersection_numba をコピー
 @njit(cache=True, fastmath=True)
-def ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y,
-                                   seg_x1, seg_y1, seg_x2, seg_y2):
+def ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y, seg_x1, seg_y1, seg_x2, seg_y2):
     """直線と線分の交点を計算（最短交点距離を返す）"""
     seg_dx = seg_x2 - seg_x1
     seg_dy = seg_y2 - seg_y1
-    
+
     seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy
     if seg_len_sq < 1e-12:
         return 1e6
-    
+
     fx = seg_x1 - start_x
     fy = seg_y1 - start_y
-    
+
     cross = dir_x * seg_dy - dir_y * seg_dx
-    
+
     if abs(cross) > 1e-10:
         t = (fx * seg_dy - fy * seg_dx) / cross
         if t < 1e-6:
@@ -39,7 +38,7 @@ def ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y,
         eps = 1e-10
         is_vertical = abs(seg_dx) < eps
         is_horizontal = abs(seg_dy) < eps
-        
+
         if is_vertical:
             if abs(dir_x) < eps:
                 return 1e6
@@ -53,7 +52,7 @@ def ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y,
                 return t
             else:
                 return 1e6
-        
+
         elif is_horizontal:
             if abs(dir_y) < eps:
                 return 1e6
@@ -67,9 +66,10 @@ def ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y,
                 return t
             else:
                 return 1e6
-        
+
         else:
             return 1e6
+
 
 # テストケース
 print("=" * 80)
@@ -87,7 +87,7 @@ seg_x2, seg_y2 = 0.0, 2.0
 result = ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y, seg_x1, seg_y1, seg_x2, seg_y2)
 expected = np.sqrt(2) * 4.0  # (-4, -4) から (0, 0) へは距離 4√2
 print(f"  Result: {result:.4f}, Expected: {expected:.4f}")
-print(f"  ✓ PASS" if abs(result - expected) < 0.01 else f"  ✗ FAIL")
+print("  ✓ PASS" if abs(result - expected) < 0.01 else "  ✗ FAIL")
 
 # Test 2: 水平線（斜めレイが水平線と交差）
 print("\nTest 2: Diagonal ray hits horizontal line at y=0")
@@ -100,7 +100,7 @@ seg_x2, seg_y2 = 2.0, 0.0
 result = ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y, seg_x1, seg_y1, seg_x2, seg_y2)
 expected = np.sqrt(2) * 4.0  # (-4, -4) から (0, 0) へは距離 4√2
 print(f"  Result: {result:.4f}, Expected: {expected:.4f}")
-print(f"  ✓ PASS" if abs(result - expected) < 0.01 else f"  ✗ FAIL")
+print("  ✓ PASS" if abs(result - expected) < 0.01 else "  ✗ FAIL")
 
 # Test 3: 対角線レイが垂直線と交差
 print("\nTest 3: Diagonal ray hits vertical line")
@@ -111,9 +111,9 @@ dir_x, dir_y = dir_x / dir_mag, dir_y / dir_mag
 seg_x1, seg_y1 = 0.0, -2.0
 seg_x2, seg_y2 = 0.0, 2.0
 result = ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y, seg_x1, seg_y1, seg_x2, seg_y2)
-expected = np.sqrt((4.0)**2 + (4.0)**2)  # (-4,-4) から (0,0) まで
+expected = np.sqrt((4.0) ** 2 + (4.0) ** 2)  # (-4,-4) から (0,0) まで
 print(f"  Result: {result:.4f}, Expected: {expected:.4f}")
-print(f"  ✓ PASS" if abs(result - expected) < 0.01 else f"  ✗ FAIL")
+print("  ✓ PASS" if abs(result - expected) < 0.01 else "  ✗ FAIL")
 
 # Test 4: レイが線分の端点で交差
 print("\nTest 4: Ray hits endpoint of segment")
@@ -126,7 +126,7 @@ seg_x2, seg_y2 = 1.0, 1.0
 result = ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y, seg_x1, seg_y1, seg_x2, seg_y2)
 expected = np.sqrt(2) * 4.0  # (-4,-4) から (0,0) まで
 print(f"  Result: {result:.4f}, Expected: {expected:.4f}")
-print(f"  ✓ PASS" if abs(result - expected) < 0.01 else f"  ✗ FAIL")
+print("  ✓ PASS" if abs(result - expected) < 0.01 else "  ✗ FAIL")
 
 # Test 5: 垂直線（外壁）との交差
 print("\nTest 5: Ray hits vertical wall at x=6.1")
@@ -137,6 +137,6 @@ seg_x2, seg_y2 = 6.1, 6.0
 result = ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y, seg_x1, seg_y1, seg_x2, seg_y2)
 expected = 6.1 - (-4.0)  # 10.1
 print(f"  Result: {result:.4f}, Expected: {expected:.4f}")
-print(f"  ✓ PASS" if abs(result - expected) < 0.01 else f"  ✗ FAIL")
+print("  ✓ PASS" if abs(result - expected) < 0.01 else "  ✗ FAIL")
 
 print("\n" + "=" * 80)

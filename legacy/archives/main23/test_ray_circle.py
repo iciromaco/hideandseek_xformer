@@ -2,8 +2,10 @@
 """
 ray_circle_intersection_numba のテスト
 """
-import sys
+
 import os
+import sys
+
 sys.path.insert(0, os.getcwd())
 
 from main23_sightmap_optimized import ray_circle_intersection_numba

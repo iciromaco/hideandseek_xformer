@@ -5,9 +5,6 @@ SDF距離場を構築してキャッシュに保存
 
 import os
 import sys
-import numpy as np
-import pickle
-from pathlib import Path
 
 current_script_abs_path_val = os.path.abspath(__file__)
 current_script_parent_dir_val = os.path.dirname(current_script_abs_path_val)
@@ -27,9 +24,13 @@ if os.getcwd() not in sys.path:
 import main18_optimization as base_config
 import mujoco
 from main23_sightmap_optimized import (
-    VisibilityEngine, LIDAR_MAX_DIST,
-    build_sdf_distance_field, save_sdf_distance_field,
-    create_cell_grid, SDF_CELL_SIZE, ENV_BOUNDS
+    ENV_BOUNDS,
+    LIDAR_MAX_DIST,
+    SDF_CELL_SIZE,
+    VisibilityEngine,
+    build_sdf_distance_field,
+    create_cell_grid,
+    save_sdf_distance_field,
 )
 
 print("=" * 80)
@@ -61,16 +62,16 @@ sdf_cell_centers, sdf_metadata = create_cell_grid(ENV_BOUNDS, SDF_CELL_SIZE)
 print(f"✓ Created {len(sdf_cell_centers)} cells")
 
 # SDF距離場を構築
-print(f"\nBuilding SDF distance field...")
+print("\nBuilding SDF distance field...")
 sdf_field = build_sdf_distance_field(visibility_engine, sdf_cell_centers)
 
 # キャッシュに保存
-print(f"\nSaving SDF distance field to cache...")
+print("\nSaving SDF distance field to cache...")
 output_file = "sdf_distance_field.pkl"
 save_sdf_distance_field(sdf_field, sdf_cell_centers, sdf_metadata, output_file)
 
-print(f"\n" + "=" * 80)
-print(f"✓ SDF distance field built and saved successfully!")
+print("\n" + "=" * 80)
+print("✓ SDF distance field built and saved successfully!")
 print(f"  Shape: {sdf_field.shape}")
 print(f"  Min: {sdf_field.min():.4f}, Max: {sdf_field.max():.4f}")
-print(f"=" * 80)
+print("=" * 80)

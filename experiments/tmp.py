@@ -1,4 +1,7 @@
-import sys,os,time
+import os
+import sys
+import time
+
 # sys.path拡張：このスクリプトの親ディレクトリ（プロジェクトルート）と src を追加
 root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, root_dir)
@@ -12,7 +15,7 @@ env = TeamCosEnv(debug_mode=False, target="seeker")
 # move boxes/ramps/other agents far after the initial reset so reset()'s random placement
 # is not overwritten by a later reset
 env = prepare_env(env, place_far=True)
-a = [0.25,0.0,0.0,0.0]
+a = [0.25, 0.0, 0.0, 0.0]
 for _ in range(400):
     env.step(a)
     env.render()

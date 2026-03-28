@@ -3,11 +3,11 @@
 SDF の内壁周辺の値を詳細に検査
 """
 
-import os
-import sys
-import numpy as np
 import pickle
+import sys
 from pathlib import Path
+
+import numpy as np
 
 # SDF を読み込み
 cache_file = Path("sdf_distance_field.pkl")
@@ -33,19 +33,16 @@ test_points = [
     (-6.0, 0.0, "外壁西"),
     (0.0, 6.0, "外壁北"),
     (0.0, -6.0, "外壁南"),
-    
     # 内壁 maze_w0: x=[1.5,4.5], y=[1.3,1.7]
     (3.0, 1.7, "maze_w0 上辺（壁の上）"),
     (3.0, 1.5, "maze_w0 中央（壁内）"),
     (3.0, 1.3, "maze_w0 下辺（壁の下）"),
     (3.0, 2.0, "maze_w0 上外側"),
     (3.0, 1.0, "maze_w0 下外側"),
-    
     # 内壁 maze_w1: x=[-4.5,-1.5], y=[-1.7,-1.3]
     (-3.0, -1.7, "maze_w1 下辺（壁の下）"),
     (-3.0, -1.5, "maze_w1 中央（壁内）"),
     (-3.0, -1.3, "maze_w1 上辺（壁の上）"),
-    
     # 視点周辺
     (-2.0, 0.0, "Viewpoint"),
     (-1.0, 0.0, "Viewpoint + 1m"),
@@ -59,7 +56,7 @@ for x, y, label in test_points:
     # グリッド座標に変換
     grid_x = int((x + 6.0) / cell_size + 0.5)
     grid_y = int((y + 6.0) / cell_size + 0.5)
-    
+
     # 境界チェック
     if 0 <= grid_x < grid_size and 0 <= grid_y < grid_size:
         sdf_val = sdf_field[grid_y, grid_x]
@@ -91,13 +88,13 @@ print("-" * 60)
 for dist in distances:
     ray_x = viewpoint[0] + beam_cos * dist
     ray_y = viewpoint[1] + beam_sin * dist
-    
+
     grid_x = int((ray_x + 6.0) / cell_size + 0.5)
     grid_y = int((ray_y + 6.0) / cell_size + 0.5)
-    
+
     if 0 <= grid_x < grid_size and 0 <= grid_y < grid_size:
         sdf_val = sdf_field[grid_y, grid_x]
-        
+
         # 壁チェック
         status = "OK"
         # maze_w3: x=[-0.1,0.1], y=[1.5,4.5]
@@ -106,7 +103,7 @@ for dist in distances:
         # 他の壁のチェック
         elif ray_x <= -6.0 or ray_x >= 6.0 or ray_y <= -6.0 or ray_y >= 6.0:
             status = "OUTSIDE bounds!"
-        
+
         print(f"{dist:<10.2f} ({ray_x:7.3f}, {ray_y:7.3f})  {sdf_val:<10.4f} {status:<20}")
     else:
         print(f"{dist:<10.2f} ({ray_x:7.3f}, {ray_y:7.3f})  OUT OF BOUNDS  OUT OF BOUNDS")

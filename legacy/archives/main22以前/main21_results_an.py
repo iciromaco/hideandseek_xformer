@@ -1,21 +1,23 @@
 # 演習第21回：最適化結果の分析スクリプト main21_results_analysis.py
 import os
-import pandas as pd
-import numpy as np
+
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
 plt.rcParams["font.family"] = "Hiragino Sans"
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.inspection import PartialDependenceDisplay
+from sklearn.linear_model import LinearRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 # =========================
 # 設定
 # =========================
 CSV_PATH = "./optuna_results_layer0/results_refinement.csv"
 FIG_DIR = "figures"
-SHOW_FIG = True   # True にすると画面表示される
+SHOW_FIG = True  # True にすると画面表示される
 
 os.makedirs(FIG_DIR, exist_ok=True)
 
@@ -70,10 +72,7 @@ lin_model.fit(X, y)
 
 係数 = lin_model.named_steps["回帰"].coef_
 
-coef_df = (
-    pd.DataFrame({"変数": 説明変数, "係数": 係数})
-    .sort_values("係数")
-)
+coef_df = pd.DataFrame({"変数": 説明変数, "係数": 係数}).sort_values("係数")
 
 plt.figure()
 plt.barh(coef_df["変数"], coef_df["係数"])
@@ -98,15 +97,12 @@ gbr = GradientBoostingRegressor(
 gbr.fit(X, y)
 
 # ---- 特徴量重要度
-importance_df = (
-    pd.DataFrame(
-        {
-            "変数": 説明変数,
-            "重要度": gbr.feature_importances_,
-        }
-    )
-    .sort_values("重要度")
-)
+importance_df = pd.DataFrame(
+    {
+        "変数": 説明変数,
+        "重要度": gbr.feature_importances_,
+    }
+).sort_values("重要度")
 
 plt.figure()
 plt.barh(importance_df["変数"], importance_df["重要度"])

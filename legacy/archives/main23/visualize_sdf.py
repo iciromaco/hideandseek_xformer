@@ -4,12 +4,12 @@ SDF フィールドを可視化
 距離を色に置き換えて表示
 """
 
-import os
-import sys
-import numpy as np
-import matplotlib.pyplot as plt
 import pickle
+import sys
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
 
 # SDF を読み込み
 cache_file = Path("sdf_distance_field.pkl")
@@ -20,7 +20,7 @@ if not cache_file.exists():
 with open(cache_file, "rb") as f:
     data_dict = pickle.load(f)
     sdf_field = data_dict.get("sdf_field")
-    
+
 if sdf_field is None:
     print("Error: SDF field not found in pickle file")
     sys.exit(1)
@@ -47,33 +47,40 @@ fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 ax1 = axes[0]
 # 距離値をクリップして可視化（-1 to 1 の範囲に）
 sdf_clipped = np.clip(sdf_field, -1, 1)
-im1 = ax1.contourf(X, Y, sdf_clipped, levels=20, cmap='RdBu_r')
-ax1.set_title('SDF Distance Field (clipped -1 to 1)', fontsize=12, fontweight='bold')
-ax1.set_xlabel('X')
-ax1.set_ylabel('Y')
-ax1.set_aspect('equal')
+im1 = ax1.contourf(X, Y, sdf_clipped, levels=20, cmap="RdBu_r")
+ax1.set_title("SDF Distance Field (clipped -1 to 1)", fontsize=12, fontweight="bold")
+ax1.set_xlabel("X")
+ax1.set_ylabel("Y")
+ax1.set_aspect("equal")
 cbar1 = plt.colorbar(im1, ax=ax1)
-cbar1.set_label('Distance (m)')
+cbar1.set_label("Distance (m)")
 
 # 等高線も追加
-contour = ax1.contour(X, Y, sdf_field, levels=[-0.5, -0.25, 0, 0.25, 0.5, 1.0], 
-                       colors='black', alpha=0.3, linewidths=0.5)
+contour = ax1.contour(
+    X,
+    Y,
+    sdf_field,
+    levels=[-0.5, -0.25, 0, 0.25, 0.5, 1.0],
+    colors="black",
+    alpha=0.3,
+    linewidths=0.5,
+)
 ax1.clabel(contour, inline=True, fontsize=8)
 
 # プロット2: 絶対距離
 ax2 = axes[1]
 sdf_abs = np.abs(sdf_field)
 sdf_abs_clipped = np.clip(sdf_abs, 0, 2)
-im2 = ax2.contourf(X, Y, sdf_abs_clipped, levels=20, cmap='viridis')
-ax2.set_title('Absolute Distance Field (clipped 0 to 2)', fontsize=12, fontweight='bold')
-ax2.set_xlabel('X')
-ax2.set_ylabel('Y')
-ax2.set_aspect('equal')
+im2 = ax2.contourf(X, Y, sdf_abs_clipped, levels=20, cmap="viridis")
+ax2.set_title("Absolute Distance Field (clipped 0 to 2)", fontsize=12, fontweight="bold")
+ax2.set_xlabel("X")
+ax2.set_ylabel("Y")
+ax2.set_aspect("equal")
 cbar2 = plt.colorbar(im2, ax=ax2)
-cbar2.set_label('|Distance| (m)')
+cbar2.set_label("|Distance| (m)")
 
 plt.tight_layout()
-plt.savefig('sdf_visualization.png', dpi=150, bbox_inches='tight')
+plt.savefig("sdf_visualization.png", dpi=150, bbox_inches="tight")
 print("\nPlot saved to 'sdf_visualization.png'")
 plt.show()
 
@@ -89,28 +96,27 @@ if (sdf_field > 0).sum() > 0:
     print(f"Positive range: {sdf_field[sdf_field > 0].min():.4f} to {sdf_field[sdf_field > 0].max():.4f}")
 
 
-
 # 外壁付近の値をチェック
 print("\n[WALL VICINITY CHECK]")
 # 北壁 (y = 6)
 idx_north = grid_size_0 - 1
-print(f"North wall (y=6) SDF values:")
+print("North wall (y=6) SDF values:")
 print(f"  At center (x=0): {sdf_field[idx_north, grid_size_1//2]:.4f}")
 print(f"  At x=-5: {sdf_field[idx_north, int(((-5 + 6) / 12) * grid_size_1)]:.4f}")
 
 # 南壁 (y = -6)
 idx_south = 0
-print(f"South wall (y=-6) SDF values:")
+print("South wall (y=-6) SDF values:")
 print(f"  At center (x=0): {sdf_field[idx_south, grid_size_1//2]:.4f}")
 
 # 東壁 (x = 6)
 idx_east = grid_size_1 - 1
-print(f"East wall (x=6) SDF values:")
+print("East wall (x=6) SDF values:")
 print(f"  At center (y=0): {sdf_field[grid_size_0//2, idx_east]:.4f}")
 
 # 西壁 (x = -6)
 idx_west = 0
-print(f"West wall (x=-6) SDF values:")
+print("West wall (x=-6) SDF values:")
 print(f"  At center (y=0): {sdf_field[grid_size_0//2, idx_west]:.4f}")
 
 # 中央付近

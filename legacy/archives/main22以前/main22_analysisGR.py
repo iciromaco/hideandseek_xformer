@@ -1,54 +1,58 @@
 # main22_analysisGR.py
 # ガウス過程回帰 (GPR) を用いたパラメータ感度・部分依存性分析 (改良版)
-# 
+#
 # 【特徴】
 # - ログスケール対応: LEARNING_RATE 等の対数変換パラメータをグラフ上で正しく表示。
 # - ARD感度分析: どのパラメータが報酬に敏感に反応するかを数値化。
 # - 最適値予測: モデルに基づいた理論的なベストパラメータを算出。
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 import os
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel as C
+from sklearn.gaussian_process.kernels import ConstantKernel as C
+from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.inspection import partial_dependence
 
 # ==========================================
 # 設定
 # ==========================================
-CSV_PATH = './optuna_results_layer0/results_refinement.csv'
-OUTPUT_DIR = './optuna_results_layer0/analysis_output'
-REPORT_FILENAME = 'analysis_report.txt'
-FIGURE_FILENAME = 'pdp_analysis_chart.png'
+CSV_PATH = "./optuna_results_layer0/results_refinement.csv"
+OUTPUT_DIR = "./optuna_results_layer0/analysis_output"
+REPORT_FILENAME = "analysis_report.txt"
+FIGURE_FILENAME = "pdp_analysis_chart.png"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams["font.family"] = "sans-serif"
 
 # ==========================================
 # 1. データ読み込みと前処理
 # ==========================================
 print("Loading data...")
 df = pd.read_csv(CSV_PATH)
-df = df[df['state'] == 'COMPLETE'].copy()
+df = df[df["state"] == "COMPLETE"].copy()
 
 # パラメータ列の定義
-X_train = np.column_stack([
-    np.log10(df['params_ENT_COEF'] + 1e-10),
-    np.log10(df['params_LEARNING_RATE'] + 1e-10),
-    df['params_PENALTY_STAGNATION_FORCE'],
-    df['params_REWARD_DISTANCE_DIFF_SCALE'],
-    df['params_REWARD_SURVIVAL_SCALE']
-])
+X_train = np.column_stack(
+    [
+        np.log10(df["params_ENT_COEF"] + 1e-10),
+        np.log10(df["params_LEARNING_RATE"] + 1e-10),
+        df["params_PENALTY_STAGNATION_FORCE"],
+        df["params_REWARD_DISTANCE_DIFF_SCALE"],
+        df["params_REWARD_SURVIVAL_SCALE"],
+    ]
+)
 
-y_train = df['value'].values
+y_train = df["value"].values
 
 features_info = [
-    {'name': 'ENT_COEF', 'is_log': True},
-    {'name': 'LEARNING_RATE', 'is_log': True},
-    {'name': 'PENALTY_STAGNATION', 'is_log': False},
-    {'name': 'REWARD_DIST_SCALE', 'is_log': False},
-    {'name': 'REWARD_SURVIVAL', 'is_log': False}
+    {"name": "ENT_COEF", "is_log": True},
+    {"name": "LEARNING_RATE", "is_log": True},
+    {"name": "PENALTY_STAGNATION", "is_log": False},
+    {"name": "REWARD_DIST_SCALE", "is_log": False},
+    {"name": "REWARD_SURVIVAL", "is_log": False},
 ]
 
 # ==========================================
@@ -56,21 +60,9 @@ features_info = [
 # ==========================================
 print("Training Gaussian Process Model...")
 
-kernel = C(1.0, (1e-3, 1e8)) * Matern(
-    length_scale=[1.0] * 5,
-    length_scale_bounds=(1e-2, 1e8),
-    nu=2.5
-) + WhiteKernel(
-    noise_level=0.1,
-    noise_level_bounds=(1e-2, 1e5)
-)
+kernel = C(1.0, (1e-3, 1e8)) * Matern(length_scale=[1.0] * 5, length_scale_bounds=(1e-2, 1e8), nu=2.5) + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-2, 1e5))
 
-gp_model = GaussianProcessRegressor(
-    kernel=kernel,
-    n_restarts_optimizer=15,
-    normalize_y=True,
-    random_state=42
-)
+gp_model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=15, normalize_y=True, random_state=42)
 
 gp_model.fit(X_train, y_train)
 print("Model trained.")
@@ -97,25 +89,22 @@ sensitivity_normalized = sensitivities / np.max(sensitivities) * 100
 fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 axes = axes.ravel()
 
-target_idx = 0 
+target_idx = 0
 
 for i, info in enumerate(features_info):
-    name = info['name']
-    is_log = info['is_log']
+    name = info["name"]
+    is_log = info["is_log"]
     ax = axes[i]
 
     # --- PDP計算 ---
-    pdp_out = partial_dependence(
-        gp_model, X_train, [i],
-        kind='average', grid_resolution=100
-    )
+    pdp_out = partial_dependence(gp_model, X_train, [i], kind="average", grid_resolution=100)
 
-    if 'grid_values' in pdp_out:
-        x_vals = pdp_out['grid_values'][target_idx]
+    if "grid_values" in pdp_out:
+        x_vals = pdp_out["grid_values"][target_idx]
     else:
-        x_vals = pdp_out['values'][target_idx]
-    
-    y_vals = pdp_out['average'][target_idx]
+        x_vals = pdp_out["values"][target_idx]
+
+    y_vals = pdp_out["average"][target_idx]
 
     # --- 数値分析 ---
     impact = np.max(y_vals) - np.min(y_vals)
@@ -131,46 +120,52 @@ for i, info in enumerate(features_info):
 
     sens_str = f"{sensitivity_normalized[i]:5.1f}"
     impact_str = f"{impact:5.2f}"
-    
+
     report_lines.append(f"{name:<25} | {sens_str:>10} | {impact_str:>12} | {best_val_str:>15}")
 
     # --- グラフ描画 ---
     if is_log:
-        plot_x = 10 ** x_vals
+        plot_x = 10**x_vals
     else:
         plot_x = x_vals
 
-    ax.plot(plot_x, y_vals, color='tab:blue', linewidth=2, label='Mean EpLen')
-    ax.fill_between(plot_x, y_vals - 1.0, y_vals + 1.0, color='tab:blue', alpha=0.1)
-    
-    ax.scatter([best_val_display], [np.max(y_vals)], color='red', zorder=5, label=f'Best: {best_val_str}')
+    ax.plot(plot_x, y_vals, color="tab:blue", linewidth=2, label="Mean EpLen")
+    ax.fill_between(plot_x, y_vals - 1.0, y_vals + 1.0, color="tab:blue", alpha=0.1)
+
+    ax.scatter(
+        [best_val_display],
+        [np.max(y_vals)],
+        color="red",
+        zorder=5,
+        label=f"Best: {best_val_str}",
+    )
 
     # ★改善点: タイトルに変動幅(Impact)を表示して、グラフの重要度を数値で直感的に分かるようにする
-    ax.set_title(f"{name}\n(Impact: {impact:.2f})", fontsize=12, fontweight='bold')
-    
-    ax.set_ylabel('Expected Episode Length')
-    
+    ax.set_title(f"{name}\n(Impact: {impact:.2f})", fontsize=12, fontweight="bold")
+
+    ax.set_ylabel("Expected Episode Length")
+
     # ★変更点: Y軸の範囲統一を削除し、Matplotlibの自動スケーリングに戻す
     # これにより、微細な変化も拡大表示されるが、タイトルのImpact値で重要度を判断する
-    # ax.set_ylim(ylim_global) 
-    
+    # ax.set_ylim(ylim_global)
+
     ax.grid(True, which="both", ls="-", alpha=0.5)
-    
+
     if is_log:
-        ax.set_xscale('log')
-        ax.set_xlabel('Value (Log Scale)')
+        ax.set_xscale("log")
+        ax.set_xlabel("Value (Log Scale)")
     else:
-        ax.set_xlabel('Value (Linear Scale)')
-        
-    ax.legend(loc='best')
+        ax.set_xlabel("Value (Linear Scale)")
+
+    ax.legend(loc="best")
 
 # 余ったサブプロットを消す
 for j in range(len(features_info), len(axes)):
-    axes[j].axis('off')
+    axes[j].axis("off")
 
 plt.tight_layout()
 plot_path = os.path.join(OUTPUT_DIR, FIGURE_FILENAME)
-plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+plt.savefig(plot_path, dpi=300, bbox_inches="tight")
 
 # レポート出力
 report_lines.append("-" * 80)

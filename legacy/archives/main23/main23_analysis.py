@@ -13,19 +13,20 @@
 #    - 複数代入やセミコロンを完全に排除。1行1ステートメントを徹底。
 
 import os
-import sys
-import pandas as pd
-import numpy as np
+
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel as C
+from sklearn.gaussian_process.kernels import Matern, WhiteKernel
+from sklearn.inspection import partial_dependence
+from sklearn.linear_model import LinearRegression
+from sklearn.pipeline import Pipeline
 
 # 機械学習ライブラリのインポート
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel as C
-from sklearn.inspection import partial_dependence
-from sklearn.pipeline import Pipeline
 
 # ==========================================
 # 1. 設定セクション
@@ -42,7 +43,8 @@ if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
 # プロットのフォント設定
-plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams["font.family"] = "sans-serif"
+
 
 # ==========================================
 # 2. データ読み込みとクレンジング
@@ -55,28 +57,28 @@ def load_and_clean_data():
 
     # 生データの読み込み
     df_raw = pd.read_csv(INPUT_CSV)
-    
+
     # 成功した試行のみを抽出
     df = df_raw[df_raw["state"] == "COMPLETE"].copy()
-    
+
     # 解析対象とするハイパーパラメータ列
     param_cols = [
         "params_learning_rate",
         "params_ent_coef",
         "params_reward_hidden_bonus",
         "params_reward_distance_diff_scale",
-        "params_cos_penalty_scale"
+        "params_cos_penalty_scale",
     ]
     # 目的変数（Hiddenステップ数）
     target_col = "value"
-    
+
     # 必須列リストの作成
     required_cols = param_cols + [target_col]
 
     # 全ての対象列を数値型へ強制変換（エラー値は NaN に置換）
     for col in required_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # 基本的な欠損値除去
     df = df.dropna(subset=required_cols)
@@ -104,20 +106,21 @@ def load_and_clean_data():
 
     return df, param_cols, target_col
 
+
 # ==========================================
 # 3. 分析実行・可視化エンジン
 # ==========================================
 def analyze_model(df, model, param_cols, target_col, model_label, suffix):
     """特定の回帰モデルを用いて感度を計測し、情報を復元したグラフを出力します。"""
     print(f"Processing model: {model_label}")
-    
+
     # 説明変数 X と 目的変数 y の抽出
     X = df[param_cols].values
     y = df[target_col].values
-    
+
     # モデルの適合
     model.fit(X, y)
-    
+
     # レポート情報の初期化
     report_lines = []
     report_lines.append(f"{'='*75}")
@@ -129,37 +132,37 @@ def analyze_model(df, model, param_cols, target_col, model_label, suffix):
     # 2x2 のグラフグリッドを作成
     fig, axes = plt.subplots(3, 2, figsize=(16, 11))
     axes_flat = axes.ravel()
-    
+
     # パラメータごとにループして PDP (部分依存プロット) を作成
     for i, col_name in enumerate(param_cols):
         ax = axes_flat[i]
-        
+
         # 部分依存性 (PDP) の計算
         # 他の変数の影響を平均化して、その変数単体の振る舞いを可視化
-        pdp_res = partial_dependence(model, X, [i], kind='average', grid_resolution=50)
-        
+        pdp_res = partial_dependence(model, X, [i], kind="average", grid_resolution=50)
+
         # 軸データの抽出
-        if 'grid_values' in pdp_res:
-            x_raw = pdp_res['grid_values'][0]
+        if "grid_values" in pdp_res:
+            x_raw = pdp_res["grid_values"][0]
         else:
-            x_raw = pdp_res['values'][0]
-            
-        y_avg = pdp_res['average'][0]
+            x_raw = pdp_res["values"][0]
+
+        y_avg = pdp_res["average"][0]
 
         # 数値分析: 変動幅 (Impact) と 最適値の特定
         impact_val = np.max(y_avg) - np.min(y_avg)
         best_point_idx = np.argmax(y_avg)
         best_x_raw = x_raw[best_point_idx]
-        
+
         # 表示情報の整理
         clean_name = col_name.replace("params_", "")
-        
+
         # 対数スケールパラメータの復元処理
         if "learning_rate" in col_name or "ent_coef" in col_name:
             # log10 から元に戻す
-            best_val_actual = 10 ** best_x_raw
+            best_val_actual = 10**best_x_raw
             best_val_str = f"{best_val_actual:.2e}"
-            plot_x_axis = 10 ** x_raw
+            plot_x_axis = 10**x_raw
             is_log_param = True
         else:
             best_val_actual = best_x_raw
@@ -171,7 +174,7 @@ def analyze_model(df, model, param_cols, target_col, model_label, suffix):
         metric_score = 0.0
         if model_label == "Linear Regression":
             # 回帰係数の絶対値
-            metric_score = abs(model.named_steps['reg'].coef_[i])
+            metric_score = abs(model.named_steps["reg"].coef_[i])
         elif model_label == "Gradient Boosting":
             # 決定木における寄与度 (%)
             metric_score = model.feature_importances_[i] * 100
@@ -185,50 +188,72 @@ def analyze_model(df, model, param_cols, target_col, model_label, suffix):
 
         # --- グラフの描画 (情報を復元) ---
         # 1. 予測平均線
-        ax.plot(plot_x_axis, y_avg, color='tab:blue', linewidth=2.5, label='Predicted Mean', zorder=2)
-        
+        ax.plot(
+            plot_x_axis,
+            y_avg,
+            color="tab:blue",
+            linewidth=2.5,
+            label="Predicted Mean",
+            zorder=2,
+        )
+
         # 2. 視覚的な「青い帯 (信頼空間風)」の復元
         # PDPの平均値に対してわずかなマージン（あるいは標準偏差）を表示
         band_y_min = y_avg - 1.5
         band_y_max = y_avg + 1.5
-        ax.fill_between(plot_x_axis, band_y_min, band_y_max, color='tab:blue', alpha=0.15, label='Estimated Range')
-        
+        ax.fill_between(
+            plot_x_axis,
+            band_y_min,
+            band_y_max,
+            color="tab:blue",
+            alpha=0.15,
+            label="Estimated Range",
+        )
+
         # 3. 最適点の強調 (赤い点)
         peak_y = np.max(y_avg)
-        ax.scatter([best_val_actual], [peak_y], color='red', s=80, edgecolors='white', zorder=5, label='Theoretical Best')
-        
+        ax.scatter(
+            [best_val_actual],
+            [peak_y],
+            color="red",
+            s=80,
+            edgecolors="white",
+            zorder=5,
+            label="Theoretical Best",
+        )
+
         # 4. 最大値テキストラベルの復元
         label_y_pos = peak_y + 0.5
         ax.annotate(
-            best_val_str, 
-            xy=(best_val_actual, peak_y), 
-            xytext=(0, 10), 
-            textcoords='offset points', 
-            ha='center', 
-            fontsize=10, 
-            color='red', 
-            fontweight='bold'
+            best_val_str,
+            xy=(best_val_actual, peak_y),
+            xytext=(0, 10),
+            textcoords="offset points",
+            ha="center",
+            fontsize=10,
+            color="red",
+            fontweight="bold",
         )
 
         # タイトルと軸のラベル
-        ax.set_title(f"{clean_name}\n(Range: {impact_val:.2f})", fontsize=12, fontweight='bold')
-        ax.set_ylabel('Mean Hidden Steps')
-        ax.grid(True, linestyle='--', alpha=0.5)
-        
+        ax.set_title(f"{clean_name}\n(Range: {impact_val:.2f})", fontsize=12, fontweight="bold")
+        ax.set_ylabel("Mean Hidden Steps")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
         # スケールの設定
         if is_log_param:
-            ax.set_xscale('log')
-            ax.set_xlabel('Value (Log Scale)')
+            ax.set_xscale("log")
+            ax.set_xlabel("Value (Log Scale)")
         else:
-            ax.set_xlabel('Value (Linear Scale)')
-            
-        ax.legend(fontsize='small', loc='best')
+            ax.set_xlabel("Value (Linear Scale)")
+
+        ax.legend(fontsize="small", loc="best")
 
     # 全体の体裁を調整
     fig_title = f"Hyperparameter Sensitivity via {model_label}"
-    plt.suptitle(fig_title, fontsize=18, fontweight='bold')
+    plt.suptitle(fig_title, fontsize=18, fontweight="bold")
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
+
     # グラフ画像の書き出し
     img_filename = f"pdp_chart_{suffix}.png"
     img_path = os.path.join(OUTPUT_DIR, img_filename)
@@ -239,7 +264,7 @@ def analyze_model(df, model, param_cols, target_col, model_label, suffix):
     fit_score = model.score(X, y)
     report_lines.append("-" * 75)
     report_lines.append(f"Model R-squared (R2 Score): {fit_score:.4f}")
-    
+
     # ガウス過程の場合のみノイズレベルを表示
     if model_label == "Gaussian Process":
         noise_lv = model.kernel_.k2.noise_level
@@ -251,8 +276,9 @@ def analyze_model(df, model, param_cols, target_col, model_label, suffix):
     txt_path = os.path.join(OUTPUT_DIR, txt_filename)
     with open(txt_path, "w", encoding="utf-8") as f_report:
         f_report.write(report_content)
-    
+
     print(f"  -> Generated: {OUTPUT_DIR}/{txt_filename} & {img_filename}")
+
 
 # ==========================================
 # 4. メイン実行プロセス
@@ -263,57 +289,38 @@ def run_analysis():
     bundle = load_and_clean_data()
     if bundle is None:
         return
-        
+
     cleaned_df = bundle[0]
     columns_x = bundle[1]
     column_y = bundle[2]
 
     # --- A. 線形回帰 (Linear Regression) ---
     # 直線的な「正負の傾向」を見るための基本モデル
-    lr_pipe = Pipeline([
-        ('scaler', StandardScaler()),
-        ('reg', LinearRegression())
-    ])
+    lr_pipe = Pipeline([("scaler", StandardScaler()), ("reg", LinearRegression())])
     analyze_model(cleaned_df, lr_pipe, columns_x, column_y, "Linear Regression", "LR")
 
     # --- B. 勾配ブースティング (Gradient Boosting) ---
     # 非線形な「しきい値」や急激な変化を捉えるモデル
-    gbr_inst = GradientBoostingRegressor(
-        n_estimators=100, 
-        learning_rate=0.1, 
-        max_depth=3, 
-        random_state=42
-    )
+    gbr_inst = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
     analyze_model(cleaned_df, gbr_inst, columns_x, column_y, "Gradient Boosting", "GBR")
 
     # --- C. ガウス過程回帰 (Gaussian Process Regression) ---
     # 統計的な曲面を推定し、ARD感度（各次元への敏感さ）を算出する高度なモデル
     # パラメータ数に合わせたMaternカーネルを設定
     num_params = len(columns_x)
-    matern_kernel = Matern(
-        length_scale=[1.0] * num_params, 
-        length_scale_bounds=(1e-2, 1e5), 
-        nu=2.5
-    )
-    white_noise = WhiteKernel(
-        noise_level=0.1, 
-        noise_level_bounds=(1e-2, 1e3)
-    )
+    matern_kernel = Matern(length_scale=[1.0] * num_params, length_scale_bounds=(1e-2, 1e5), nu=2.5)
+    white_noise = WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-2, 1e3))
     # 複合カーネルの定義
     gp_kernel = C(1.0, (1e-3, 1e8)) * matern_kernel + white_noise
-    
-    gpr_inst = GaussianProcessRegressor(
-        kernel=gp_kernel, 
-        n_restarts_optimizer=10, 
-        normalize_y=True, 
-        random_state=42
-    )
+
+    gpr_inst = GaussianProcessRegressor(kernel=gp_kernel, n_restarts_optimizer=10, normalize_y=True, random_state=42)
     analyze_model(cleaned_df, gpr_inst, columns_x, column_y, "Gaussian Process", "GPR")
 
-    print("\n" + "="*75)
-    print(f" ALL ANALYSES COMPLETED ")
+    print("\n" + "=" * 75)
+    print(" ALL ANALYSES COMPLETED ")
     print(f" Detailed reports and PNG charts are in: {OUTPUT_DIR}/")
-    print("="*75)
+    print("=" * 75)
+
 
 if __name__ == "__main__":
     run_analysis()

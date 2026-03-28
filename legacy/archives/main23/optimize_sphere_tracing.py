@@ -5,6 +5,7 @@ Sphere Tracing パラメータ最適化テスト
 
 import os
 import sys
+
 import numpy as np
 
 current_script_abs_path_val = os.path.abspath(__file__)
@@ -23,8 +24,12 @@ if os.getcwd() not in sys.path:
     sys.path.insert(0, os.getcwd())
 
 import main18_optimization as base_config
-from main23_sightmap_optimized import VisibilityEngine, cast_ray_direct_numba, cast_ray_numba
 import mujoco
+from main23_sightmap_optimized import (
+    VisibilityEngine,
+    cast_ray_direct_numba,
+    cast_ray_numba,
+)
 
 # 初期化
 xml_string = base_config.XML_CONTENT
@@ -66,7 +71,7 @@ wall_segments = [
     ((-0.1, -4.5), (-0.1, -1.5)),
     ((0.1, -4.5), (0.1, -1.5)),
     ((-0.1, 1.5), (-0.1, 4.5)),
-    ((0.1, 1.5), (0.1, 4.5))
+    ((0.1, 1.5), (0.1, 4.5)),
 ]
 
 for i, (p1, p2) in enumerate(wall_segments):
@@ -82,8 +87,9 @@ visibility_engine.static_walls = wall_segments
 
 # SDF を読み込み
 try:
-    from pathlib import Path
     import pickle
+    from pathlib import Path
+
     cache_file = Path("sdf_distance_field.pkl")
     if cache_file.exists():
         with open(cache_file, "rb") as f:
@@ -102,8 +108,8 @@ yaw = np.pi / 3
 SEEKER_BODY_ID = 5
 
 # Lidar 設定
-surround = np.linspace(0, 2*np.pi, 8, endpoint=False)
-front = np.linspace(-np.pi/6, np.pi/6, 5)
+surround = np.linspace(0, 2 * np.pi, 8, endpoint=False)
+front = np.linspace(-np.pi / 6, np.pi / 6, 5)
 lidar_angles = np.unique(np.concatenate([surround, front]))
 n_beams = len(lidar_angles)
 
@@ -130,47 +136,60 @@ print()
 for epsilon, max_steps, label in test_params:
     distances_direct = []
     distances_sphere = []
-    
+
     for i in range(n_beams):
         direction = np.array([beam_cos[i], beam_sin[i], 0.0], dtype=np.float64)
-        
+
         # Direct
         dist_dir, _ = cast_ray_direct_numba(
-            viewpoint[0], viewpoint[1],
-            direction[0], direction[1],
+            viewpoint[0],
+            viewpoint[1],
+            direction[0],
+            direction[1],
             visibility_engine.dynamic_positions,
             visibility_engine.dynamic_radii,
             visibility_engine.dynamic_body_ids_array,
             visibility_engine.num_dynamic_objects,
             visibility_engine.wall_segments,
             visibility_engine.num_wall_segments,
-            SEEKER_BODY_ID, -1, 15.0
+            SEEKER_BODY_ID,
+            -1,
+            15.0,
         )
         distances_direct.append(dist_dir)
-        
+
         # Sphere
         grid_size = visibility_engine.sdf_field.shape
         cell_size = 12.0 / (grid_size[0] - 1)
         dist_sph, _ = cast_ray_numba(
-            viewpoint[0], viewpoint[1],
-            direction[0], direction[1],
-            visibility_engine.sdf_field, grid_size[0], grid_size[1], cell_size,
-            visibility_engine.dynamic_positions, visibility_engine.dynamic_radii,
+            viewpoint[0],
+            viewpoint[1],
+            direction[0],
+            direction[1],
+            visibility_engine.sdf_field,
+            grid_size[0],
+            grid_size[1],
+            cell_size,
+            visibility_engine.dynamic_positions,
+            visibility_engine.dynamic_radii,
             visibility_engine.dynamic_body_ids_array,
             visibility_engine.num_dynamic_objects,
-            SEEKER_BODY_ID, -1,
-            epsilon, max_steps, 15.0
+            SEEKER_BODY_ID,
+            -1,
+            epsilon,
+            max_steps,
+            15.0,
         )
         distances_sphere.append(dist_sph)
-    
+
     distances_direct = np.array(distances_direct)
     distances_sphere = np.array(distances_sphere)
-    
+
     # 統計
     diff = np.abs(distances_direct - distances_sphere)
     mean_diff = diff.mean()
     max_diff = diff.max()
-    
+
     print(f"{label}:")
     print(f"  Direct avg: {distances_direct.mean():.3f}m")
     print(f"  Sphere avg: {distances_sphere.mean():.3f}m")

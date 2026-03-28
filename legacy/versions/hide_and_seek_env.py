@@ -18,7 +18,7 @@ MuJoCo Hide-and-Seek 環境
 
 import argparse
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import mujoco
@@ -38,8 +38,8 @@ PlacementSpec = Optional[Tuple[float, float, float]]
 # ---------------------------------------------------------------------------
 @dataclass
 class _PlacedItem:
-    name:   str
-    pos:    np.ndarray   # (x, y)
+    name: str
+    pos: np.ndarray  # (x, y)
     radius: float
 
 
@@ -62,22 +62,22 @@ class HideAndSeekEnv:
     """
 
     # ---- アリーナ設定 --------------------------------------------------------
-    ARENA_HALF   = 6.0    # 外壁内側 (m)
-    SAFE_HALF    = 5.0    # ランダム配置の範囲
-    PLACE_MARGIN = 0.25   # 物体間の最小隙間 (m)
-    MAX_TRIES    = 3000   # rejection-sampling の最大試行回数
+    ARENA_HALF = 6.0  # 外壁内側 (m)
+    SAFE_HALF = 5.0  # ランダム配置の範囲
+    PLACE_MARGIN = 0.25  # 物体間の最小隙間 (m)
+    MAX_TRIES = 3000  # rejection-sampling の最大試行回数
 
     # ---- 配置衝突半径 --------------------------------------------------------
     R_AGENT = 0.55
-    R_BOX   = 0.95
-    R_RAMP  = 1.30
+    R_BOX = 0.95
+    R_RAMP = 1.30
 
     # ---- 迷路壁 (cx, cy, half_x, half_y) ------------------------------------
     MAZE_WALLS: List[Tuple[float, float, float, float]] = [
-        ( 3.0,  1.5, 1.5, 0.2),
+        (3.0, 1.5, 1.5, 0.2),
         (-3.0, -1.5, 1.5, 0.2),
-        ( 0.0, -3.0, 0.2, 1.5),
-        ( 0.0,  3.0, 0.2, 1.5),
+        (0.0, -3.0, 0.2, 1.5),
+        (0.0, 3.0, 0.2, 1.5),
     ]
 
     # ---- エージェント色 ------------------------------------------------------
@@ -100,53 +100,53 @@ class HideAndSeekEnv:
     # Box 摩擦力  0.20×40×9.81 = 78.5 N < 90 N → 強く押せばゆっくり動く
     # Ramp 摩擦力 0.20×55×9.81 = 108 N > 90 N → 1体では動かない
 
-    AGENT_MASS_BODY   = 4.0
+    AGENT_MASS_BODY = 4.0
     AGENT_MASS_BOTTOM = 12.0
-    AGENT_FRICTION    = (0.35, 0.01, 0.001)
+    AGENT_FRICTION = (0.35, 0.01, 0.001)
     AGENT_CAPSULE_FRICTION = (0.35, 0.01, 0.001)
-    AGENT_DAMPING_XY  = 26.0
-    AGENT_DAMPING_Z   = 15.0
+    AGENT_DAMPING_XY = 26.0
+    AGENT_DAMPING_Z = 15.0
     AGENT_DAMPING_ROT = 30.0
-    AGENT_ACTUATOR_FWD  = 1000
+    AGENT_ACTUATOR_FWD = 1000
     AGENT_ACTUATOR_TURN = 120
 
     FLOOR_FRICTION = (0.02, 0.05, 0.001)
 
-    BOX_MASS    = 40.0
+    BOX_MASS = 40.0
     BOX_DAMPING = 20.0
     BOX_FRICTION = (0.20, 0.005, 0.001)
 
     RAMP_MASS_BASE = 60.0
-    RAMP_DAMPING   = 65.0
+    RAMP_DAMPING = 65.0
     RAMP_SLOPE_FRICTION = (2.00, 0.02, 0.001)
-    RAMP_BASE_FRICTION  = (0.95, 0.02, 0.001)
+    RAMP_BASE_FRICTION = (0.95, 0.02, 0.001)
 
     # =========================================================================
     def __init__(
         self,
         n_seekers: int = 1,
-        n_hiders:  int = 2,
-        n_boxes:   int = 2,
-        n_ramps:   int = 1,
+        n_hiders: int = 2,
+        n_boxes: int = 2,
+        n_ramps: int = 1,
         seeker_specs: Optional[List[PlacementSpec]] = None,
-        hider_specs:  Optional[List[PlacementSpec]] = None,
-        box_specs:    Optional[List[PlacementSpec]] = None,
-        ramp_specs:   Optional[List[PlacementSpec]] = None,
+        hider_specs: Optional[List[PlacementSpec]] = None,
+        box_specs: Optional[List[PlacementSpec]] = None,
+        ramp_specs: Optional[List[PlacementSpec]] = None,
         seed: Optional[int] = None,
     ):
         if seed is not None:
             np.random.seed(seed)
 
         self.n_seekers = n_seekers
-        self.n_hiders  = n_hiders
-        self.n_boxes   = n_boxes
-        self.n_ramps   = n_ramps
+        self.n_hiders = n_hiders
+        self.n_boxes = n_boxes
+        self.n_ramps = n_ramps
 
         # specs を n_* の長さに揃える（短い・None は None 補完）
         self._seeker_specs = self._normalize_specs(seeker_specs, n_seekers)
-        self._hider_specs  = self._normalize_specs(hider_specs,  n_hiders)
-        self._box_specs    = self._normalize_specs(box_specs,    n_boxes)
-        self._ramp_specs   = self._normalize_specs(ramp_specs,   n_ramps)
+        self._hider_specs = self._normalize_specs(hider_specs, n_hiders)
+        self._box_specs = self._normalize_specs(box_specs, n_boxes)
+        self._ramp_specs = self._normalize_specs(ramp_specs, n_ramps)
 
         self._build()
 
@@ -162,9 +162,7 @@ class HideAndSeekEnv:
     # 配置生成
     # =========================================================================
     @staticmethod
-    def _normalize_specs(
-        specs: Optional[List[PlacementSpec]], n: int
-    ) -> List[PlacementSpec]:
+    def _normalize_specs(specs: Optional[List[PlacementSpec]], n: int) -> List[PlacementSpec]:
         """specs を長さ n のリストに正規化する。不足分は None で補完。"""
         if specs is None:
             return [None] * n
@@ -182,9 +180,7 @@ class HideAndSeekEnv:
         """
         placed: List[_PlacedItem] = []
 
-        def resolve_group(
-            specs: List[PlacementSpec], radius: float, tag: str
-        ) -> List[Tuple[np.ndarray, float]]:
+        def resolve_group(specs: List[PlacementSpec], radius: float, tag: str) -> List[Tuple[np.ndarray, float]]:
             results = []
             for i, spec in enumerate(specs):
                 if spec is not None:
@@ -193,7 +189,7 @@ class HideAndSeekEnv:
                     xy = np.array([x, y], dtype=float)
                 else:
                     # ---- ランダム安全配置 --------------------------------
-                    xy  = self._place_random(placed, radius)
+                    xy = self._place_random(placed, radius)
                     rot = np.random.uniform(0.0, 2.0 * np.pi)
 
                 placed.append(_PlacedItem(f"{tag}_{i}", xy, radius))
@@ -201,30 +197,22 @@ class HideAndSeekEnv:
             return results
 
         return dict(
-            seekers = resolve_group(self._seeker_specs, self.R_AGENT, "seeker"),
-            hiders  = resolve_group(self._hider_specs,  self.R_AGENT, "hider"),
-            boxes   = resolve_group(self._box_specs,    self.R_BOX,   "box"),
-            ramps   = resolve_group(self._ramp_specs,   self.R_RAMP,  "ramp"),
+            seekers=resolve_group(self._seeker_specs, self.R_AGENT, "seeker"),
+            hiders=resolve_group(self._hider_specs, self.R_AGENT, "hider"),
+            boxes=resolve_group(self._box_specs, self.R_BOX, "box"),
+            ramps=resolve_group(self._ramp_specs, self.R_RAMP, "ramp"),
         )
 
-    def _place_random(
-        self, placed: List[_PlacedItem], radius: float
-    ) -> np.ndarray:
+    def _place_random(self, placed: List[_PlacedItem], radius: float) -> np.ndarray:
         """Rejection sampling で干渉しない (x,y) を返す。"""
         for _ in range(self.MAX_TRIES):
             xy = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
             if self._overlaps_maze_wall(xy, radius):
                 continue
-            if any(
-                np.linalg.norm(xy - p.pos) < radius + p.radius + self.PLACE_MARGIN
-                for p in placed
-            ):
+            if any(np.linalg.norm(xy - p.pos) < radius + p.radius + self.PLACE_MARGIN for p in placed):
                 continue
             return xy
-        raise RuntimeError(
-            f"ランダム配置に失敗 ({self.MAX_TRIES} 試行)。"
-            "物体数を減らすか SAFE_HALF / PLACE_MARGIN を調整してください。"
-        )
+        raise RuntimeError(f"ランダム配置に失敗 ({self.MAX_TRIES} 試行)。" "物体数を減らすか SAFE_HALF / PLACE_MARGIN を調整してください。")
 
     def _overlaps_maze_wall(self, xy: np.ndarray, radius: float) -> bool:
         for cx, cy, hx, hy in self.MAZE_WALLS:
@@ -240,9 +228,9 @@ class HideAndSeekEnv:
     def _build(self) -> None:
         """配置を決定して XML をコンパイルし model / data を生成する。"""
         placements = self._generate_placements()
-        xml_str    = self._build_xml(**placements)
+        xml_str = self._build_xml(**placements)
         self.model = mujoco.MjModel.from_xml_string(xml_str)
-        self.data  = mujoco.MjData(self.model)
+        self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
 
     def reset(self, seed: Optional[int] = None) -> None:
@@ -260,9 +248,9 @@ class HideAndSeekEnv:
     def _build_xml(
         self,
         seekers: List[Tuple[np.ndarray, float]],
-        hiders:  List[Tuple[np.ndarray, float]],
-        boxes:   List[Tuple[np.ndarray, float]],
-        ramps:   List[Tuple[np.ndarray, float]],
+        hiders: List[Tuple[np.ndarray, float]],
+        boxes: List[Tuple[np.ndarray, float]],
+        ramps: List[Tuple[np.ndarray, float]],
     ) -> str:
         wb, eq, ac = [], [], []
 
@@ -387,14 +375,17 @@ class HideAndSeekEnv:
 
     # ---- Agent ---------------------------------------------------------------
     def _xml_agent(
-        self, tag: str, i: int,
-        xy: np.ndarray, rot: float,
+        self,
+        tag: str,
+        i: int,
+        xy: np.ndarray,
+        rot: float,
         color: Tuple[float, float, float],
     ) -> str:
         r, g, b = color
         quat = _euler_z_to_quat(rot)
-        af   = " ".join(str(f) for f in self.AGENT_FRICTION)
-        acf  = " ".join(str(f) for f in self.AGENT_CAPSULE_FRICTION)
+        af = " ".join(str(f) for f in self.AGENT_FRICTION)
+        acf = " ".join(str(f) for f in self.AGENT_CAPSULE_FRICTION)
         return f"""
     <body name="{tag}_{i}_anchor" pos="{xy[0]:.3f} {xy[1]:.3f} 0.45" quat="{quat}">
       <joint name="{tag}_{i}_x"   type="slide" axis="1 0 0"
@@ -435,21 +426,15 @@ class HideAndSeekEnv:
 
     # ---- Equality ------------------------------------------------------------
     def _xml_grasp_eq(self, agent_tag: str, ai: int, obj_tag: str, oi: int) -> str:
-        name  = f"grasp_{agent_tag}_{ai}_{obj_tag}_{oi}"
+        name = f"grasp_{agent_tag}_{ai}_{obj_tag}_{oi}"
         body1 = f"{agent_tag}_{ai}_body"
         body2 = f"{obj_tag}_{oi}_body"
-        return (
-            f'<weld name="{name}" body1="{body1}" body2="{body2}" '
-            f'active="false" solref="0.06 1" solimp="0.90 0.95 0.001"/>\n    '
-        )
+        return f'<weld name="{name}" body1="{body1}" body2="{body2}" ' f'active="false" solref="0.06 1" solimp="0.90 0.95 0.001"/>\n    '
 
     def _xml_lock_eq(self, obj_tag: str, oi: int) -> str:
-        name  = f"lock_{obj_tag}_{oi}"
+        name = f"lock_{obj_tag}_{oi}"
         body2 = f"{obj_tag}_{oi}_body"
-        return (
-            f'<weld name="{name}" body1="world" body2="{body2}" '
-            f'active="false" solref="0.02 1" solimp="0.95 0.99 0.001"/>\n    '
-        )
+        return f'<weld name="{name}" body1="world" body2="{body2}" ' f'active="false" solref="0.02 1" solimp="0.95 0.99 0.001"/>\n    '
 
     # =========================================================================
     # シミュレーション制御
@@ -459,25 +444,25 @@ class HideAndSeekEnv:
 
     def run_viewer(
         self,
-        lookat:    Tuple[float, float, float] = (0.0, 0.0, 0.0),
-        distance:  float = 18.0,
+        lookat: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        distance: float = 18.0,
         elevation: float = -55.0,
-        azimuth:   float = 135.0,
+        azimuth: float = 135.0,
     ) -> None:
         with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
             viewer.cam.lookat[:] = lookat
-            viewer.cam.distance  = distance
+            viewer.cam.distance = distance
             viewer.cam.elevation = elevation
-            viewer.cam.azimuth   = azimuth
+            viewer.cam.azimuth = azimuth
 
             viewer.sync()
             time.sleep(0.05)
 
-            sim_time   = 0.0
+            sim_time = 0.0
             wall_start = time.perf_counter()
             while viewer.is_running():
                 wall_now = time.perf_counter()
-                target   = wall_now - wall_start
+                target = wall_now - wall_start
                 while sim_time < target:
                     self.step()
                     sim_time += self.model.opt.timestep
@@ -499,20 +484,21 @@ def _euler_z_to_quat(yaw: float) -> str:
 def _parse_args():
     p = argparse.ArgumentParser(description="Hide-and-Seek MuJoCo Viewer")
     p.add_argument("--seekers", type=int, default=1)
-    p.add_argument("--hiders",  type=int, default=2)
-    p.add_argument("--boxes",   type=int, default=2)
-    p.add_argument("--ramps",   type=int, default=1)
-    p.add_argument("--seed",    type=int, default=None)
+    p.add_argument("--hiders", type=int, default=2)
+    p.add_argument("--boxes", type=int, default=2)
+    p.add_argument("--ramps", type=int, default=1)
+    p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    print(f"[HideAndSeek] Seekers={args.seekers}, Hiders={args.hiders}, "
-          f"Boxes={args.boxes}, Ramps={args.ramps}, Seed={args.seed}")
+    print(f"[HideAndSeek] Seekers={args.seekers}, Hiders={args.hiders}, " f"Boxes={args.boxes}, Ramps={args.ramps}, Seed={args.seed}")
     env = HideAndSeekEnv(
-        n_seekers=args.seekers, n_hiders=args.hiders,
-        n_boxes=args.boxes,     n_ramps=args.ramps,
+        n_seekers=args.seekers,
+        n_hiders=args.hiders,
+        n_boxes=args.boxes,
+        n_ramps=args.ramps,
         seed=args.seed,
     )
     print("[HideAndSeek] Viewer を起動します。ウィンドウを閉じると終了します。")

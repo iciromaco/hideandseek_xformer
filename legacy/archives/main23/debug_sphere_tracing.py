@@ -5,11 +5,11 @@ Sphere Tracing デバッグプログラム
 """
 
 import os
-import sys
-import numpy as np
 import pickle
+import sys
 from pathlib import Path
-import math
+
+import numpy as np
 
 # パス設定
 current_script_abs_path_val = os.path.abspath(__file__)
@@ -34,10 +34,7 @@ except ImportError as e:
     raise
 
 import mujoco
-from main23_sightmap_optimized import (
-    VisibilityEngine, LIDAR_MAX_DIST,
-    sdf_lookup_numba
-)
+from main23_sightmap_optimized import LIDAR_MAX_DIST, VisibilityEngine, sdf_lookup_numba
 
 # ============================================
 # 初期化
@@ -49,9 +46,9 @@ mujoco.mj_resetData(model, data)
 
 # エージェント位置
 agent_positions = {
-    'seeker_body': np.array([3.0, 3.0]),
-    'hider1_body': np.array([1.0, 1.0]),
-    'hider2_body': np.array([5.0, 5.0])
+    "seeker_body": np.array([3.0, 3.0]),
+    "hider1_body": np.array([1.0, 1.0]),
+    "hider2_body": np.array([5.0, 5.0]),
 }
 
 # visibility engineの初期化
@@ -68,17 +65,29 @@ ramp_body = model.body("ramp_body").id
 visibility_engine.set_bodies(s0_body, h1_body, h2_body, box1_body, box2_body, ramp_body)
 
 # 動的オブジェクト位置
-visibility_engine.dynamic_positions[0] = agent_positions['seeker_body']
-visibility_engine.dynamic_positions[1] = agent_positions['hider1_body']
-visibility_engine.dynamic_positions[2] = agent_positions['hider2_body']
+visibility_engine.dynamic_positions[0] = agent_positions["seeker_body"]
+visibility_engine.dynamic_positions[1] = agent_positions["hider1_body"]
+visibility_engine.dynamic_positions[2] = agent_positions["hider2_body"]
 visibility_engine.dynamic_positions[3] = np.array([2.0, -2.0])
 visibility_engine.dynamic_positions[4] = np.array([-2.0, 2.0])
 visibility_engine.dynamic_positions[5] = np.array([0.0, 0.0])
 
 # エージェント位置を data に反映
-data.qpos[0:3] = [agent_positions['seeker_body'][0], agent_positions['seeker_body'][1], 0.5]
-data.qpos[3:6] = [agent_positions['hider1_body'][0], agent_positions['hider1_body'][1], 0.5]
-data.qpos[6:9] = [agent_positions['hider2_body'][0], agent_positions['hider2_body'][1], 0.5]
+data.qpos[0:3] = [
+    agent_positions["seeker_body"][0],
+    agent_positions["seeker_body"][1],
+    0.5,
+]
+data.qpos[3:6] = [
+    agent_positions["hider1_body"][0],
+    agent_positions["hider1_body"][1],
+    0.5,
+]
+data.qpos[6:9] = [
+    agent_positions["hider2_body"][0],
+    agent_positions["hider2_body"][1],
+    0.5,
+]
 
 mujoco.mj_forward(model, data)
 
@@ -104,14 +113,14 @@ yaw = np.pi / 4
 
 # ビーム1を選択（問題のあるビーム）
 beam_index = 1
-surround = np.linspace(0, 2*np.pi, 8, endpoint=False)
-front = np.linspace(-np.pi/6, np.pi/6, 5)
+surround = np.linspace(0, 2 * np.pi, 8, endpoint=False)
+front = np.linspace(-np.pi / 6, np.pi / 6, 5)
 lidar_angles = np.unique(np.concatenate([surround, front]))
 
 lidar_angle = lidar_angles[beam_index]
-print(f"\n" + "=" * 80)
+print("\n" + "=" * 80)
 print(f"Sphere Tracing Debug - Beam {beam_index}")
-print(f"=" * 80)
+print("=" * 80)
 print(f"Lidar angle: {np.degrees(lidar_angle):.1f}° = {lidar_angle:.4f} rad")
 
 # ビーム方向の計算
@@ -143,14 +152,14 @@ epsilon = 0.1
 max_steps = 15
 max_dist = LIDAR_MAX_DIST
 
-print(f"\nSphere Tracing parameters:")
+print("\nSphere Tracing parameters:")
 print(f"  Grid size: {grid_size}")
 print(f"  Cell size: {cell_size:.6f}")
 print(f"  Epsilon: {epsilon}")
 print(f"  Max steps: {max_steps}")
 print(f"  Max dist: {max_dist}")
 
-print(f"\n" + "-" * 80)
+print("\n" + "-" * 80)
 print(f"{'Step':<6} {'X':<10} {'Y':<10} {'d_static':<12} {'d_dynamic':<12} {'d_min':<12} {'total_d':<12}")
 print("-" * 80)
 
@@ -161,15 +170,21 @@ hit = False
 
 for step in range(max_steps):
     # SDF値の取得
-    d_static = sdf_lookup_numba(curr_x, curr_y, visibility_engine.sdf_field, 
-                                grid_size[0], grid_size[1], cell_size)
-    
+    d_static = sdf_lookup_numba(
+        curr_x,
+        curr_y,
+        visibility_engine.sdf_field,
+        grid_size[0],
+        grid_size[1],
+        cell_size,
+    )
+
     # 負の値の処理
     if d_static < 0:
         d_static_orig = d_static
         d_static = epsilon
         print(f"[WARN] Negative SDF at step {step}: {d_static_orig:.4f} -> {epsilon}")
-    
+
     # 動的SDF
     d_dynamic = 1e6
     for i in range(visibility_engine.num_dynamic_objects):
@@ -179,30 +194,30 @@ for step in range(max_steps):
             dist = np.sqrt(dx * dx + dy * dy) - visibility_engine.dynamic_radii[i]
             if dist < d_dynamic:
                 d_dynamic = dist
-    
+
     # 最小距離
     d = min(d_static, d_dynamic)
-    
+
     print(f"{step:<6} {curr_x:<10.4f} {curr_y:<10.4f} {d_static:<12.4f} {d_dynamic:<12.4f} {d:<12.4f} {total_d:<12.4f}")
-    
+
     # 収束判定
     if d < epsilon:
         hit = True
         print(f"[HIT] Converged at step {step}, total_d={total_d:.4f}")
         break
-    
+
     # 前進
     total_d += d
     curr_x += dir_x_norm * d
     curr_y += dir_y_norm * d
-    
+
     # 距離チェック
     if total_d > max_dist:
         print(f"[MAX_DIST] Exceeded max_dist at step {step}, total_d={total_d:.4f}")
         break
 
 print("-" * 80)
-print(f"\nFinal result:")
+print("\nFinal result:")
 print(f"  Hit: {hit}")
 print(f"  Total distance: {total_d:.4f}")
 print(f"  Final position: ({curr_x:.4f}, {curr_y:.4f})")

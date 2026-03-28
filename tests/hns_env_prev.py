@@ -2043,25 +2043,114 @@ class TeamCosEnv(gym.Env):
         obs = self._normalize_obs(self._get_obs(idx_to_obs))
         reward = float(rb if self.target == "hider" else -rb)
         done = self.current_step >= self.max_episode_steps
-        # ランプ関連のデバッグ指標をヘルパーで取得
+        # ランプ関連のデバッグ指標を計算（ランプ上にいると判断できる場合のみ）
+        dbg_ramp_progress = None
+        dbg_ramp_lx = None
+        dbg_ramp_ly = None
+        dbg_ramp_facing = None
+        dbg_ramp_rpos = None
         try:
-            ramp_dbg = self._compute_ramp_debug(learnable_agent_body_id, learnable_agent_pos, dbg_agent_z, dbg_agent_vz)
-            dbg_ramp_progress = ramp_dbg.get("dbg_ramp_progress", None)
-            dbg_ramp_lx = ramp_dbg.get("dbg_ramp_lx", None)
-            dbg_ramp_ly = ramp_dbg.get("dbg_ramp_ly", None)
-            dbg_ramp_facing = ramp_dbg.get("dbg_ramp_facing", None)
-            dbg_ramp_rpos = ramp_dbg.get("dbg_ramp_rpos", None)
-            dbg_ramp_climbing = ramp_dbg.get("dbg_ramp_climbing", False)
-            dbg_ramp_reached_top = ramp_dbg.get("dbg_ramp_reached_top", False)
-            dbg_agent_z = ramp_dbg.get("dbg_agent_z", dbg_agent_z)
-        except Exception:
-            dbg_ramp_progress = None
-            dbg_ramp_lx = None
-            dbg_ramp_ly = None
-            dbg_ramp_facing = None
-            dbg_ramp_rpos = None
+            # _ramp_boost_gain が高いとランプ上にいる可能性が高いのでそれをフィルタに使う
+            boost = float(self._ramp_boost_gain(self.learnable_agent_key))
+            if boost > 0.0:
+                # agent の位置・高さ — qpos の z ではなく body の world z を使う
+                # (qpos.z はジョイント制約で AGENT_Z_MIN にクリップされるため、
+                #  実際のボディ高さを使う方がランプ接触の指標として有用)
+                agent_body_id = learnable_agent_body_id
+                agent_z = float(self.data.xpos[agent_body_id][2])
+                apos2 = learnable_agent_pos[:2]
+                # 学習対象の回転角（z）を取得して facing 計算に使う
+                arot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[self.learnable_agent_key]["rot"]]]
+                # 進捗正規化に使う範囲はランプごとの実ジオメトリから算出
+                for _i, rid in enumerate(self.ramp_ids, start=1):
+                    rpos = self.data.xpos[rid][:2]
+                    up = self._ramp_uphill_dir(rid)
+                    side = np.array([-up[1], up[0]], dtype=np.float32)
+                    rel = apos2 - rpos
+                    lx = float(np.dot(rel, up))
+                    ly = float(np.dot(rel, side))
+                    # 横ずれが大きければ無視
+                    if abs(ly) > 1.5:
+                        continue
+                    try:
+                        lx_min, lx_max, _ = self._compute_ramp_lx_bounds(rid, up)
+                    except Exception:
+                        lx_min, lx_max = -1.15, 0.666
+                    # 正規化された進捗（clamp 0..1）
+                    prog = (lx - lx_min) / max(1e-6, (lx_max - lx_min))
+                    prog = max(0.0, min(1.0, prog))
+                    # ランプの高さはブースト判定には関係しないため、
+                    # `dbg_agent_z` にはエージェントの world z をそのまま記録する。
+                    # 最も進捗が大きいランプを採用
+                    if dbg_ramp_progress is None or prog > dbg_ramp_progress:
+                        dbg_ramp_progress = float(prog)
+                        dbg_agent_z = float(agent_z)
+                        dbg_ramp_lx = float(lx)
+                        dbg_ramp_ly = float(ly)
+                        # facing はエージェント向きとランプ上り方向のコサイン
+                        afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
+                        dbg_ramp_facing = float(np.dot(afwd, up))
+                        dbg_ramp_rpos = rpos.copy()
+                        dbg_ramp_rid = rid
+                # end per-ramp loop
+                # If boost suggests a ramp but we didn't select any, emit per-ramp diagnostics
+                # to help tune filters (temporary verbose diagnostic).
+                if dbg_ramp_progress is None:
+                    try:
+                        details = []
+                        afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
+                        for i2, rid2 in enumerate(self.ramp_ids, start=1):
+                            rkey2 = f"ramp{i2}"
+                            st2 = self.object_state.get(rkey2, {})
+                            rpos2 = self.data.xpos[rid2][:2]
+                            up2 = self._ramp_uphill_dir(rid2)
+                            side2 = np.array([-up2[1], up2[0]], dtype=np.float32)
+                            rel2 = apos2 - rpos2
+                            lx2 = float(np.dot(rel2, up2))
+                            ly2 = float(np.dot(rel2, side2))
+                            facing2 = float(np.dot(afwd, up2))
+                            details.append(f"{rkey2}(mode={st2.get('mode')},owner={st2.get('owner')}," f"lx={lx2:.3f},ly={ly2:.3f},f={facing2:.3f},rpos=({rpos2[0]:.3f},{rpos2[1]:.3f}))")
+                        s = ", ".join(details)
+                        if getattr(self, "debug_mode", False):
+                            print(f"[RAMP_DBG_REJECT] step={getattr(self,'current_step',-1)} ak={self.learnable_agent_key} " f"boost={boost:.3f} candidates=[{s}]")
+                    except Exception:
+                        pass
+            # detect climbing (agent z increasing while on/near ramp) and reaching top
+            prev_z = self._prev_agent_z.get(self.learnable_agent_key, None)
             dbg_ramp_climbing = False
             dbg_ramp_reached_top = False
+            if dbg_ramp_progress is not None:
+                if prev_z is not None and (agent_z - prev_z) > 0.01 and dbg_ramp_progress > 0.05:
+                    dbg_ramp_climbing = True
+                # reached-top is only debug info; use height-only criterion
+                try:
+                    HEIGHT_TOL = 0.02
+                    if dbg_ramp_rid is not None:
+                        top_z = self._compute_ramp_top_z(dbg_ramp_rid)
+                        dbg_ramp_reached_top = agent_z >= (top_z - HEIGHT_TOL)
+                    else:
+                        dbg_ramp_reached_top = False
+                except Exception:
+                    dbg_ramp_reached_top = False
+            # store for next step
+            try:
+                self._prev_agent_z[self.learnable_agent_key] = float(agent_z)
+            except Exception:
+                pass
+        except Exception:
+            # ランプ指標の計算で失敗しても主処理に影響を出さない。
+            # ただしエージェントの位置/速度は常に報告したいため
+            # `dbg_agent_z` と `dbg_agent_vz` は上書きしない。
+            dbg_ramp_progress = None
+            dbg_ramp_climbing = False
+            dbg_ramp_reached_top = False
+        # Ensure agent z is reported when we have a computed progress but z wasn't set
+        try:
+            if dbg_ramp_progress is not None and dbg_agent_z is None:
+                agent_body_id = learnable_agent_body_id
+                dbg_agent_z = float(self.data.xpos[agent_body_id][2])
+        except Exception:
+            dbg_agent_z = None
         info = self._assemble_step_info(
             find=find,
             any_lock_event=any_lock_event,
@@ -2240,149 +2329,6 @@ class TeamCosEnv(gym.Env):
                 pass
         except Exception:
             pass
-
-    def _compute_and_apply_wall_repulsion(self, learnable_agent_body_id, learnable_agent_pos, last_ctrl_f, applied_forward_env):
-        """
-        壁反発の中心ロジックをまとめて `data.xfrc_applied` に力を加え、
-        必要なデバッグ値を辞書で返す。
-
-        戻り値キー (すべて float または int):
-            dist, nx, ny, clearance, applied_fwd,
-            fb_fx, fb_fy, ctrl_fx, ctrl_fy, fx_tot, fy_tot, bid, ncon
-        """
-        bid = int(learnable_agent_body_id)
-        # 初期値
-        dist = 1.0
-        nx = 0.0
-        ny = 0.0
-        clearance = 1.0
-        applied_fwd = float(applied_forward_env if applied_forward_env is not None else 0.0)
-        fb_fx = fb_fy = ctrl_fx = ctrl_fy = fx_tot = fy_tot = 0.0
-
-        try:
-            # SDF を使って壁距離・法線をサンプリング
-            try:
-                dist_w, nx_w, ny_w = self.vis_engine.sample_sdf_with_normal(float(learnable_agent_pos[0]), float(learnable_agent_pos[1]))
-                dist = float(dist_w)
-                nx = float(nx_w)
-                ny = float(ny_w)
-            except Exception:
-                dist = 1.0
-                nx = ny = 0.0
-
-            # クリアランス (エージェント表面ベースの余裕距離)
-            try:
-                r_eff = float(getattr(self, "AGENT_EFFECTIVE_RADIUS", 0.4))
-                clearance = float(dist - (r_eff - float(getattr(self, "WALL_REPULSION_CLEARANCE", 0.2))))
-            except Exception:
-                clearance = float(dist)
-
-            # 制御ベースの反発推定 (EMA)
-            try:
-                ctrl_lp = float(getattr(self, "WALL_REPULSION_CTRL_LP", 0.2))
-                scale = float(getattr(self, "WALL_REPULSION_CTRL_SCALE", 0.05))
-                clip = getattr(self, "WALL_REPULSION_CTRL_CLIP", None)
-                prev = float(getattr(self, "_wall_repulsion_ctrl_ema", 0.0))
-                # 入力は実際に環境で適用された前進値を使う
-                inp = float(applied_forward_env if applied_forward_env is not None else last_ctrl_f if last_ctrl_f is not None else 0.0)
-                ema = (1.0 - ctrl_lp) * prev + ctrl_lp * inp
-                if clip is not None:
-                    try:
-                        ema = max(min(float(clip), float(ema)), -float(clip))
-                    except Exception:
-                        pass
-                # persist for next step
-                self._wall_repulsion_ctrl_ema = float(ema)
-                ctrl_force = float(ema) * scale
-                # forward vector (world)
-                try:
-                    rot_j = self.qpos_indices[self.learnable_agent_key]["rot"]
-                    rot_val = float(self.data.qpos[self.model.jnt_qposadr[rot_j]])
-                    afwd_x = float(math.cos(rot_val))
-                    afwd_y = float(math.sin(rot_val))
-                except Exception:
-                    afwd_x, afwd_y = 1.0, 0.0
-                ctrl_fx = ctrl_force * afwd_x
-                ctrl_fy = ctrl_force * afwd_y
-            except Exception:
-                ctrl_fx = ctrl_fy = 0.0
-
-            # フィードバック（壁法線ベース）の反発
-            try:
-                # 距離が小さいほど強いフィードバック
-                kp = float(getattr(self, "WALL_REPULSION_PASSIVE_KP", 40.0))
-                fmax = float(getattr(self, "WALL_REPULSION_PASSIVE_FMAX", 30.0))
-                r_start = float(getattr(self, "WALL_REPULSION_RADIUS", 0.25))
-                depth = max(0.0, r_start - float(dist))
-                fb_mag = kp * depth
-                if fb_mag > fmax:
-                    fb_mag = fmax
-                fb_fx = fb_mag * float(nx)
-                fb_fy = fb_mag * float(ny)
-            except Exception:
-                fb_fx = fb_fy = 0.0
-
-            # 合計力
-            try:
-                fx_tot = float(fb_fx + ctrl_fx)
-                fy_tot = float(fb_fy + ctrl_fy)
-                # 1 ステップ内で書き込む増分をクリップ
-                try:
-                    clamp_v = float(getattr(self, "WALL_REPULSION_ACCUM_CLAMP_MAX", 100.0))
-                    fx_tot = max(min(fx_tot, clamp_v), -clamp_v)
-                    fy_tot = max(min(fy_tot, clamp_v), -clamp_v)
-                except Exception:
-                    pass
-                # data.xfrc_applied に反映
-                try:
-                    if hasattr(self.data, "xfrc_applied"):
-                        # ensure shape
-                        if self.data.xfrc_applied.shape[1] >= 2:
-                            self.data.xfrc_applied[bid, 0] = float(self.data.xfrc_applied[bid, 0]) + fx_tot
-                            self.data.xfrc_applied[bid, 1] = float(self.data.xfrc_applied[bid, 1]) + fy_tot
-                except Exception:
-                    pass
-            except Exception:
-                fx_tot = fy_tot = 0.0
-
-            # 回転抑制処理を呼び出す
-            try:
-                self._apply_rotation_suppression(bid, float(clearance))
-            except Exception:
-                pass
-
-            # verbose debug
-            try:
-                self._debug_wall_repulsion(
-                    bid, dist, float(clearance), float(np.dot([afwd_x, afwd_y], [nx, ny]) if "afwd_x" in locals() else 0.0), applied_fwd, fb_fx, fb_fy, ctrl_fx, ctrl_fy, fx_tot, fy_tot
-                )
-            except Exception:
-                pass
-
-        except Exception:
-            pass
-
-        # ncon (contacts) 取得
-        try:
-            ncon = int(getattr(self.data, "ncon", 0)) if hasattr(self.data, "ncon") else 0
-        except Exception:
-            ncon = 0
-
-        return {
-            "dist": float(dist),
-            "nx": float(nx),
-            "ny": float(ny),
-            "clearance": float(clearance),
-            "applied_fwd": float(applied_fwd),
-            "fb_fx": float(fb_fx),
-            "fb_fy": float(fb_fy),
-            "ctrl_fx": float(ctrl_fx),
-            "ctrl_fy": float(ctrl_fy),
-            "fx_tot": float(fx_tot),
-            "fy_tot": float(fy_tot),
-            "bid": int(bid),
-            "ncon": int(ncon),
-        }
 
     def _assemble_step_info(
         self,
@@ -2604,114 +2550,6 @@ class TeamCosEnv(gym.Env):
                 pass
         except Exception:
             pass
-
-    def _compute_ramp_debug(self, learnable_agent_body_id, learnable_agent_pos, dbg_agent_z, dbg_agent_vz):
-        """
-        ランプ判定と関連デバッグ指標を計算して辞書で返す。
-        既存の step() ブロックと同じ値を返すように実装する。
-        """
-        dbg_ramp_progress = None
-        dbg_ramp_lx = None
-        dbg_ramp_ly = None
-        dbg_ramp_facing = None
-        dbg_ramp_rpos = None
-        dbg_ramp_rid = None
-        dbg_ramp_climbing = False
-        dbg_ramp_reached_top = False
-        try:
-            boost = float(self._ramp_boost_gain(self.learnable_agent_key))
-            if boost > 0.0:
-                agent_body_id = learnable_agent_body_id
-                agent_z = float(self.data.xpos[agent_body_id][2])
-                apos2 = learnable_agent_pos[:2]
-                arot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[self.learnable_agent_key]["rot"]]]
-                for _i, rid in enumerate(self.ramp_ids, start=1):
-                    try:
-                        rpos = self.data.xpos[rid][:2]
-                        up = self._ramp_uphill_dir(rid)
-                        side = np.array([-up[1], up[0]], dtype=np.float32)
-                        rel = apos2 - rpos
-                        lx = float(np.dot(rel, up))
-                        ly = float(np.dot(rel, side))
-                        if abs(ly) > 1.5:
-                            continue
-                        try:
-                            lx_min, lx_max, _ = self._compute_ramp_lx_bounds(rid, up)
-                        except Exception:
-                            lx_min, lx_max = -1.15, 0.666
-                        prog = (lx - lx_min) / max(1e-6, (lx_max - lx_min))
-                        prog = max(0.0, min(1.0, prog))
-                        if dbg_ramp_progress is None or prog > dbg_ramp_progress:
-                            dbg_ramp_progress = float(prog)
-                            dbg_agent_z = float(agent_z)
-                            dbg_ramp_lx = float(lx)
-                            dbg_ramp_ly = float(ly)
-                            afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
-                            dbg_ramp_facing = float(np.dot(afwd, up))
-                            dbg_ramp_rpos = rpos.copy()
-                            dbg_ramp_rid = rid
-                    except Exception:
-                        continue
-                if dbg_ramp_progress is None:
-                    try:
-                        details = []
-                        afwd = np.array([math.cos(arot), math.sin(arot)], dtype=np.float32)
-                        for i2, rid2 in enumerate(self.ramp_ids, start=1):
-                            rkey2 = f"ramp{i2}"
-                            st2 = self.object_state.get(rkey2, {})
-                            rpos2 = self.data.xpos[rid2][:2]
-                            up2 = self._ramp_uphill_dir(rid2)
-                            side2 = np.array([-up2[1], up2[0]], dtype=np.float32)
-                            rel2 = apos2 - rpos2
-                            lx2 = float(np.dot(rel2, up2))
-                            ly2 = float(np.dot(rel2, side2))
-                            facing2 = float(np.dot(afwd, up2))
-                            details.append(f"{rkey2}(mode={st2.get('mode')},owner={st2.get('owner')},lx={lx2:.3f},ly={ly2:.3f},f={facing2:.3f},rpos=({rpos2[0]:.3f},{rpos2[1]:.3f}))")
-                        s = ", ".join(details)
-                        if getattr(self, "debug_mode", False):
-                            print(f"[RAMP_DBG_REJECT] step={getattr(self,'current_step',-1)} ak={self.learnable_agent_key} " f"boost={boost:.3f} candidates=[{s}]")
-                    except Exception:
-                        pass
-
-            prev_z = self._prev_agent_z.get(self.learnable_agent_key, None)
-            if dbg_ramp_progress is not None:
-                if prev_z is not None and (agent_z - prev_z) > 0.01 and dbg_ramp_progress > 0.05:
-                    dbg_ramp_climbing = True
-                try:
-                    HEIGHT_TOL = 0.02
-                    if dbg_ramp_rid is not None:
-                        top_z = self._compute_ramp_top_z(dbg_ramp_rid)
-                        dbg_ramp_reached_top = agent_z >= (top_z - HEIGHT_TOL)
-                    else:
-                        dbg_ramp_reached_top = False
-                except Exception:
-                    dbg_ramp_reached_top = False
-            try:
-                self._prev_agent_z[self.learnable_agent_key] = float(agent_z)
-            except Exception:
-                pass
-        except Exception:
-            dbg_ramp_progress = None
-            dbg_ramp_climbing = False
-            dbg_ramp_reached_top = False
-        try:
-            if dbg_ramp_progress is not None and dbg_agent_z is None:
-                agent_body_id = learnable_agent_body_id
-                dbg_agent_z = float(self.data.xpos[agent_body_id][2])
-        except Exception:
-            dbg_agent_z = None
-
-        return {
-            "dbg_ramp_progress": dbg_ramp_progress,
-            "dbg_ramp_lx": dbg_ramp_lx,
-            "dbg_ramp_ly": dbg_ramp_ly,
-            "dbg_ramp_facing": dbg_ramp_facing,
-            "dbg_ramp_rpos": dbg_ramp_rpos,
-            "dbg_ramp_rid": dbg_ramp_rid,
-            "dbg_ramp_climbing": dbg_ramp_climbing,
-            "dbg_ramp_reached_top": dbg_ramp_reached_top,
-            "dbg_agent_z": dbg_agent_z,
-        }
 
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
         rel = t_pos - pos

@@ -5,14 +5,16 @@
 """
 
 import sys
+
 from main23_sightmap_optimized import ray_segment_intersection_numba
+
 
 def test_case(name, start_x, start_y, dir_x, dir_y, seg_x1, seg_y1, seg_x2, seg_y2, expected_t):
     """
     テストケースを実行
     """
     result = ray_segment_intersection_numba(start_x, start_y, dir_x, dir_y, seg_x1, seg_y1, seg_x2, seg_y2)
-    
+
     # 期待値との比較
     if expected_t is None:
         # 交点がないことを期待
@@ -27,8 +29,9 @@ def test_case(name, start_x, start_y, dir_x, dir_y, seg_x1, seg_y1, seg_x2, seg_
         status = "✓ PASS" if is_pass else "✗ FAIL"
         print(f"{status} | {name}")
         print(f"  Result: {result:.4f}, Expected: {expected_t:.4f}, Error: {error:.4f}")
-    
+
     return is_pass
+
 
 print("=" * 70)
 print("交線法テスト（ray_segment_intersection_numba）")

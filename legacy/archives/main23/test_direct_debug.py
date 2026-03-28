@@ -4,15 +4,16 @@
 """
 
 import os
+
 # Skip GL setup for headless rendering
-os.environ['MUJOCO_GL'] = 'glfw'  # Use default
+os.environ["MUJOCO_GL"] = "glfw"  # Use default
 
 import mujoco
 import numpy as np
 from main23_sightmap_optimized import (
-    VisibilityEngine, 
+    VisibilityEngine,
     cast_ray_direct_numba,
-    ray_segment_intersection_numba
+    ray_segment_intersection_numba,
 )
 
 # ===== MuJoCo環境のセットアップ =====
@@ -45,30 +46,43 @@ for beam_idx in [1, 3, 5, 6]:
     angle = lidar_angles[beam_idx]
     dir_x = np.cos(seeker_yaw + angle)
     dir_y = np.sin(seeker_yaw + angle)
-    
+
     print(f"\nBeam {beam_idx}:")
     print(f"  Angle: {np.degrees(angle):.1f}°")
     print(f"  Direction: ({dir_x:.4f}, {dir_y:.4f})")
-    
+
     # キャスト実行
     dist, hit = cast_ray_direct_numba(
-        seeker_pos[0], seeker_pos[1], dir_x, dir_y,
-        visibility_engine.positions, visibility_engine.radii, 
-        visibility_engine.body_ids, visibility_engine.num_objects,
-        visibility_engine.wall_segments, visibility_engine.num_walls,
-        seeker_body_id, -1,
-        15.0
+        seeker_pos[0],
+        seeker_pos[1],
+        dir_x,
+        dir_y,
+        visibility_engine.positions,
+        visibility_engine.radii,
+        visibility_engine.body_ids,
+        visibility_engine.num_objects,
+        visibility_engine.wall_segments,
+        visibility_engine.num_walls,
+        seeker_body_id,
+        -1,
+        15.0,
     )
-    
+
     print(f"  Result Distance: {dist:.4f}")
     print(f"  Hit: {hit}")
-    
+
     # 個別に壁との交点を確認
-    print(f"  Wall intersection details:")
+    print("  Wall intersection details:")
     for w_idx, wall in enumerate(visibility_engine.wall_segments[:5]):  # 最初の5つだけ
         d = ray_segment_intersection_numba(
-            seeker_pos[0], seeker_pos[1], dir_x, dir_y,
-            wall[0], wall[1], wall[2], wall[3]
+            seeker_pos[0],
+            seeker_pos[1],
+            dir_x,
+            dir_y,
+            wall[0],
+            wall[1],
+            wall[2],
+            wall[3],
         )
         if d < 15.0:
             print(f"    Wall {w_idx}: ({wall[0]:.2f},{wall[1]:.2f}) - ({wall[2]:.2f},{wall[3]:.2f}) -> distance={d:.4f}")

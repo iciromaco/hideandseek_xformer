@@ -5,6 +5,7 @@ SDF距離フィールドを生成（テスト用）
 
 import os
 import sys
+
 import numpy as np
 
 current_script_abs_path_val = os.path.abspath(__file__)
@@ -23,8 +24,12 @@ if os.getcwd() not in sys.path:
     sys.path.insert(0, os.getcwd())
 
 import main18_optimization as base_config
-from main23_sightmap_optimized import VisibilityEngine, build_sdf_distance_field, save_sdf_distance_field
 import mujoco
+from main23_sightmap_optimized import (
+    VisibilityEngine,
+    build_sdf_distance_field,
+    save_sdf_distance_field,
+)
 
 # 初期化
 xml_string = base_config.XML_CONTENT
@@ -66,7 +71,7 @@ wall_segments = [
     ((-0.1, -4.5), (-0.1, -1.5)),
     ((0.1, -4.5), (0.1, -1.5)),
     ((-0.1, 1.5), (-0.1, 4.5)),
-    ((0.1, 1.5), (0.1, 4.5))
+    ((0.1, 1.5), (0.1, 4.5)),
 ]
 
 for i, (p1, p2) in enumerate(wall_segments):
@@ -99,11 +104,11 @@ metadata = {
     "grid_size": grid_size,
     "cell_size": cell_size,
     "bounds": [[-6, 6], [-6, 6]],
-    "timestamp": str(np.datetime64('now'))
+    "timestamp": str(np.datetime64("now")),
 }
 save_sdf_distance_field(sdf_field, cell_centers, metadata, "sdf_distance_field.pkl")
 
-print(f"SDF field saved!")
+print("SDF field saved!")
 print(f"  Shape: {sdf_field.shape}")
 print(f"  Min: {sdf_field.min():.4f}")
 print(f"  Max: {sdf_field.max():.4f}")

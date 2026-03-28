@@ -1,12 +1,13 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 import os
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
 plt.rcParams["font.family"] = "Hiragino Sans"
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.inspection import partial_dependence
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
 
 # =====================================
 # 設定
@@ -92,11 +93,7 @@ coef.to_csv(f"{FIG_DIR}/linear_regression_coeffs.csv")
 # =====================================
 # 5. 非線形モデル（RandomForest）
 # =====================================
-rf = RandomForestRegressor(
-    n_estimators=300,
-    random_state=RANDOM_STATE,
-    n_jobs=-1
-)
+rf = RandomForestRegressor(n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1)
 rf.fit(X, y)
 
 # =====================================
@@ -106,12 +103,7 @@ for p in BASE_PARAMS:
     print(f"PDP 作成中: {p}")
 
     # PDP 用の特徴量
-    pdp = partial_dependence(
-        rf,
-        X,
-        features=[p],
-        grid_resolution=50
-    )
+    pdp = partial_dependence(rf, X, features=[p], grid_resolution=50)
 
     x = pdp["grid_values"][0]
     y_pdp = pdp["average"][0]
@@ -122,32 +114,25 @@ for p in BASE_PARAMS:
 
     if p in LOG_PARAM_MAP:
         # x はすでに実値
-        plt.plot(x, y_pdp) #, marker=".")
+        plt.plot(x, y_pdp)  # , marker=".")
         plt.xscale("log")
 
         ax = plt.gca()
-        ax.xaxis.set_minor_formatter(mticker.FuncFormatter(
-            lambda v, _: f"{v:.1e}"
-        ))
+        ax.xaxis.set_minor_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.1e}"))
         ax.tick_params(axis="x", which="minor", labelsize=8)
 
         ax.xaxis.set_major_locator(mticker.LogLocator(base=10))
-        ax.xaxis.set_minor_locator(
-            mticker.LogLocator(
-                base=10,
-                subs=(2, 5)   # ← ここが刻み
-            )
-        )
-        #ax.xaxis.set_minor_locator(
+        ax.xaxis.set_minor_locator(mticker.LogLocator(base=10, subs=(2, 5)))  # ← ここが刻み
+        # ax.xaxis.set_minor_locator(
         #    mticker.LogLocator(base=10, subs=(2, 3, 4, 5, 6, 7, 8, 9))
-        #)
-        #ax.xaxis.set_minor_formatter(mticker.LogFormatterSciNotation())
-        #ax.xaxis.set_minor_locator(mticker.NullLocator())
+        # )
+        # ax.xaxis.set_minor_formatter(mticker.LogFormatterSciNotation())
+        # ax.xaxis.set_minor_locator(mticker.NullLocator())
 
         plt.xlabel(p.replace("params_", "").lower())
 
     else:
-        plt.plot(x, y_pdp) # , marker="o")
+        plt.plot(x, y_pdp)  # , marker="o")
         plt.xlabel(p.replace("params_", "").lower())
 
     plt.ylabel("予測 value（部分依存）")

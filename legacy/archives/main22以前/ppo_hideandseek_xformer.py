@@ -1,14 +1,15 @@
 import argparse
+
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions.categorical import Categorical
 from gymnasium.vector import AsyncVectorEnv
-from torch.utils.tensorboard import SummaryWriter
 
 # === 環境の定義 ===
 from hidenadseek import HideAndSeekEnv  # ← 実際のモジュール名に置き換えてね！
+from torch.utils.tensorboard import SummaryWriter
+
 
 def make_env(rank, seed=0):
     def _init():
@@ -16,7 +17,9 @@ def make_env(rank, seed=0):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.reset(seed=seed + rank)
         return env
+
     return _init
+
 
 # === Transformerベースのポリシー ===
 class TransformerPolicy(nn.Module):
@@ -35,7 +38,7 @@ class TransformerPolicy(nn.Module):
         std = self.log_std.exp().expand_as(mean)
         return mean, std
 
-from gymnasium.vector import SyncVectorEnv
+
 # === メイン ===
 def main():
     parser = argparse.ArgumentParser()
@@ -82,9 +85,10 @@ def main():
     envs.close()
     writer.close()
 
+
 if __name__ == "__main__":
     main()
-'''
+"""
 def main():
     print(f"--- Multi-Agent Training Stage: Target = {TRAIN_TARGET} ---")
     
@@ -154,4 +158,4 @@ def main():
     writer.close()       
 
 
-main(SAVE_PATH=SAVE_PATH, ...)'''
+main(SAVE_PATH=SAVE_PATH, ...)"""
