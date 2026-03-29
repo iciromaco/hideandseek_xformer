@@ -4,10 +4,6 @@
 import logging
 import math
 import os
-import select
-import sys
-import termios
-import tty
 from typing import Any, Dict, Optional
 
 import gymnasium as gym
@@ -51,50 +47,64 @@ class DebugLogger:
         self.enabled = enabled
         self.console = console
         self.log_interval_steps = log_interval_steps
-        self._log_last_step = {}
-        self._policy_src_logged = set()
+        # no environment-specific initialization here; keep logger lightweight
+        # internal buffers
+        self._policy_src_log = []
+        self._last_step_msgs = []
 
-    def print(self, message):
-        # デバッグ出力を Python の logging 経由でルーティングし、
-        # `HNS_LOG_LEVEL` に従って出力レベルを制御します。
-        # `debug_logger.enabled` が True の場合のみ出力されます。
-        if not self.enabled:
-            return
+    def print(self, msg: str):
+        """Emit a debug message. If `console` is True print to stdout,
+        otherwise route to the module logger at debug level.
+        """
         try:
-            # メッセージ先頭が '[DEBUG]' の場合は DEBUG レベルで出力し、
-            # それ以外は INFO レベルで出力します。
-            if isinstance(message, str) and message.startswith("[DEBUG]"):
-                logger.debug(message)
+            if self.console:
+                builtins_print = __builtins__.get("print", print) if isinstance(__builtins__, dict) else print
+                builtins_print(msg)
             else:
-                logger.info(message)
+                if isinstance(msg, str) and msg.startswith("[DEBUG]"):
+                    logger.debug(msg)
+                else:
+                    logger.info(msg)
         except Exception:
             try:
                 logger.exception("DebugLogger.print failed")
             except Exception:
                 pass
 
-    def log_policy_src(self, agent_key, source, current_step, force=False):
-        if not self.enabled and not force:
-            return
+    def log_policy_src(self, agent_key, source, step, force=False):
+        """Record policy source; safe no-op when disabled unless force=True."""
         try:
-            logger.debug(f"[POLICY_SRC] step={current_step} agent={agent_key} src={source}")
+            if not (self.enabled or force):
+                return
+            self._policy_src_log.append((int(step), agent_key, source))
+            if self.console:
+                try:
+                    builtins_print = __builtins__.get("print", print) if isinstance(__builtins__, dict) else print
+                    builtins_print(f"[POLICY_SRC] step={step} agent={agent_key} src={source}")
+                except Exception:
+                    logger.debug(f"[POLICY_SRC] step={step} agent={agent_key} src={source}")
         except Exception:
             try:
                 logger.exception("DebugLogger.log_policy_src failed")
             except Exception:
                 pass
 
-    def clear_policy_src_log(self):
-        self._policy_src_logged.clear()
-
     def clear_last_step(self):
-        self._log_last_step.clear()
+        try:
+            self._last_step_msgs.clear()
+        except Exception:
+            pass
+
+    def clear_policy_src_log(self):
+        try:
+            self._policy_src_log.clear()
+        except Exception:
+            pass
 
 
-def _euler_z_to_quat(yaw):
-    # Z軸回転角からクォータニオン文字列を生成。
-    w, z = math.cos(yaw / 2.0), math.sin(yaw / 2.0)
-    return f"{w:.6f} 0 0 {z:.6f}"
+def _euler_z_to_quat(rot: float):
+    """Return quaternion (w,x,y,z) for rotation around Z by `rot` radians."""
+    return np.array([math.cos(rot * 0.5), 0.0, 0.0, math.sin(rot * 0.5)], dtype=np.float32)
 
 
 @njit(cache=True)  # numbaで高速化された壁との遮蔽判定関数
@@ -293,6 +303,9 @@ class TeamCosEnv(gym.Env):
         seed: Optional[int] = None,
         USE_VIEWER: bool = False,
         human_key_bindings: Optional[Dict[str, Any]] = None,
+        vis_facing_threshold: Optional[float] = None,
+        prep_steps: int = 80,
+        max_episode_steps: int = 500,
     ):
         # apply deterministic seed at instantiation when provided
         try:
@@ -331,7 +344,10 @@ class TeamCosEnv(gym.Env):
         self.mode, self.target, self.render_mode = mode, target, render_mode
         self.show_turn_lines = bool(show_turn_lines)
         self.mode4_sdf_cell_size = float(mode4_sdf_cell_size)
-        self.current_step, self.prep_steps, self.max_episode_steps = 0, 80, 500
+        # runtime-configurable episode parameters
+        self.current_step = 0
+        self.prep_steps = int(prep_steps)
+        self.max_episode_steps = int(max_episode_steps)
         # use private attr and property to keep debug_logger.enabled in sync
         self._debug_mode = bool(debug_mode)
         self.debug_logger = DebugLogger(enabled=self._debug_mode, console=bool(debug_console), log_interval_steps=dbg_log_interval_steps)
@@ -351,7 +367,20 @@ class TeamCosEnv(gym.Env):
         self._being_hit_counters: Dict[Any, int] = {}
         # cached last observation returned for the learnable agent
         self._cached_obs = None
+        # per-step cache to avoid recomputing observations/visibility repeatedly
+        self._frame_cache_step: int = -1
+        self._frame_obs_cache: Dict[int, Any] = {}
+        # per-step visibility cache: keys are (viewer_body_id, target_body_id) -> bool
+        self._frame_vis_cache: Dict[Any, Any] = {}
         self._init_debug_stats()
+        # Visibility facing threshold: used by cheap prefilter in `_is_vis`.
+        try:
+            if vis_facing_threshold is not None:
+                self.VIS_FACING_THRESHOLD = float(vis_facing_threshold)
+            else:
+                self.VIS_FACING_THRESHOLD = float(os.environ.get("HNS_VIS_FACING_THRESHOLD", 0.38))
+        except Exception:
+            self.VIS_FACING_THRESHOLD = 0.38
         if self.n_seekers == 1:
             self.seeker_keys = ["s"]
         else:
@@ -687,7 +716,7 @@ class TeamCosEnv(gym.Env):
             'solimp="0.95 0.99 0.001" friction="1.35 0.22 0.01"/>'
         )
         return f"""
-        <body name="ramp{i}_body" pos="{xy[0]} {xy[1]} 0" quat="{q}">
+        <body name="ramp{i}_body" pos="{xy[0]} {xy[1]} 0" quat="{q[0]} {q[1]} {q[2]} {q[3]}">
             <inertial pos="0.3 0 0.25" mass="{self.RAMP_MASS}" diaginertia="10 10 20"/>
             <joint name="ramp{i}_joint_x" type="slide" axis="1 0 0" damping="{self.RAMP_JOINT_DAMPING}"/>
             <joint name="ramp{i}_joint_y" type="slide" axis="0 1 0" damping="{self.RAMP_JOINT_DAMPING}"/>
@@ -702,7 +731,7 @@ class TeamCosEnv(gym.Env):
     def _xml_box(self, i, xy, rot):
         q = _euler_z_to_quat(rot)
         return f"""
-    <body name="box{i}_body" pos="{xy[0]} {xy[1]} 0.5" quat="{q}">
+    <body name="box{i}_body" pos="{xy[0]} {xy[1]} 0.5" quat="{q[0]} {q[1]} {q[2]} {q[3]}">
             <joint name="box{i}_joint" type="free" damping="{self.BOX_JOINT_DAMPING}"/>
             <geom name="box{i}_geom" type="box" size="0.6 0.6 0.5" mass="{self.BOX_MASS}" solref="0.02 1" condim="3" rgba="0.75 0.55 0.3 1" friction="1.2 0.08 0.003"/>
     </body>"""
@@ -722,7 +751,7 @@ class TeamCosEnv(gym.Env):
         q = _euler_z_to_quat(rot)
         r, g, b = color
         return f"""
-    <body name="{pre}_anchor" pos="{xy[0]} {xy[1]} 0.5" quat="{q}">
+    <body name="{pre}_anchor" pos="{xy[0]} {xy[1]} 0.5" quat="{q[0]} {q[1]} {q[2]} {q[3]}">
       <joint name="{pre}_x" type="slide" axis="1 0 0" damping="{self.AGENT_DAMPING_XY}"/>
       <joint name="{pre}_y" type="slide" axis="0 1 0" damping="{self.AGENT_DAMPING_XY}"/>
     <joint name="{pre}_z" type="slide" axis="0 0 1" damping="{self.AGENT_DAMPING_Z}" limited="true" range="{self.AGENT_Z_MIN} {self.AGENT_Z_MAX}"/>
@@ -1270,7 +1299,11 @@ class TeamCosEnv(gym.Env):
                 continue
             if for_grab and float(np.dot(fwd, rel)) <= -0.2:
                 continue
-            if not self.vis_engine.is_visible(apos, opos, body_exclude=aid, target_body_id=bid):
+            try:
+                rot_view = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]])
+            except Exception:
+                rot_view = 0.0
+            if not self._is_vis(apos, rot_view, opos, aid, bid):
                 continue
             if dist < best_dist:
                 best_key, best_dist = tk, dist
@@ -1318,7 +1351,11 @@ class TeamCosEnv(gym.Env):
             cpos = self.data.xpos[cid][:2]
             if self._interaction_blocked_by_static_walls(apos, cpos):
                 return False
-            if not self.vis_engine.is_visible(apos, cpos, body_exclude=aid, target_body_id=cid):
+            try:
+                rot_view = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]])
+            except Exception:
+                rot_view = 0.0
+            if not self._is_vis(apos, rot_view, cpos, aid, cid):
                 return False
 
         if cur is not None and (tk is None or tk == cur):
@@ -1363,7 +1400,11 @@ class TeamCosEnv(gym.Env):
                             rel = opos - apos
                             dist = float(np.linalg.norm(rel))
                             wall_block = bool(self._interaction_blocked_by_static_walls(apos, opos))
-                            vis = bool(self.vis_engine.is_visible(apos, opos, body_exclude=self.body_ids[ak], target_body_id=bid))
+                            try:
+                                rot_view_dbg = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]])
+                            except Exception:
+                                rot_view_dbg = 0.0
+                            vis = bool(self._is_vis(apos, rot_view_dbg, opos, self.body_ids[ak], bid))
                             out.append(f"{tk}:dist={dist:.3f},in_range={dist<=self.INTERACT_RANGE},vis={vis},wall_block={wall_block}")
                         print(f"[human_debug][LOCK_FAIL] ak={ak} candidates=[{';'.join(out)}]")
                     except Exception:
@@ -1385,7 +1426,11 @@ class TeamCosEnv(gym.Env):
                             rel = opos - apos
                             dist = float(np.linalg.norm(rel))
                             wall_block = bool(self._interaction_blocked_by_static_walls(apos, opos))
-                            vis = bool(self.vis_engine.is_visible(apos, opos, body_exclude=self.body_ids[ak], target_body_id=bid))
+                            try:
+                                rot_view_dbg = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]])
+                            except Exception:
+                                rot_view_dbg = 0.0
+                            vis = bool(self._is_vis(apos, rot_view_dbg, opos, self.body_ids[ak], bid))
                             forward_dot = float(
                                 np.dot(
                                     np.array(
@@ -1638,14 +1683,284 @@ class TeamCosEnv(gym.Env):
         for cx, cy, hx, hy in getattr(self, "static_wall_aabbs", []):
             if abs(px - cx) <= (hx + radius + margin) and abs(py - cy) <= (hy + radius + margin):
                 return False
+        # 既に配置済みのオブジェクトとの距離チェック
         for pp, pr in placed:
             if np.linalg.norm(pos_xy - pp) < (radius + pr + margin):
                 return False
         return True
 
+    def _randomly_place_bodies(self, specs, placed, trials=500, margin=0.2):
+        """Place bodies (ramps/boxes) randomly using the existing placement logic.
+
+        Args:
+            specs: iterable of (body_id, radius, z)
+            placed: list to append placed (pos, radius) tuples
+            trials: number of sampling attempts per body
+            margin: margin passed to `_is_spawn_position_valid`
+        """
+        for bid, rad, z in specs:
+            for _ in range(trials):
+                p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
+                if not self._is_spawn_position_valid(p, rad, placed, margin=margin):
+                    continue
+                try:
+                    jadr = self.model.body_jntadr[bid]
+                    if jadr is None or int(jadr) < 0:
+                        if self.debug_mode:
+                            self.debug_logger.print(f"[DEBUG][reset] invalid body_jntadr for body {bid}: {jadr}")
+                        continue
+                    adr = int(self.model.jnt_qposadr[jadr])
+                    if adr is None or adr < 0 or (adr + 7) > self.data.qpos.shape[0]:
+                        if self.debug_mode:
+                            self.debug_logger.print(f"[DEBUG][reset] invalid qpos adr for body {bid}: {adr}")
+                        continue
+                    if bid in getattr(self, "ramp_ids", []):
+                        # slide x, slide y, hinge z
+                        self.data.qpos[adr : adr + 3] = [p[0], p[1], 0.0]
+                    else:
+                        # boxes etc.: free joint (pos + quat)
+                        self.data.qpos[adr : adr + 7] = [p[0], p[1], z, 1, 0, 0, 0]
+                    placed.append((p, rad))
+                except Exception:
+                    if self.debug_mode:
+                        self.debug_logger.print(f"[DEBUG][reset] exception placing body {bid}")
+                    continue
+                break
+
+    def _randomly_place_agents(self, placed, trials=500, margin=0.3):
+        """Place agents randomly using existing placement logic."""
+        for ak in self.agent_keys:
+            for _ in range(trials):
+                p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
+                rot = np.random.uniform(-np.pi, np.pi)
+                if not self._is_spawn_position_valid(p, self.R_AGENT, placed, margin=margin):
+                    continue
+                jx = self.qpos_indices[ak]["x"]
+                jy = self.qpos_indices[ak]["y"]
+                jz = self.qpos_indices[ak]["z"]
+                jr = self.qpos_indices[ak]["rot"]
+                self.data.qpos[self.model.jnt_qposadr[jx]] = p[0]
+                self.data.qpos[self.model.jnt_qposadr[jy]] = p[1]
+                self.data.qpos[self.model.jnt_qposadr[jz]] = 0.5
+                self.data.qpos[self.model.jnt_qposadr[jr]] = rot
+                placed.append((p, self.R_AGENT))
+                break
+
+    def _populate_prev_vis_and_being_hit(self):
+        """Populate `self._prev_vis` and `self._prev_being_hit` based on current positions.
+
+        This extracts the duplicated logic used during `reset()` and `step()` so
+        both can reuse the same code path.
+        """
+        # refresh caches based on current (post-physics) positions/rotations
+        self._prev_vis.clear()
+        self._prev_being_hit.clear()
+        for viewer in self.agent_keys:
+            try:
+                v_bid = self.body_ids[viewer]
+                v_pos = self.data.xpos[v_bid][:2]
+                v_idx_r = self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]
+                v_rot = float(self.data.qpos[v_idx_r])
+            except Exception:
+                logger.exception("failed to read viewer body/joint data while populating prev_vis; skipping viewer")
+                continue
+            for target in self.agent_keys:
+                if target == viewer:
+                    continue
+                try:
+                    t_bid = self.body_ids[target]
+                    t_pos = self.data.xpos[t_bid][:2]
+                except Exception:
+                    logger.exception("failed to read target body data while populating prev_vis; marking not visible")
+                    self._prev_vis[(viewer, target)] = False
+                    continue
+                vis = False
+                try:
+                    # Use direct engine call here to avoid polluting the
+                    # per-frame `_frame_vis_cache` with pre-physics results.
+                    p1 = np.array([v_pos[0], v_pos[1], 0.4])
+                    p2 = np.array([t_pos[0], t_pos[1], 0.4])
+                    vis = bool(self.vis_engine.is_visible(p1, p2, body_exclude=v_bid, target_body_id=t_bid))
+                except Exception:
+                    logger.exception("vis_engine.is_visible failed while populating _prev_vis")
+                    vis = False
+                self._prev_vis[(viewer, target)] = vis
+                # being_hit: viewer=hider, target=seeker -> store flag for (hider, seeker)
+                if viewer.startswith("h") and target.startswith("s"):
+                    is_hit = False
+                    try:
+                        s_idx_r = self.model.jnt_qposadr[self.qpos_indices[target]["rot"]]
+                        s_rot = float(self.data.qpos[s_idx_r])
+                        try:
+                            p1_h = np.array([self.data.xpos[t_bid][0], self.data.xpos[t_bid][1], 0.4])
+                            p2_h = np.array([v_pos[0], v_pos[1], 0.4])
+                            is_hit = bool(self.vis_engine.is_visible(p1_h, p2_h, body_exclude=t_bid, target_body_id=v_bid))
+                        except Exception:
+                            logger.exception("vis_engine.is_visible failed when checking seeker->hider hit in prev_vis population")
+                            is_hit = False
+                    except Exception:
+                        logger.exception("failed to read seeker rotation while computing being_hit in prev_vis population")
+                        is_hit = False
+                    self._prev_being_hit[(viewer, target)] = 1.0 if is_hit else 0.0
+        # Invalidate per-frame observation cache to avoid serving
+        # pre-physics computed observations later in this step.
+        try:
+            self._frame_obs_cache.clear()
+        except Exception:
+            self._frame_obs_cache = {}
+        try:
+            self._frame_vis_cache.clear()
+        except Exception:
+            self._frame_vis_cache = {}
+
+    def _capture_prephysics_prev_vis(self):
+        """Capture visibility / being-hit state before the physics step in `step()`.
+
+        This mirrors the inline logic previously present in `step()` but is
+        extracted for readability and reuse.
+        """
+        try:
+            self._prev_vis.clear()
+            self._prev_being_hit.clear()
+            for viewer in self.agent_keys:
+                v_bid = self.body_ids[viewer]
+                v_pos = self.data.xpos[v_bid][:2]
+                v_rot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]])
+                for target in self.agent_keys:
+                    if target == viewer:
+                        continue
+                    t_bid = self.body_ids[target]
+                    t_pos = self.data.xpos[t_bid][:2]
+                    try:
+                        p1 = np.array([v_pos[0], v_pos[1], 0.4])
+                        p2 = np.array([t_pos[0], t_pos[1], 0.4])
+                        vis = bool(self.vis_engine.is_visible(p1, p2, body_exclude=v_bid, target_body_id=t_bid))
+                    except Exception:
+                        vis = False
+                    self._prev_vis[(viewer, target)] = vis
+                    # being_hit: viewer is seeker, target is hider -> store as (hider, seeker)
+                    if viewer.startswith("s") and target.startswith("h"):
+                        self._prev_being_hit[(target, viewer)] = 1.0 if vis else 0.0
+        except Exception:
+            # keep step robust to any visibility errors
+            pass
+        # Invalidate per-frame observation cache after capturing pre-physics visibility
+        try:
+            self._frame_obs_cache.clear()
+        except Exception:
+            self._frame_obs_cache = {}
+        try:
+            self._frame_vis_cache.clear()
+        except Exception:
+            self._frame_vis_cache = {}
+
+    def _process_agent_actions(self, action_array):
+        """Process `action_array` for all agents and return control vector and stats.
+
+        Returns:
+            cv: ndarray control vector sized `model.nu`
+            stats: dict with keys used by `step()` (booleans, counts, applied_forward values, etc.)
+        """
+        af = np.ravel(action_array)
+        cv = np.zeros(self.model.nu)
+        any_lock_event = False
+        any_grab_event = False
+        any_lock_pressed = False
+        any_grab_pressed = False
+        any_lock_target = False
+        any_grab_target = False
+        max_lock_btn = 0.0
+        max_grab_btn = 0.0
+        boosted_agents = 0
+        applied_forward_model = 0.0
+        applied_forward_env = 0.0
+
+        for i, ak in enumerate(self.agent_keys):
+            is_seeker = ak.startswith("s")
+            if ak == self.learnable_agent_key:
+                if is_seeker and self.current_step <= self.prep_steps:
+                    f, t, lck, grb = 0.0, 0.0, 0.0, 0.0
+                elif self.override_learnable_policy:
+                    norm_obs = self._normalize_obs(self._get_obs(i))
+                    f, t, lck, grb = self._policy_action(ak, norm_obs)
+                else:
+                    f = af[0] if len(af) > 0 else 0.0
+                    t = af[1] if len(af) > 1 else 0.0
+                    lck = af[2] if len(af) > 2 else 0.0
+                    grb = af[3] if len(af) > 3 else 0.0
+            else:
+                if is_seeker and self.current_step <= self.prep_steps:
+                    f, t, lck, grb = 0.0, 0.0, 0.0, 0.0
+                else:
+                    norm_obs = self._normalize_obs(self._get_obs(i))
+                    f, t, lck, grb = self._policy_action(ak, norm_obs)
+
+            boost = self._ramp_boost_gain(ak)
+            if boost > 0.0:
+                f = float(np.clip(f + self.RAMP_BOOST_FWD * boost, -1.0, 1.0))
+                boosted_agents += 1
+
+            if ak == self.learnable_agent_key:
+                applied_forward_model = float(f)
+
+            max_lock_btn = max(max_lock_btn, float(lck))
+            max_grab_btn = max(max_grab_btn, float(grb))
+            lock_pressed = bool(lck > self.BTN_ON)
+            grab_pressed = bool(grb > self.BTN_ON)
+            any_lock_pressed = any_lock_pressed or lock_pressed
+            any_grab_pressed = any_grab_pressed or grab_pressed
+            if lock_pressed and self._select_target(ak, for_grab=False) is not None:
+                any_lock_target = True
+            if grab_pressed and self._select_target(ak, for_grab=True) is not None:
+                any_grab_target = True
+
+            lock_evt, grab_evt = self._handle_buttons(ak, lck, grb)
+            any_lock_event = any_lock_event or lock_evt
+            any_grab_event = any_grab_event or grab_evt
+
+            if getattr(self, "human_debug_keys", False):
+                try:
+                    if lock_evt:
+                        print(f"[human_debug] lock event for {ak}: {lock_evt}")
+                    if grab_evt:
+                        print(f"[human_debug] grab event for {ak}: {grab_evt}")
+                except Exception:
+                    pass
+
+            if ak == self.learnable_agent_key and self._inference_models.get(ak) is not None:
+                f_env = float(self.INFERENCE_FORWARD_SIGN * f)
+            else:
+                f_env = float(f)
+
+            applied_forward_env = f_env
+            t_env = float(t)
+            cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = (f_env, t_env)
+            self.last_debug_ctrl[ak] = (f_env, t_env)
+
+        stats = dict(
+            any_lock_event=any_lock_event,
+            any_grab_event=any_grab_event,
+            any_lock_pressed=any_lock_pressed,
+            any_grab_pressed=any_grab_pressed,
+            any_lock_target=any_lock_target,
+            any_grab_target=any_grab_target,
+            max_lock_btn=max_lock_btn,
+            max_grab_btn=max_grab_btn,
+            boosted_agents=boosted_agents,
+            applied_forward_model=applied_forward_model,
+            applied_forward_env=applied_forward_env,
+        )
+        return cv, stats
+
     # 環境をリセットするための関数。シードとオプションを受け取り、環境の状態を初期化します。エージェントとオブジェクトの位置をランダムに配置し、必要な初期化処理を行います。デバッグモードが有効な場合は、配置の過程で詳細なログを記録します。
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        # invalidate per-step caches
+        try:
+            self._frame_cache_step = -1
+            self._frame_obs_cache.clear()
+        except Exception:
+            pass
         self.current_step = 0
         self._policy_histories.clear()
         self.debug_logger.clear_last_step()
@@ -1667,57 +1982,12 @@ class TeamCosEnv(gym.Env):
                 raise
         self._init_agent_intelligence()
         self._init_interaction_state()
+        # place static bodies (ramps/boxes) and agents using helpers
         placed = []
         ramp_specs = [(rid, self.R_RAMP, 0.0) for rid in self.ramp_ids]
         box_specs = [(b, self.R_BOX, 0.5) for b in self.box_ids]
-        for bid, rad, z in ramp_specs + box_specs:
-            for _ in range(500):
-                p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
-                if self._is_spawn_position_valid(p, rad, placed, margin=0.2):
-                    try:
-                        jadr = self.model.body_jntadr[bid]
-                        if jadr is None or int(jadr) < 0:
-                            if self.debug_mode:
-                                self.debug_logger.print(f"[DEBUG][reset] invalid body_jntadr for body {bid}: {jadr}")
-                            continue
-                        adr = int(self.model.jnt_qposadr[jadr])
-                        if adr is None or adr < 0 or (adr + 7) > self.data.qpos.shape[0]:
-                            if self.debug_mode:
-                                self.debug_logger.print(f"[DEBUG][reset] invalid qpos adr for body {bid}: {adr}")
-                            continue
-                        # ランプは free から slide x/y + hinge z に変更したため
-                        # qpos の長さが異なる（3）点に注意する
-                        if bid in getattr(self, "ramp_ids", []):
-                            # slide x, slide y, hinge z
-                            self.data.qpos[adr : adr + 3] = [p[0], p[1], 0.0]
-                        else:
-                            # boxes 等は従来通り free joint (pos + quat)
-                            self.data.qpos[adr : adr + 7] = [p[0], p[1], z, 1, 0, 0, 0]
-                        placed.append((p, rad))
-                    except Exception:
-                        if self.debug_mode:
-                            self.debug_logger.print(f"[DEBUG][reset] exception placing body {bid}")
-                        continue
-                    # ランプのみx, y出力とqpos値も出力
-                    # if (bid, rad, z) in ramp_specs:
-                    #    print(f"[reset] ramp placed: x={p[0]:.3f}, y={p[1]:.3f}, qpos={self.data.qpos[adr]:.3f},{self.data.qpos[adr+1]:.3f}")
-                    # 正常に配置できたら inner loop を抜け、次のオブジェクト配置に進む
-                    break
-        for ak in self.agent_keys:
-            for _ in range(500):
-                p = np.random.uniform(-self.SAFE_HALF, self.SAFE_HALF, 2)
-                rot = np.random.uniform(-np.pi, np.pi)
-                if self._is_spawn_position_valid(p, self.R_AGENT, placed, margin=0.3):
-                    jx = self.qpos_indices[ak]["x"]
-                    jy = self.qpos_indices[ak]["y"]
-                    jz = self.qpos_indices[ak]["z"]
-                    jr = self.qpos_indices[ak]["rot"]
-                    self.data.qpos[self.model.jnt_qposadr[jx]] = p[0]
-                    self.data.qpos[self.model.jnt_qposadr[jy]] = p[1]
-                    self.data.qpos[self.model.jnt_qposadr[jz]] = 0.5
-                    self.data.qpos[self.model.jnt_qposadr[jr]] = rot
-                    placed.append((p, self.R_AGENT))
-                    break
+        self._randomly_place_bodies(ramp_specs + box_specs, placed, margin=0.2)
+        self._randomly_place_agents(placed)
         mujoco.mj_forward(self.model, self.data)
         if self.debug_mode:
             # report any objects or agents still at origin (likely placement failure)
@@ -1740,107 +2010,23 @@ class TeamCosEnv(gym.Env):
                     self.debug_logger.print("[DEBUG][reset] Non-finite detected in qpos/qvel after forward")
             except Exception:
                 pass
+
         # --- update prev_vis / prev_being_hit to reflect post-step state ---
         try:
-            # refresh caches based on current (post-physics) positions/rotations
-            self._prev_vis.clear()
-            self._prev_being_hit.clear()
-            for viewer in self.agent_keys:
-                try:
-                    v_bid = self.body_ids[viewer]
-                    v_pos = self.data.xpos[v_bid][:2]
-                    v_idx_r = self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]
-                    v_rot = float(self.data.qpos[v_idx_r])
-                except Exception:
-                    logger.exception("failed to read viewer body/joint data in reset visibility cache; skipping viewer")
-                    continue
-                for target in self.agent_keys:
-                    if target == viewer:
-                        continue
-                    try:
-                        t_bid = self.body_ids[target]
-                        t_pos = self.data.xpos[t_bid][:2]
-                    except Exception:
-                        logger.exception("failed to read target body data in reset visibility cache; marking not visible")
-                        self._prev_vis[(viewer, target)] = False
-                        continue
-                    vis = False
-                    try:
-                        vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
-                    except Exception:
-                        logger.exception("_is_vis failed while populating _prev_vis")
-                        vis = False
-                    self._prev_vis[(viewer, target)] = vis
-                    if viewer.startswith("h") and target.startswith("s"):
-                        # check whether seeker (target) sees the hider (viewer)
-                        is_hit = False
-                        try:
-                            s_idx_r = self.model.jnt_qposadr[self.qpos_indices[target]["rot"]]
-                            s_rot = float(self.data.qpos[s_idx_r])
-                            try:
-                                is_hit = bool(self._is_vis(t_pos, s_rot, v_pos, t_bid, v_bid))
-                            except Exception:
-                                logger.exception("_is_vis failed when checking seeker->hider hit in reset cache")
-                                is_hit = False
-                        except Exception:
-                            logger.exception("failed to read seeker rotation while computing being_hit in reset cache")
-                            is_hit = False
-                        self._prev_being_hit[(viewer, target)] = 1.0 if is_hit else 0.0
+            self._populate_prev_vis_and_being_hit()
         except Exception:
             logger.exception("failed while refreshing prev_vis/prev_being_hit caches after forward")
             raise
+
         # initialize previous-step visibility / being-hit caches so _get_obs
         # can use a well-defined 'previous' value immediately after reset
         self._prev_vis.clear()
         self._prev_being_hit.clear()
-        for viewer in self.agent_keys:
-            try:
-                v_bid = self.body_ids[viewer]
-                v_pos = self.data.xpos[v_bid][:2]
-                v_idx_r = self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]
-                v_rot = float(self.data.qpos[v_idx_r])
-            except Exception:
-                logger.exception("failed to access viewer state when initializing prev_vis; skipping viewer")
-                continue
-
-            for target in self.agent_keys:
-                if target == viewer:
-                    continue
-                try:
-                    t_bid = self.body_ids[target]
-                    t_pos = self.data.xpos[t_bid][:2]
-                except Exception:
-                    logger.exception("failed to access target state when initializing prev_vis; marking not visible")
-                    self._prev_vis[(viewer, target)] = False
-                    continue
-
-                # 視界判定 (局所的に例外を捕捉)
-                vis = False
-                try:
-                    vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
-                except Exception:
-                    logger.exception("_is_vis exception during initialization of prev_vis; marking not visible")
-                    vis = False
-                self._prev_vis[(viewer, target)] = vis
-
-                # 被弾フラグ: viewer が Hider で target が Seeker の場合、
-                # seeker の視界で自分(viewer)が見られているかを判定して保存する
-                if viewer.startswith("h") and target.startswith("s"):
-                    try:
-                        s_idx_r = self.model.jnt_qposadr[self.qpos_indices[target]["rot"]]
-                        s_rot = float(self.data.qpos[s_idx_r])
-                        is_hit = False
-                        try:
-                            is_hit = bool(self._is_vis(t_pos, s_rot, v_pos, t_bid, v_bid))
-                        except Exception:
-                            is_hit = False
-                    except Exception:
-                        is_hit = False
-                    # store as (hider, seeker)
-                    self._prev_being_hit[(viewer, target)] = 1.0 if is_hit else 0.0
-                    # set persistence counter when hit detected
-                    if is_hit:
-                        self._being_hit_counters[(viewer, target)] = int(self.being_hit_persist)
+        try:
+            self._populate_prev_vis_and_being_hit()
+        except Exception:
+            logger.exception("_populate_prev_vis_and_being_hit failed during reset initialization")
+            pass
 
         self._cache_planar_object_pose()
 
@@ -1894,99 +2080,12 @@ class TeamCosEnv(gym.Env):
 
         # 歴史的に各寄稿処理が `data.xfrc_applied` に累積してきたため。
 
-        for i, ak in enumerate(self.agent_keys):
-            is_seeker = ak.startswith("s")
-            if ak == self.learnable_agent_key:
-                if is_seeker and self.current_step <= self.prep_steps:
-                    f, t, lck, grb = 0.0, 0.0, 0.0, 0.0  # シーカーの準備ステップ中は無入力で固定
-                elif self.override_learnable_policy:  # 学習エージェントも外部アクションを適用するモード
-                    norm_obs = self._normalize_obs(self._get_obs(i))
-                    f, t, lck, grb = self._policy_action(ak, norm_obs)
-                else:
-                    # 外部アクション（常に4要素）を適用
-                    f = af[0] if len(af) > 0 else 0.0  # 前進チャネルは常に最初の要素を使用
-                    t = af[1] if len(af) > 1 else 0.0  # 回転チャネルは2番目の要素を使用
-                    lck = af[2] if len(af) > 2 else 0.0  # ロックボタンチャネルは3番目の要素を使用
-                    grb = af[3] if len(af) > 3 else 0.0  # グラブボタンチャネルは4番目の要素を使用
-            else:
-                # 非学習エージェントは推論モデル優先、なければRuleBased
-                if is_seeker and self.current_step <= self.prep_steps:
-                    f, t, lck, grb = 0.0, 0.0, 0.0, 0.0
-                else:
-                    norm_obs = self._normalize_obs(self._get_obs(i))
-                    f, t, lck, grb = self._policy_action(ak, norm_obs)
-
-            boost = self._ramp_boost_gain(ak)
-            if boost > 0.0:
-                f = float(np.clip(f + self.RAMP_BOOST_FWD * boost, -1.0, 1.0))
-                boosted_agents += 1
-
-            # record the final model forward for the learnable agent (before any env-side transform)
-            if ak == self.learnable_agent_key:
-                applied_forward_model = float(f)
-
-            max_lock_btn = max(max_lock_btn, float(lck))
-            max_grab_btn = max(max_grab_btn, float(grb))
-            lock_pressed = bool(lck > self.BTN_ON)
-            grab_pressed = bool(grb > self.BTN_ON)
-            any_lock_pressed = any_lock_pressed or lock_pressed
-            any_grab_pressed = any_grab_pressed or grab_pressed
-            if lock_pressed and self._select_target(ak, for_grab=False) is not None:
-                any_lock_target = True
-            if grab_pressed and self._select_target(ak, for_grab=True) is not None:
-                any_grab_target = True
-
-            lock_evt, grab_evt = self._handle_buttons(ak, lck, grb)
-            any_lock_event = any_lock_event or lock_evt
-            any_grab_event = any_grab_event or grab_evt
-            if getattr(self, "human_debug_keys", False):
-                try:
-                    if lock_evt:
-                        print(f"[human_debug] lock event for {ak}: {lock_evt}")
-                    if grab_evt:
-                        print(f"[human_debug] grab event for {ak}: {grab_evt}")
-                except Exception:
-                    pass
-
-            # 推論互換性: 一部のチェックポイントは前進チャネルの符号規約が逆で学習されています。
-            # `INFERENCE_FORWARD_SIGN` による実行時のみの変換を適用し、下流のロジックを編集せず
-            # にこの挙動を切り替えられるようにします。
-            if ak == self.learnable_agent_key and self._inference_models.get(ak) is not None:
-                f_env = float(self.INFERENCE_FORWARD_SIGN * f)
-            else:
-                f_env = float(f)
-
-            applied_forward_env = f_env
-            # Turn channel: no env-side scaling — let学習で回転を学ばせる
-            t_env = float(t)
-            cv[self.actuator_ids[f"{ak}_fwd"]], cv[self.actuator_ids[f"{ak}_turn"]] = (
-                f_env,
-                t_env,
-            )
-            self.last_debug_ctrl[ak] = (f_env, t_env)
-
+        # process agent actions and build control vector
+        cv, _stats = self._process_agent_actions(af)
         self.data.ctrl[:] = cv
         # --- capture pre-physics visibility / being-hit state (used as 'previous' freshness) ---
         try:
-            self._prev_vis.clear()
-            self._prev_being_hit.clear()
-            for viewer in self.agent_keys:
-                v_bid = self.body_ids[viewer]
-                v_pos = self.data.xpos[v_bid][:2]
-                v_rot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[viewer]["rot"]]])
-                for target in self.agent_keys:
-                    if target == viewer:
-                        continue
-                    t_bid = self.body_ids[target]
-                    t_pos = self.data.xpos[t_bid][:2]
-                    try:
-                        vis = bool(self._is_vis(v_pos, v_rot, t_pos, v_bid, t_bid))
-                    except Exception:
-                        vis = False
-                    self._prev_vis[(viewer, target)] = vis
-                    # being_hit: store as (hider, seeker) -> flag
-                    if viewer.startswith("s") and target.startswith("h"):
-                        self._prev_being_hit[(target, viewer)] = 1.0 if vis else 0.0
+            self._capture_prephysics_prev_vis()
         except Exception:
             pass
         for _ in range(self.action_repeat):
@@ -1996,6 +2095,12 @@ class TeamCosEnv(gym.Env):
         self._apply_object_constraints()
         self._stabilize_agent_vertical_motion()
         mujoco.mj_forward(self.model, self.data)
+        # Refresh visibility cache to reflect post-physics positions so
+        # observations computed below use current (post-step) visibility.
+        try:
+            self._populate_prev_vis_and_being_hit()
+        except Exception:
+            pass
         if self.debug_mode:
             try:
                 bad_qpos = np.where(~np.isfinite(self.data.qpos))[0]
@@ -2092,51 +2197,37 @@ class TeamCosEnv(gym.Env):
                 self._current_applied_forward_env = applied_forward_env
             except Exception:
                 pass
+
             rep = self._compute_and_apply_wall_repulsion()
-            dist = rep.get("dist", 0.0)
-            nx = rep.get("nx", 0.0)
-            ny = rep.get("ny", 0.0)
-            clearance = rep.get("clearance", 0.0)
-            applied_fwd = rep.get("applied_fwd", 0.0)
-            fb_fx = rep.get("fb_fx", 0.0)
-            fb_fy = rep.get("fb_fy", 0.0)
-            ctrl_fx = rep.get("ctrl_fx", 0.0)
-            ctrl_fy = rep.get("ctrl_fy", 0.0)
-            fx_tot = rep.get("fx_tot", 0.0)
-            fy_tot = rep.get("fy_tot", 0.0)
+
+            # 必要最小限の値だけを取り出して利用する（冗長なローカル展開を避ける）
             bid = int(rep.get("bid", int(learnable_agent_body_id)))
-            ncon = int(rep.get("ncon", int(getattr(self.data, "ncon", 0))))
+            fx_tot = float(rep.get("fx_tot", 0.0))
+            fy_tot = float(rep.get("fy_tot", 0.0))
+            clearance = float(rep.get("clearance", 0.0))
+
             # data.xfrc_applied に反映（元の書き込み順序を再現）
             try:
-                if hasattr(self.data, "xfrc_applied"):
-                    if self.data.xfrc_applied.shape[1] >= 2:
-                        self.data.xfrc_applied[bid, 0] = float(self.data.xfrc_applied[bid, 0]) + float(fx_tot)
-                        self.data.xfrc_applied[bid, 1] = float(self.data.xfrc_applied[bid, 1]) + float(fy_tot)
+                if hasattr(self.data, "xfrc_applied") and self.data.xfrc_applied.shape[1] >= 2:
+                    self.data.xfrc_applied[bid, 0] = float(self.data.xfrc_applied[bid, 0]) + fx_tot
+                    self.data.xfrc_applied[bid, 1] = float(self.data.xfrc_applied[bid, 1]) + fy_tot
             except Exception:
                 pass
+
             # 回転抑制処理（Mz の加算等）を呼び出す
             try:
-                self._apply_rotation_suppression(bid, float(clearance))
+                self._apply_rotation_suppression(bid, clearance)
             except Exception:
                 pass
-            # verbose debug（afwd を再計算して facing_dot を作る）
+
+            # verbose debug は rep を直接渡す
             try:
-                try:
-                    rot_j = self.qpos_indices[self.learnable_agent_key]["rot"]
-                    rot_val = float(self.data.qpos[self.model.jnt_qposadr[rot_j]])
-                    afwd_x = float(math.cos(rot_val))
-                    afwd_y = float(math.sin(rot_val))
-                except Exception:
-                    afwd_x, afwd_y = 1.0, 0.0
                 self._debug_wall_repulsion(rep)
             except Exception:
                 pass
         except Exception:
             # シミュレーションステップが中断されないように、反発ロジックのエラーを無視する
-            dist = nx = ny = clearance = applied_fwd = 0.0
-            fb_fx = fb_fy = ctrl_fx = ctrl_fy = fx_tot = fy_tot = 0.0
             bid = int(learnable_agent_body_id)
-            ncon = int(getattr(self.data, "ncon", 0))
         finally:
             try:
                 if hasattr(self, "_current_applied_forward_env"):
@@ -2169,22 +2260,16 @@ class TeamCosEnv(gym.Env):
             dbg_ramp_rpos = None
             dbg_ramp_climbing = False
             dbg_ramp_reached_top = False
-        info = self._assemble_step_info(
+        # assemble reward and info via helper to improve readability
+        reward, done, info = self._finalize_reward_and_info(
+            rb=rb,
             find=find,
-            any_lock_event=any_lock_event,
-            any_grab_event=any_grab_event,
-            any_lock_pressed=any_lock_pressed,
-            any_grab_pressed=any_grab_pressed,
-            any_lock_target=any_lock_target,
-            any_grab_target=any_grab_target,
-            max_lock_btn=max_lock_btn,
-            max_grab_btn=max_grab_btn,
+            stats=_stats,
             moving_box_count=moving_box_count,
             moving_ramp_count=moving_ramp_count,
             box_speeds=box_speeds,
             ramp_speeds=ramp_speeds,
             blocked_ramp_count=blocked_ramp_count,
-            boosted_agents=boosted_agents,
             gaze_cos_front_max=gaze_cos_front_max,
             gaze_dist_max=gaze_dist_max,
             learnable_hider_seen=learnable_hider_seen,
@@ -2194,8 +2279,9 @@ class TeamCosEnv(gym.Env):
             agent_vy=agent_vy,
             last_ctrl_f=last_ctrl_f,
             last_ctrl_t=last_ctrl_t,
-            applied_forward_model=applied_forward_model,
-            applied_forward_env=applied_forward_env,
+            learnable_agent_body_id=learnable_agent_body_id,
+            learnable_agent_pos=learnable_agent_pos,
+            dbg_agent_z=dbg_agent_z,
         )
         # デバッグ用: ランプ上判定に使った boost 値を常に出力する
         try:
@@ -2601,6 +2687,156 @@ class TeamCosEnv(gym.Env):
             "applied_forward": applied_forward_env,
         }
 
+    def _finalize_reward_and_info(
+        self,
+        *,
+        rb,
+        find,
+        stats: Optional[Dict[str, Any]] = None,
+        moving_box_count,
+        moving_ramp_count,
+        box_speeds,
+        ramp_speeds,
+        blocked_ramp_count,
+        gaze_cos_front_max,
+        gaze_dist_max,
+        learnable_hider_seen,
+        wall_dist,
+        agent_vz,
+        agent_vx,
+        agent_vy,
+        last_ctrl_f,
+        last_ctrl_t,
+        learnable_agent_body_id,
+        learnable_agent_pos,
+        dbg_agent_z,
+    ):
+        """Compute final reward, done flag, and `info` dict for a step.
+
+        This centralizes ramp-debug computation and `info` assembly so `step()`
+        remains compact.
+        """
+        # unpack stats dict for local use (keeps step() simpler)
+        try:
+            s = stats or {}
+            any_lock_event = bool(s.get("any_lock_event", False))
+            any_grab_event = bool(s.get("any_grab_event", False))
+            any_lock_pressed = bool(s.get("any_lock_pressed", False))
+            any_grab_pressed = bool(s.get("any_grab_pressed", False))
+            any_lock_target = bool(s.get("any_lock_target", False))
+            any_grab_target = bool(s.get("any_grab_target", False))
+            max_lock_btn = float(s.get("max_lock_btn", 0.0))
+            max_grab_btn = float(s.get("max_grab_btn", 0.0))
+            boosted_agents = int(s.get("boosted_agents", 0))
+            applied_forward_model = float(s.get("applied_forward_model", 0.0))
+            applied_forward_env = float(s.get("applied_forward_env", 0.0))
+        except Exception:
+            any_lock_event = False
+            any_grab_event = False
+            any_lock_pressed = False
+            any_grab_pressed = False
+            any_lock_target = False
+            any_grab_target = False
+            max_lock_btn = 0.0
+            max_grab_btn = 0.0
+            boosted_agents = 0
+            applied_forward_model = 0.0
+            applied_forward_env = 0.0
+
+        # reward and done
+        reward = float(rb if self.target == "hider" else -rb)
+        done = self.current_step >= self.max_episode_steps
+
+        # ramp/debug metrics
+        try:
+            ramp_dbg = self._compute_ramp_metrics(learnable_agent_body_id, learnable_agent_pos, dbg_agent_z)
+            dbg_ramp_progress = ramp_dbg.get("dbg_ramp_progress", None)
+            dbg_ramp_lx = ramp_dbg.get("dbg_ramp_lx", None)
+            dbg_ramp_ly = ramp_dbg.get("dbg_ramp_ly", None)
+            dbg_ramp_facing = ramp_dbg.get("dbg_ramp_facing", None)
+            dbg_ramp_rpos = ramp_dbg.get("dbg_ramp_rpos", None)
+            dbg_ramp_climbing = ramp_dbg.get("dbg_ramp_climbing", False)
+            dbg_ramp_reached_top = ramp_dbg.get("dbg_ramp_reached_top", False)
+            dbg_agent_z = ramp_dbg.get("dbg_agent_z", dbg_agent_z)
+        except Exception:
+            dbg_ramp_progress = None
+            dbg_ramp_lx = None
+            dbg_ramp_ly = None
+            dbg_ramp_facing = None
+            dbg_ramp_rpos = None
+            dbg_ramp_climbing = False
+            dbg_ramp_reached_top = False
+
+        # assemble info
+        info = self._assemble_step_info(
+            find=find,
+            any_lock_event=any_lock_event,
+            any_grab_event=any_grab_event,
+            any_lock_pressed=any_lock_pressed,
+            any_grab_pressed=any_grab_pressed,
+            any_lock_target=any_lock_target,
+            any_grab_target=any_grab_target,
+            max_lock_btn=max_lock_btn,
+            max_grab_btn=max_grab_btn,
+            moving_box_count=moving_box_count,
+            moving_ramp_count=moving_ramp_count,
+            box_speeds=box_speeds,
+            ramp_speeds=ramp_speeds,
+            blocked_ramp_count=blocked_ramp_count,
+            boosted_agents=boosted_agents,
+            gaze_cos_front_max=gaze_cos_front_max,
+            gaze_dist_max=gaze_dist_max,
+            learnable_hider_seen=learnable_hider_seen,
+            wall_dist=wall_dist,
+            agent_vz=agent_vz,
+            agent_vx=agent_vx,
+            agent_vy=agent_vy,
+            last_ctrl_f=last_ctrl_f,
+            last_ctrl_t=last_ctrl_t,
+            applied_forward_model=applied_forward_model,
+            applied_forward_env=applied_forward_env,
+        )
+
+        # add debug ramp and agent z/vz fields
+        try:
+            info["dbg_ramp_boost"] = float(self._ramp_boost_gain(self.learnable_agent_key))
+        except Exception:
+            pass
+
+        if dbg_ramp_lx is not None:
+            info["ramp_lx"] = dbg_ramp_lx
+            info["dbg_ramp_lx"] = dbg_ramp_lx
+        if dbg_ramp_ly is not None:
+            info["ramp_ly"] = dbg_ramp_ly
+            info["dbg_ramp_ly"] = dbg_ramp_ly
+        if dbg_ramp_facing is not None:
+            info["ramp_facing"] = dbg_ramp_facing
+            info["dbg_ramp_facing"] = dbg_ramp_facing
+        if dbg_ramp_rpos is not None:
+            info["ramp_rpos_x"] = float(dbg_ramp_rpos[0])
+            info["ramp_rpos_y"] = float(dbg_ramp_rpos[1])
+            info["dbg_ramp_rpos_x"] = float(dbg_ramp_rpos[0])
+            info["dbg_ramp_rpos_y"] = float(dbg_ramp_rpos[1])
+        info["agent_world_z"] = dbg_agent_z
+        info["dbg_agent_z"] = dbg_agent_z
+        info["agent_world_vz"] = agent_vz
+        info["dbg_agent_vz"] = agent_vz
+        if dbg_ramp_progress is not None:
+            info["ramp_progress"] = dbg_ramp_progress
+            info["dbg_ramp_progress"] = dbg_ramp_progress
+        info["ramp_climbing"] = bool(dbg_ramp_climbing)
+        info["dbg_ramp_climbing"] = bool(dbg_ramp_climbing)
+        info["ramp_reached_top"] = bool(dbg_ramp_reached_top)
+        info["dbg_ramp_reached_top"] = bool(dbg_ramp_reached_top)
+
+        # collect stats and return
+        try:
+            self._dbg_collect_stats(reward, info)
+        except Exception:
+            pass
+
+        return reward, done, info
+
     def _apply_rotation_suppression(self, bid, clearance):
         """
         接触時に発生しがちな「壁方向へ回り込む」回転を抑制するための処理をまとめる。
@@ -2864,11 +3100,116 @@ class TeamCosEnv(gym.Env):
         }
 
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
-        rel = t_pos - pos
-        dist = math.sqrt(np.sum(rel**2)) + 1e-8
-        if dist > L_SCALE or (math.cos(rot) * (rel[0] / dist) + math.sin(rot) * (rel[1] / dist)) < 0.38:
-            return False
-        return self.vis_engine.is_visible(pos, t_pos, body_exclude=my_id, target_body_id=t_id)
+        # Use per-frame cache to avoid repeated expensive visibility checks
+        try:
+            if int(self._frame_cache_step) != int(self.current_step):
+                # invalidate cache for new step
+                try:
+                    self._frame_vis_cache.clear()
+                except Exception:
+                    self._frame_vis_cache = {}
+                self._frame_cache_step = int(self.current_step)
+        except Exception:
+            pass
+
+        key = (int(my_id) if my_id is not None else -1, int(t_id) if t_id is not None else -1)
+        try:
+            if key in self._frame_vis_cache:
+                try:
+                    if getattr(self, "debug_mode", False) or getattr(self, "VIS_DEBUG", False) or getattr(getattr(self, "debug_logger", None), "enabled", False):
+                        print(f"[IS_VIS DEBUG] cache hit: key={key} val={self._frame_vis_cache[key]}")
+                except Exception:
+                    pass
+                return bool(self._frame_vis_cache[key])
+        except Exception:
+            pass
+
+        # Restore a cheap, semantic prefilter based on distance and facing.
+        # Historically this prevented drawing/marking targets that are
+        # clearly outside the seeker's forward cone. The repo's tests
+        # and legacy code used a cosine threshold ~= 0.38. Apply the
+        # same logic here before delegating to the (more expensive)
+        # VisibilityEngine.is_visible. Keep this guarded so any error
+        # falls back to the engine path.
+        try:
+            try:
+                cs = int(getattr(self, "current_step", 0))
+            except Exception:
+                cs = 0
+            if cs == 0:
+                try:
+                    print(
+                        f"[RENDER DEBUG] _is_vis input(step=0): pos={list(pos) if hasattr(pos, '__iter__') else pos} t_pos={list(t_pos) if hasattr(t_pos, '__iter__') else t_pos} my_id={int(my_id) if my_id is not None else None} t_id={int(t_id) if t_id is not None else None} key={key}"
+                    )
+                except Exception:
+                    pass
+
+            # cheap prefilter: if target is far outside lidar range or behind
+            # the seeker (dot < 0.38) then it's not considered visible.
+            try:
+                dx = float(t_pos[0]) - float(pos[0])
+                dy = float(t_pos[1]) - float(pos[1])
+                dist = math.hypot(dx, dy)
+                dot = None
+                if dist > 1e-8:
+                    dot = math.cos(rot) * (dx / dist) + math.sin(rot) * (dy / dist)
+                try:
+                    if getattr(self, "debug_mode", False) or getattr(self, "VIS_DEBUG", False) or getattr(getattr(self, "debug_logger", None), "enabled", False):
+                        print(f"[IS_VIS DEBUG] cs={cs} key={key} dist={dist:.4f} dot={dot}")
+                except Exception:
+                    pass
+                if dist > L_SCALE:
+                    vis = False
+                    try:
+                        self._frame_vis_cache[key] = bool(vis)
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(self, "debug_mode", False) or getattr(self, "VIS_DEBUG", False) or getattr(getattr(self, "debug_logger", None), "enabled", False):
+                            print(f"[IS_VIS DEBUG] prefilter: dist>{L_SCALE} -> vis=False key={key}")
+                    except Exception:
+                        pass
+                    return vis
+                if dist > 1e-8 and dot is not None:
+                    if dot < float(getattr(self, "VIS_FACING_THRESHOLD", 0.38)):
+                        vis = False
+                        try:
+                            self._frame_vis_cache[key] = bool(vis)
+                        except Exception:
+                            pass
+                        try:
+                            if getattr(self, "debug_mode", False) or getattr(self, "VIS_DEBUG", False) or getattr(getattr(self, "debug_logger", None), "enabled", False):
+                                thr = float(getattr(self, "VIS_FACING_THRESHOLD", 0.38))
+                                print(f"[IS_VIS DEBUG] prefilter: dot<{thr} -> vis=False key={key} dot={dot:.4f}")
+                        except Exception:
+                            pass
+                        return vis
+            except Exception:
+                # if anything goes wrong in the cheap test, fall back to
+                # calling the full visibility engine below
+                pass
+
+            vis = bool(self.vis_engine.is_visible(pos, t_pos, body_exclude=my_id, target_body_id=t_id))
+            try:
+                if getattr(self, "debug_mode", False) or getattr(self, "VIS_DEBUG", False) or getattr(getattr(self, "debug_logger", None), "enabled", False):
+                    print(f"[IS_VIS DEBUG] vis_engine result for key={key}: {vis}")
+            except Exception:
+                pass
+        except Exception:
+            vis = False
+        try:
+            if cs == 0:
+                try:
+                    print(f"[RENDER DEBUG] _is_vis output(step=0): vis={bool(vis)} key={key}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self._frame_vis_cache[key] = bool(vis)
+        except Exception:
+            pass
+        return vis
 
     def _normalize_obs(self, o):
         v = o.copy()
@@ -2899,6 +3240,16 @@ class TeamCosEnv(gym.Env):
         観測情報の生成:
         名前ベースの絶対インデックス参照により、情報の取り違えとIndexErrorを完全に排除。
         """
+        # Use per-frame cache to avoid recomputing the same observation multiple
+        # times within a single environment step.
+        try:
+            if int(self._frame_cache_step) == int(self.current_step):
+                cached = self._frame_obs_cache.get(int(idx), None)
+                if cached is not None:
+                    return cached.copy()
+        except Exception:
+            pass
+
         o = np.zeros(self.idx.total_dim, dtype=np.float32)
         ak, m, d = self.agent_keys[idx], self.model, self.data
         ps, rv = (
@@ -2966,11 +3317,16 @@ class TeamCosEnv(gym.Env):
             e_pos = d.xpos[eid][:2]
 
             # 1. 視界判定 (自分が相手を見ているか)
-            prev_vis = self._prev_vis.get((ak, enm), None)
-            if prev_vis is not None:
-                visible = bool(prev_vis)
-            else:
-                visible = self._is_vis(ps[:2], rv, e_pos, self.body_ids[ak], eid)
+            # For correctness, always use the visibility engine here rather
+            # than relying on cached pre/post values which have caused
+            # incorrect "through-wall" results. This is slightly slower
+            # but ensures semantic parity with the engine.
+            try:
+                p1 = np.array([ps[0], ps[1], 0.4])
+                p2 = np.array([e_pos[0], e_pos[1], 0.4])
+                visible = bool(self.vis_engine.is_visible(p1, p2, body_exclude=self.body_ids[ak], target_body_id=eid))
+            except Exception:
+                visible = False
 
             # 2. 被弾判定 (自分がHider、相手がSeeker、かつ相手が自分を見ているか)
             being_hit_flag = 0.0
@@ -2985,8 +3341,13 @@ class TeamCosEnv(gym.Env):
                         being_hit_flag = 1.0
                     else:
                         s_rot = float(d.qpos[m.jnt_qposadr[self.qpos_indices[enm]["rot"]]])
-                        if self._is_vis(e_pos, s_rot, ps[:2], eid, self.body_ids[ak]):
-                            being_hit_flag = 1.0
+                        try:
+                            p1_b = np.array([e_pos[0], e_pos[1], 0.4])
+                            p2_b = np.array([ps[0], ps[1], 0.4])
+                            if bool(self.vis_engine.is_visible(p1_b, p2_b, body_exclude=eid, target_body_id=self.body_ids[ak])):
+                                being_hit_flag = 1.0
+                        except Exception:
+                            pass
 
             if visible:
                 # 【視覚情報】
@@ -3045,7 +3406,13 @@ class TeamCosEnv(gym.Env):
                 o[self.idx.WALL_NORM_Y] = n_loc_y
             except Exception:
                 pass
-            return o
+        # store into per-frame cache
+        try:
+            self._frame_cache_step = int(self.current_step)
+            self._frame_obs_cache[int(idx)] = o.copy()
+        except Exception:
+            pass
+        return o
 
     def render(self):  # noqa: C901
         if getattr(self, "_render_disabled", False):
@@ -3066,7 +3433,41 @@ class TeamCosEnv(gym.Env):
                 self.viewer.cam.elevation = -35.0
                 self.viewer.cam.azimuth = 90.0
         with self.viewer.lock():
+            step = int(getattr(self, "current_step", 0) or 0)
+            # Only emit debug prints once per simulation step (viewer may render multiple frames)
+            try:
+                # Only enable render debug logs when debug_mode/debug_logger.enabled/VIS_DEBUG
+                allowed = bool(getattr(self, "debug_mode", False) or getattr(getattr(self, "debug_logger", None), "enabled", False) or getattr(self, "VIS_DEBUG", False))
+                do_log = (getattr(self, "_last_render_logged_step", None) != step) and allowed
+            except Exception:
+                do_log = False
+            # Static detection removed — agents in this script are stationary.
+            static = False
+            try:
+                if do_log and step == 0:
+                    # Only print initial agents_pose once per run to avoid viewer frame flooding
+                    try:
+                        if not getattr(self, "_printed_step0", False):
+                            poses = {}
+                            for ak in self.agent_keys:
+                                sid = self.body_ids[ak]
+                                apos = self.data.xpos[sid][:2]
+                                arot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]]
+                                poses[ak] = [float(apos[0]), float(apos[1]), float(arot)]
+                            print(f"[RENDER DEBUG] agents_pose: {poses} seed={getattr(self, '_init_seed', None)} step={step}")
+                            try:
+                                self._printed_step0 = True
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                elif do_log and step > 0 and step % 20 == 0:
+                    print(f"[RENDER DEBUG] agent_keys order: {self.agent_keys} seed={getattr(self, '_init_seed', None)} step={step}")
+            except Exception:
+                pass
             self.viewer.user_scn.ngeom = 0
+            # render-time cache for direct engine visibility checks
+            render_vis_cache = {}
             for ak in self.agent_keys:
                 sid = self.body_ids[ak]
                 pos = self.data.xpos[sid]
@@ -3084,6 +3485,10 @@ class TeamCosEnv(gym.Env):
                     p_end[1] += math.cos(rot) * t_val * 2.0
                     if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
                         g = self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom]
+                        try:
+                            print(f"[RENDER DEBUG] turn-line draw: {ak} color={color} thickness={8.0 + abs(t_val) * 25}")
+                        except Exception:
+                            pass
                         mujoco.mjv_connector(
                             g,
                             mujoco.mjtGeom.mjGEOM_LINE,
@@ -3097,15 +3502,26 @@ class TeamCosEnv(gym.Env):
                     if k == ak:
                         continue
                     tid = self.body_ids[k]
-                    if not self._is_vis(pos[:2], rot, self.data.xpos[tid][:2], sid, tid):
+                    # Use direct visibility engine for rendering consistency
+                    try:
+                        p1 = np.array([float(pos[0]), float(pos[1]), 0.4])
+                        p2 = np.array([float(self.data.xpos[tid][0]), float(self.data.xpos[tid][1]), 0.4])
+                        vkey = (int(sid), int(tid))
+                        if vkey in render_vis_cache:
+                            vis_direct = render_vis_cache[vkey]
+                        else:
+                            try:
+                                vis_direct = bool(self.vis_engine.is_visible(p1, p2, body_exclude=sid, target_body_id=tid))
+                            except Exception:
+                                vis_direct = False
+                            render_vis_cache[vkey] = vis_direct
+                    except Exception:
+                        vis_direct = False
+                    if not vis_direct:
                         continue
 
-                    # 色を決定する:
-                    # - 現在のエージェント `ak` が Seeker で対象 `k` が Hider の場合は黄色の線を表示する。
-                    #   H1 と H2 を区別できるよう輝度を変える。
-                    # - それ以外は従来の意味合いを維持（Seeker->others 赤、Hider->others 青）。
+                    # decide color
                     if ak.startswith("s") and k.startswith("h"):
-                        # hider_keys 内のインデックスに応じた輝度 (H1 を H2 より明るくする)
                         try:
                             h_idx = self.hider_keys.index(k)
                             brightness = 1.0 - 0.4 * h_idx
@@ -3122,10 +3538,28 @@ class TeamCosEnv(gym.Env):
 
                     if self.viewer.user_scn.ngeom < self.viewer.user_scn.maxgeom:
                         g = self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom]
+                        try:
+                            if do_log:
+                                try:
+                                    p1 = np.array([float(pos[0]), float(pos[1]), float(pos[2])])
+                                    p2 = np.array([float(self.data.xpos[tid][0]), float(self.data.xpos[tid][1]), float(self.data.xpos[tid][2])])
+                                    try:
+                                        vis_direct = bool(self.vis_engine.is_visible(p1, p2, body_exclude=sid, target_body_id=tid))
+                                    except Exception:
+                                        vis_direct = False
+                                    print(
+                                        f"[RENDER DEBUG] gaze-line draw: {ak} -> {k} color={color} src_pos={list(p1)} rot={rot:.3f} tgt_pos={list(p2)} _is_vis=True vis_engine_direct={vis_direct} seed={getattr(self, '_init_seed', None)} step={step}"
+                                    )
+                                except Exception:
+                                    print(
+                                        f"[RENDER DEBUG] gaze-line draw: {ak} -> {k} color={color} src_pos={pos[:2]} rot={rot:.3f} tgt_pos={self.data.xpos[tid][:2]} seed={getattr(self, '_init_seed', None)} step={step}"
+                                    )
+                        except Exception:
+                            pass
                         mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, 2.0, pos, self.data.xpos[tid])
                         g.rgba[:] = color
                         self.viewer.user_scn.ngeom += 1
-            # ランタイム再着色: もし任意の Seeker が Hider を視認していれば、その Hider のジオムを黄色に再着色する
+                # ランタイム再着色: もし任意の Seeker が Hider を視認していれば、その Hider のジオムを黄色に再着色する
             try:
                 # 各 hider キーごとの上書き設定を決定する
                 overrides = {}
@@ -3135,9 +3569,47 @@ class TeamCosEnv(gym.Env):
                     s_rot = self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[s]["rot"]]]
                     for h in [k for k in self.agent_keys if k.startswith("h")]:
                         h_tid = self.body_ids[h]
-                        if not self._is_vis(s_pos, s_rot, self.data.xpos[h_tid][:2], s_sid, h_tid):
+                        try:
+                            vis = bool(self._is_vis(s_pos, s_rot, self.data.xpos[h_tid][:2], s_sid, h_tid))
+                        except Exception:
+                            vis = False
+                        # Debug: 可視判定の入力/出力を出力（2Dベース）
+                        try:
+                            # Print override-check once per simulation step when logging is enabled.
+                            if do_log:
+                                try:
+                                    t_rot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[h]["rot"]]])
+                                except Exception:
+                                    t_rot = None
+                                print(
+                                    f"[RENDER DEBUG] override-check: seeker={s} s_pos={list(s_pos)} s_rot={s_rot:.3f} hider={h} h_pos={list(self.data.xpos[h_tid][:2])} h_rot={t_rot} vis={vis} seed={getattr(self, '_init_seed', None)} step={step}"
+                                )
+                        except Exception:
+                            pass
+                        if not vis:
                             continue
-                            # hider のインデックスに応じて輝度を算出
+                        # Additionally compute direct visibility via vis_engine with explicit 3D points
+                        try:
+                            p1 = np.array([float(s_pos[0]), float(s_pos[1]), 0.4])
+                            p2 = np.array([float(self.data.xpos[h_tid][0]), float(self.data.xpos[h_tid][1]), 0.4])
+                            try:
+                                vis_direct = bool(self.vis_engine.is_visible(p1, p2, body_exclude=s_sid, target_body_id=h_tid))
+                            except Exception:
+                                vis_direct = False
+                            try:
+                                if do_log:
+                                    try:
+                                        t_rot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[h]["rot"]]])
+                                    except Exception:
+                                        t_rot = None
+                                    print(
+                                        f"[RENDER DEBUG] vis_compare: seeker={s} hider={h} _is_vis={vis} vis_engine_direct={vis_direct} p1={list(p1)} p2={list(p2)} s_rot={s_rot:.3f} h_rot={t_rot} body_exclude={s_sid} target_body_id={h_tid} step={step}"
+                                    )
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        # hider のインデックスに応じて輝度を算出
                         try:
                             h_idx = self.hider_keys.index(h)
                             brightness = 1.0 - 0.4 * h_idx
@@ -3147,13 +3619,42 @@ class TeamCosEnv(gym.Env):
                             brightness = 0.8
                         overrides[h] = [brightness, brightness, 0.0, 1.0]
 
+                # Debug: 出力してどのhiderが上書き対象になったかを確認する
+                try:
+                    if do_log:
+                        if overrides:
+                            print(f"[RENDER DEBUG] overrides computed: {overrides} seed={getattr(self, '_init_seed', None)} step={step}")
+                        else:
+                            print(f"[RENDER DEBUG] no overrides computed seed={getattr(self, '_init_seed', None)} step={step}")
+                except Exception:
+                    pass
+
                 # 上書きがあれば適用し、なければデフォルト色を復元する
                 for ak in self.agent_keys:
                     geom_ids = self.agent_geom_ids.get(ak, [])
                     if ak in overrides:
                         col = overrides[ak]
+                        try:
+                            if do_log:
+                                try:
+                                    ak_rot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]])
+                                except Exception:
+                                    ak_rot = None
+                                print(f"[RENDER DEBUG] applying override for {ak}: {col} agent_rot={ak_rot} seed={getattr(self, '_init_seed', None)} step={step}")
+                        except Exception:
+                            pass
                         for gid in geom_ids:
                             try:
+                                try:
+                                    geom_pos = list(self.data.geom_xpos[gid])
+                                except Exception:
+                                    geom_pos = None
+                                if do_log:
+                                    try:
+                                        ak_rot = float(self.data.qpos[self.model.jnt_qposadr[self.qpos_indices[ak]["rot"]]])
+                                    except Exception:
+                                        ak_rot = None
+                                    print(f"[RENDER DEBUG] override-geom: agent={ak} gid={gid} geom_pos={geom_pos} agent_rot={ak_rot} applying_col={col} step={step}")
                                 self.model.geom_rgba[gid][:] = col
                             except Exception:
                                 pass
@@ -3170,6 +3671,12 @@ class TeamCosEnv(gym.Env):
                 pass
 
         self.viewer.sync()
+        # mark we've logged for this simulation step so repeated frame renders don't reprint
+        try:
+            if do_log:
+                self._last_render_logged_step = step
+        except Exception:
+            pass
 
     def close(self):
         if self.viewer:

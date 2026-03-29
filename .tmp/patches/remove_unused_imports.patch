@@ -1,0 +1,10 @@
+*** Begin Patch
+*** Update File: src/envs/hns_environment.py
+@@
+-import os
+-import select
+-import sys
+-import termios
+-import tty
++import os
+*** End Patch

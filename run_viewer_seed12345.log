@@ -1,0 +1,15 @@
+mujoco.viewer.launch_passive failed: `launch_passive` requires that the Python script be run under `mjpython` on macOS; disabling rendering for this process. Run under mjpython on macOS to enable passive viewer.
+Positions set. Entering render loop. Close viewer window to exit.
+vis_engine initial: False
+[RENDER DEBUG] _is_vis input(step=0): pos=[np.float64(-2.5), np.float64(-2.5)] t_pos=[np.float64(0.5), np.float64(0.5)] my_id=5 t_id=7 key=(5, 7)
+_is_vis wrapper initial: False
+step 0: vis_engine=False _is_vis=False
+step 30: vis_engine=False _is_vis=False
+step 60: vis_engine=False _is_vis=False
+step 90: vis_engine=False _is_vis=False
+step 120: vis_engine=False _is_vis=False
+step 150: vis_engine=False _is_vis=False
+step 180: vis_engine=False _is_vis=False
+step 210: vis_engine=False _is_vis=False
+step 240: vis_engine=False _is_vis=False
+step 270: vis_engine=False _is_vis=False

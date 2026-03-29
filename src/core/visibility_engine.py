@@ -13,6 +13,10 @@ import mujoco
 import numpy as np
 from numba import njit
 
+# Toggle detailed visibility debugging from caller by setting
+# `src.core.visibility_engine.VIS_DEBUG = True` at runtime.
+VIS_DEBUG = False
+
 SDF_CELL_SIZE = 0.02  # 2cm セルサイズで静的SDFグリッドを構築
 
 
@@ -724,7 +728,14 @@ class VisibilityEngine:
     def is_visible(self, p1, p2, mode=1, body_exclude=-1, target_body_id=-1):
         diff_v = p2[:2] - p1[:2]
         dist_full = np.linalg.norm(diff_v)
+        if VIS_DEBUG:
+            try:
+                print(f"[VIS DEBUG] is_visible called: p1={list(p1)} p2={list(p2)} mode={mode} body_exclude={body_exclude} target_body_id={target_body_id} dist_full={dist_full:.3f}")
+            except Exception:
+                pass
         if dist_full < 0.41:
+            if VIS_DEBUG:
+                print(f"[VIS DEBUG] short-circuit: dist_full<{0.41}")
             return True
         vx = diff_v[0] / dist_full
         vy = diff_v[1] / dist_full
@@ -741,11 +752,28 @@ class VisibilityEngine:
                 int(body_exclude),
                 self._geomid_out,
             )
+            if VIS_DEBUG:
+                try:
+                    print(f"[VIS DEBUG] mj_ray hit={hit} geomid_out={int(self._geomid_out[0])}")
+                except Exception:
+                    pass
             if hit < 0:
                 return True
             hit_body = self.m.geom_bodyid[self._geomid_out[0]]
+            if VIS_DEBUG:
+                try:
+                    print(f"[VIS DEBUG] ray hit_body={hit_body} target_body_id={target_body_id}")
+                except Exception:
+                    pass
             if hit_body == target_body_id:
+                if VIS_DEBUG:
+                    print("[VIS DEBUG] ray hit target body -> visible")
                 return True
+            if VIS_DEBUG:
+                try:
+                    print(f"[VIS DEBUG] ray distance check: hit={hit} dist_full-0.1={dist_full-0.1}")
+                except Exception:
+                    pass
             return hit > (dist_full - 0.1)
         elif mode == 1:
             MIN_T = 0.01
@@ -774,6 +802,11 @@ class VisibilityEngine:
                     continue
                 if tf >= tn:
                     if MIN_T < tn < dist_full - 0.05:
+                        if VIS_DEBUG:
+                            try:
+                                print(f"[VIS DEBUG] wall blocks: wall_idx={j} tn={tn:.3f} tf={tf:.3f} dist_full={dist_full:.3f}")
+                            except Exception:
+                                pass
                         return False
             num_a = len(self.idx_agent_geom)
             for k in range(num_a):
@@ -789,7 +822,17 @@ class VisibilityEngine:
                 if det >= 0:
                     sd = math.sqrt(det)
                     t2_val = (-b_val + sd) / 2.0
+                    if VIS_DEBUG:
+                        try:
+                            print(f"[VIS DEBUG] agent-check: k={k} bid={bid} det={det:.6f} t2={t2_val:.6f} radius={radius:.3f}")
+                        except Exception:
+                            pass
                     if MIN_T < t2_val < dist_full - 0.05:
+                        if VIS_DEBUG:
+                            try:
+                                print(f"[VIS DEBUG] agent blocks: k={k} bid={bid} t2={t2_val:.3f}")
+                            except Exception:
+                                pass
                         return False
             num_b = len(self.idx_box_geom)
             for k in range(num_b):
@@ -827,6 +870,11 @@ class VisibilityEngine:
                     continue
                 if tf_l >= tn_l:
                     if MIN_T < tn_l < dist_full - 0.05:
+                        if VIS_DEBUG:
+                            try:
+                                print(f"[VIS DEBUG] box blocks: k={k} tn_l={tn_l:.3f} tf_l={tf_l:.3f}")
+                            except Exception:
+                                pass
                         return False
             return True
         return True
