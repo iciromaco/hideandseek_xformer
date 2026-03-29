@@ -2289,19 +2289,19 @@ class TeamCosEnv(gym.Env):
         except Exception:
             pass
         # expose ramp metrics under neutral names (for training/inference)
-        if dbg_ramp_lx is not None:
-            info["ramp_lx"] = dbg_ramp_lx
-        if dbg_ramp_ly is not None:
-            info["ramp_ly"] = dbg_ramp_ly
-        if dbg_ramp_facing is not None:
-            info["ramp_facing"] = dbg_ramp_facing
-        if dbg_ramp_rpos is not None:
-            info["ramp_rpos_x"] = float(dbg_ramp_rpos[0])
-            info["ramp_rpos_y"] = float(dbg_ramp_rpos[1])
+        if (v := ramp_dbg.get("dbg_ramp_lx", None)) is not None:
+            info["ramp_lx"] = v
+        if (v := ramp_dbg.get("dbg_ramp_ly", None)) is not None:
+            info["ramp_ly"] = v
+        if (v := ramp_dbg.get("dbg_ramp_facing", None)) is not None:
+            info["ramp_facing"] = v
+        if (v := ramp_dbg.get("dbg_ramp_rpos", None)) is not None:
+            info["ramp_rpos_x"] = float(v[0])
+            info["ramp_rpos_y"] = float(v[1])
 
         # expose agent world z/vz under neutral names
         info["agent_world_z"] = dbg_agent_z
-        info["agent_world_vz"] = dbg_agent_vz
+        info["agent_world_vz"] = agent_vz
 
         if dbg_ramp_progress is not None:
             info["ramp_progress"] = dbg_ramp_progress
@@ -2776,19 +2776,19 @@ class TeamCosEnv(gym.Env):
         except Exception:
             pass
 
-        if dbg_ramp_lx is not None:
-            info["ramp_lx"] = dbg_ramp_lx
-        if dbg_ramp_ly is not None:
-            info["ramp_ly"] = dbg_ramp_ly
-        if dbg_ramp_facing is not None:
-            info["ramp_facing"] = dbg_ramp_facing
-        if dbg_ramp_rpos is not None:
-            info["ramp_rpos_x"] = float(dbg_ramp_rpos[0])
-            info["ramp_rpos_y"] = float(dbg_ramp_rpos[1])
+        if (v := ramp_dbg.get("dbg_ramp_lx", None)) is not None:
+            info["ramp_lx"] = v
+        if (v := ramp_dbg.get("dbg_ramp_ly", None)) is not None:
+            info["ramp_ly"] = v
+        if (v := ramp_dbg.get("dbg_ramp_facing", None)) is not None:
+            info["ramp_facing"] = v
+        if (v := ramp_dbg.get("dbg_ramp_rpos", None)) is not None:
+            info["ramp_rpos_x"] = float(v[0])
+            info["ramp_rpos_y"] = float(v[1])
         info["agent_world_z"] = dbg_agent_z
         info["agent_world_vz"] = agent_vz
-        if dbg_ramp_progress is not None:
-            info["ramp_progress"] = dbg_ramp_progress
+        if (v := ramp_dbg.get("dbg_ramp_progress", None)) is not None:
+            info["ramp_progress"] = v
         info["ramp_climbing"] = bool(dbg_ramp_climbing)
         info["ramp_reached_top"] = bool(dbg_ramp_reached_top)
 
