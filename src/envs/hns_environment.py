@@ -2019,10 +2019,11 @@ class TeamCosEnv(gym.Env):
         last_ctrl_t = float(last_ctrl[1])
         # 壁反発計算と適用をヘルパーに委譲
         try:
-            rep = self._compute_and_apply_wall_repulsion(learnable_agent_body_id, learnable_agent_pos, last_ctrl_f, applied_forward_env)
+            # 返り値は現在使用していないため破棄する（副作用で data.xfrc_applied を更新）
+            self._compute_and_apply_wall_repulsion(learnable_agent_body_id, learnable_agent_pos, last_ctrl_f, applied_forward_env)
         except Exception:
             # シミュレーションステップが中断されないように、反発ロジックのエラーを無視する
-            rep = {"bid": int(learnable_agent_body_id), "ncon": int(getattr(self.data, "ncon", 0))}
+            pass
 
         obs = self._normalize_obs(self._get_obs(idx_to_obs))
         reward = float(rb if self.target == "hider" else -rb)
