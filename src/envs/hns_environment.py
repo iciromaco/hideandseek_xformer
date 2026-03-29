@@ -2020,25 +2020,9 @@ class TeamCosEnv(gym.Env):
         # 壁反発計算と適用をヘルパーに委譲
         try:
             rep = self._compute_and_apply_wall_repulsion(learnable_agent_body_id, learnable_agent_pos, last_ctrl_f, applied_forward_env)
-            dist = rep.get("dist", 0.0)
-            nx = rep.get("nx", 0.0)
-            ny = rep.get("ny", 0.0)
-            clearance = rep.get("clearance", 0.0)
-            applied_fwd = rep.get("applied_fwd", 0.0)
-            fb_fx = rep.get("fb_fx", 0.0)
-            fb_fy = rep.get("fb_fy", 0.0)
-            ctrl_fx = rep.get("ctrl_fx", 0.0)
-            ctrl_fy = rep.get("ctrl_fy", 0.0)
-            fx_tot = rep.get("fx_tot", 0.0)
-            fy_tot = rep.get("fy_tot", 0.0)
-            bid = rep.get("bid", int(learnable_agent_body_id))
-            ncon = rep.get("ncon", int(getattr(self.data, "ncon", 0)))
         except Exception:
-            # シミュレーションステップが中断されないように、反発ロジックのエラーをすべて無視する
-            dist = nx = ny = clearance = applied_fwd = 0.0
-            fb_fx = fb_fy = ctrl_fx = ctrl_fy = fx_tot = fy_tot = 0.0
-            bid = int(learnable_agent_body_id)
-            ncon = int(getattr(self.data, "ncon", 0))
+            # シミュレーションステップが中断されないように、反発ロジックのエラーを無視する
+            rep = {"bid": int(learnable_agent_body_id), "ncon": int(getattr(self.data, "ncon", 0))}
 
         obs = self._normalize_obs(self._get_obs(idx_to_obs))
         reward = float(rb if self.target == "hider" else -rb)
