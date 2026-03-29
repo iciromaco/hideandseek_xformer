@@ -2245,19 +2245,11 @@ class TeamCosEnv(gym.Env):
         try:
             ramp_dbg = self._compute_ramp_metrics(learnable_agent_body_id, learnable_agent_pos, dbg_agent_z)
             dbg_ramp_progress = ramp_dbg.get("dbg_ramp_progress", None)
-            dbg_ramp_lx = ramp_dbg.get("dbg_ramp_lx", None)
-            dbg_ramp_ly = ramp_dbg.get("dbg_ramp_ly", None)
-            dbg_ramp_facing = ramp_dbg.get("dbg_ramp_facing", None)
-            dbg_ramp_rpos = ramp_dbg.get("dbg_ramp_rpos", None)
             dbg_ramp_climbing = ramp_dbg.get("dbg_ramp_climbing", False)
             dbg_ramp_reached_top = ramp_dbg.get("dbg_ramp_reached_top", False)
             dbg_agent_z = ramp_dbg.get("dbg_agent_z", dbg_agent_z)
         except Exception:
             dbg_ramp_progress = None
-            dbg_ramp_lx = None
-            dbg_ramp_ly = None
-            dbg_ramp_facing = None
-            dbg_ramp_rpos = None
             dbg_ramp_climbing = False
             dbg_ramp_reached_top = False
         # assemble reward and info via helper to improve readability
@@ -2724,19 +2716,11 @@ class TeamCosEnv(gym.Env):
         try:
             ramp_dbg = self._compute_ramp_metrics(learnable_agent_body_id, learnable_agent_pos, dbg_agent_z)
             dbg_ramp_progress = ramp_dbg.get("dbg_ramp_progress", None)
-            dbg_ramp_lx = ramp_dbg.get("dbg_ramp_lx", None)
-            dbg_ramp_ly = ramp_dbg.get("dbg_ramp_ly", None)
-            dbg_ramp_facing = ramp_dbg.get("dbg_ramp_facing", None)
-            dbg_ramp_rpos = ramp_dbg.get("dbg_ramp_rpos", None)
             dbg_ramp_climbing = ramp_dbg.get("dbg_ramp_climbing", False)
             dbg_ramp_reached_top = ramp_dbg.get("dbg_ramp_reached_top", False)
             dbg_agent_z = ramp_dbg.get("dbg_agent_z", dbg_agent_z)
         except Exception:
             dbg_ramp_progress = None
-            dbg_ramp_lx = None
-            dbg_ramp_ly = None
-            dbg_ramp_facing = None
-            dbg_ramp_rpos = None
             dbg_ramp_climbing = False
             dbg_ramp_reached_top = False
 
