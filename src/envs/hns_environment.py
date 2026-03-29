@@ -369,6 +369,15 @@ class TeamCosEnv(gym.Env):
             self.data,
             mode4_sdf_cell_size=self.mode4_sdf_cell_size,
         )
+        # ランプ周りの静的ジオメトリ情報を一度だけ計算してキャッシュする。
+        # ランプのサイズ（geom_size）は学習中に変わらないことが期待されるため、
+        # 毎ステップで model.geom_size を探索するコストを避ける。
+        self._ramp_static_cache: Dict[int, Dict[str, Any]] = {}
+        try:
+            self._prepare_ramp_static_cache()
+        except Exception:
+            # キャッシュ準備は最適化目的なので失敗してもフォールバックは許す
+            logger.exception("failed to prepare ramp static cache")
         self.viewer = None
         self.inference_policies = inference_policies or {}
         self._inference_models: Dict[str, Any] = {}
@@ -894,52 +903,47 @@ class TeamCosEnv(gym.Env):
         return np.array([math.cos(yaw), math.sin(yaw)], dtype=np.float32)
 
     # ランプの lx（ランプローカルな前後座標）に対する閾値を計算するヘルパー関数。ランプのジオメトリサイズとクォータニオンから、ランプの長さと幅を推定し、アプローチマージンを考慮して lx の最小値と最大値を計算します。
-    def _compute_ramp_lx_bounds(self, rid, up):
+    def _compute_ramp_lx_bounds(self, rid):
         """
         ランプ局所的な上り勾配座標における lx の範囲（最小値、最大値）を計算。
         利用可能な場合はジオメトリの位置を使用しようとしますが、利用できない場合は妥当なデフォルト値を使用します。
         (lx_min, lx_max) を返す。
         """
-        # rid を ramp キー (ramp1..n) にマッピングしようとする
-        try:
-            idx = int(self.ramp_ids.index(rid))
-            rkey = f"ramp{idx+1}"
-        except Exception:
-            rkey = None
-        geom_ids = []
-        if rkey is not None:
-            geom_ids = self.obj_geom_ids.get(rkey, [])
-
-        # 代表的なジオムから geom_size を読み取ろうとする
-        gsize = None
-        for gid in geom_ids:
-            try:
-                gsize = np.asarray(self.model.geom_size[gid], dtype=np.float32)
-                if gsize.size > 0:
-                    break
-            except Exception:
-                gsize = None
-
-        # ランプの長さ L と幅 W を決定
-        if gsize is not None and gsize.size >= 1:
-            # MuJoCo の geom_size は半長さ（half-extents）なので、
-            # インデックス 0 をランプ長方向とみなす
-            half_length = float(gsize[0])
-            L = 2.0 * half_length
-            half_width = float(gsize[1]) if gsize.size > 1 else 0.5
+        # キャッシュにある静的ジオメトリ情報を利用して重いループを回避する。
+        # キャッシュが無ければ従来のフォールバックロジックに寄せる。
+        c = self._ramp_static_cache.get(rid)
+        if c is not None:
+            half_length = float(c.get("half_length", 0.5))
+            half_width = float(c.get("half_width", 0.5))
         else:
-            # クラス定数があればフォールバックして使う
+            # 互換フォールバック（従来ロジックの簡略版）
             try:
-                L = float(self.R_RAMP)
+                idx = int(self.ramp_ids.index(rid))
+                rkey = f"ramp{idx+1}"
+                geom_ids = self.obj_geom_ids.get(rkey, [])
             except Exception:
-                L = 0.833
-            half_length = 0.5 * L
-            # 幅のフォールバック値
-            half_width = 0.5
+                geom_ids = []
+            gsize = None
+            for gid in geom_ids:
+                try:
+                    gsize = np.asarray(self.model.geom_size[gid], dtype=np.float32)
+                    if gsize.size > 0:
+                        break
+                except Exception:
+                    gsize = None
+            if gsize is not None and gsize.size >= 1:
+                half_length = float(gsize[0])
+                half_width = float(gsize[1]) if gsize.size > 1 else 0.5
+            else:
+                try:
+                    L = float(self.R_RAMP)
+                except Exception:
+                    L = 0.833
+                half_length = 0.5 * L
+                half_width = 0.5
 
         # クォータニオンからピッチを算出（asin の引数を安全にクランプ）
         q = self.data.xquat[rid]
-        # q = [w, x, y, z]
         sinp = 2.0 * (q[0] * q[2] - q[3] * q[1])
         if sinp >= 1.0:
             pitch = math.pi / 2
@@ -948,11 +952,7 @@ class TeamCosEnv(gym.Env):
         else:
             pitch = math.asin(sinp)
 
-        # XY平面へ投影した半長さ
         projected_half = half_length * float(math.cos(pitch))
-        # ランプ下の隙間を越えられるよう、ランプ直前からのブーストを許容する
-        # そのために接近マージンを差し引く（エージェント半径 ≈0.4m 程度）。
-        # 数値的な小さな EPS マージンも確保する。
         APPROACH_MARGIN = 0.4
         EPS_MARGIN = 0.0
         lx_min = -projected_half - APPROACH_MARGIN - EPS_MARGIN
@@ -967,36 +967,31 @@ class TeamCosEnv(gym.Env):
         単一の float を返す（頂点 z）。計算に失敗した場合はボディの z をフォールバックとして返す。
         """
         try:
-            # 可能なら slope surface ジオムを優先して使用する。
-            # このジオムはランプ中心位置とランプ方向の半長を安定して与える。
-            slope_name = None
-            try:
-                idx = int(self.ramp_ids.index(rid))
-                slope_name = f"ramp{idx+1}_slope_surface"
-            except Exception:
-                slope_name = None
-
+            # キャッシュから静的なジオメトリ情報を取り出す
+            c = self._ramp_static_cache.get(rid)
             half_length = None
             geom_center_z = None
             geom_thickness = 0.0
-            if slope_name is not None:
-                try:
-                    gid = self.model.geom(slope_name).id
-                    gsize = np.asarray(self.model.geom_size[gid], dtype=np.float32)
-                    if gsize.size >= 1:
-                        half_length = float(gsize[0])
-                    if gsize.size >= 3:
-                        geom_thickness = float(gsize[2])
-                    # 現在のジオム中心位置（ワールド座標）は data.geom_xpos を使う
-                    geom_center_z = float(self.data.geom_xpos[gid][2])
-                except Exception:
-                    half_length = None
-                    geom_center_z = None
+            if c is not None:
+                slope_gid = c.get("slope_gid")
+                if slope_gid is not None:
+                    try:
+                        gsize = np.asarray(self.model.geom_size[slope_gid], dtype=np.float32)
+                        if gsize.size >= 1:
+                            half_length = float(gsize[0])
+                        if gsize.size >= 3:
+                            geom_thickness = float(gsize[2])
+                        geom_center_z = float(self.data.geom_xpos[slope_gid][2])
+                    except Exception:
+                        half_length = None
+                        geom_center_z = None
+                else:
+                    half_length = float(c.get("half_length", 0.5))
+                    geom_center_z = float(self.data.xpos[rid][2])
 
-            # slope ジオムが利用できない場合はボディベースの推定へフォールバック
+            # フォールバック: キャッシュが使えない場合は従来ロジックを使う
             if half_length is None:
                 try:
-                    # 保存されている obj_geom_ids から代表的なジオメトリサイズを探す
                     idx = int(self.ramp_ids.index(rid))
                     rkey = f"ramp{idx+1}"
                     geom_ids = self.obj_geom_ids.get(rkey, [])
@@ -1030,9 +1025,7 @@ class TeamCosEnv(gym.Env):
             else:
                 pitch = math.asin(sinp)
 
-            # 頂点 z はジオム中心に半長の鉛直成分を足した位置
             vertical_half = abs(half_length * float(math.sin(pitch)))
-            # 可能であればスロープジオムの半厚も含める
             top_z = float(geom_center_z) + vertical_half + float(geom_thickness)
             return top_z
         except Exception:
@@ -1061,6 +1054,54 @@ class TeamCosEnv(gym.Env):
                 return True
         return False
 
+    # ランプの静的ジオメトリ情報（geom_size 等）を一度だけ収集してキャッシュする。
+    # これにより、毎ステップの model.geom_size の探索コストを削減する。
+    def _prepare_ramp_static_cache(self):
+        cache: Dict[int, Dict[str, Any]] = {}
+        m = self.model
+        for i, rid in enumerate(self.ramp_ids, start=1):
+            rkey = f"ramp{i}"
+            geom_ids = self.obj_geom_ids.get(rkey, []).copy() if hasattr(self, "obj_geom_ids") else []
+            slope_gid = None
+            gsize = None
+            # まず slope surface ジオムを探す
+            try:
+                slope_name = f"{rkey}_slope_surface"
+                gid = m.geom(slope_name).id
+                slope_gid = gid
+                gsize = np.asarray(m.geom_size[gid], dtype=np.float32)
+            except Exception:
+                slope_gid = None
+                # 代表的なジオムから見つける
+                for gid in geom_ids:
+                    try:
+                        gsz = np.asarray(m.geom_size[gid], dtype=np.float32)
+                        if gsz.size > 0:
+                            gsize = gsz
+                            break
+                    except Exception:
+                        gsize = None
+            if gsize is not None and gsize.size >= 1:
+                half_length = float(gsize[0])
+                half_width = float(gsize[1]) if gsize.size > 1 else 0.5
+            else:
+                try:
+                    L = float(self.R_RAMP)
+                except Exception:
+                    L = 0.833
+                half_length = 0.5 * L
+                half_width = 0.5
+
+            cache[rid] = {
+                "rkey": rkey,
+                "geom_ids": geom_ids,
+                "gsize": gsize,
+                "slope_gid": slope_gid,
+                "half_length": half_length,
+                "half_width": half_width,
+            }
+        self._ramp_static_cache = cache
+
     # ランプブーストのゲインを計算するヘルパー関数。エージェントとランプの位置関係、ランプの向き、エージェントの向きから、ブーストゲインを計算します。ブーストは、エージェントがランプの前方にいて、ランプに対して十分に正面を向いている場合に適用されます。
     def _ramp_boost_gain(self, ak):
         apos = self.data.xpos[self.body_ids[ak]][:2]
@@ -1086,7 +1127,7 @@ class TeamCosEnv(gym.Env):
             # 診断用のランプ候補を記録
             # 動的境界を計算してランプ情報を保持する
             try:
-                lx_min, lx_max, ly_thresh = self._compute_ramp_lx_bounds(rid, up)
+                lx_min, lx_max, ly_thresh = self._compute_ramp_lx_bounds(rid)
             except Exception:
                 lx_min, lx_max, ly_thresh = -1.15, 0.666, 0.95
             full_thresh = lx_min + 0.5 * (lx_max - lx_min)
@@ -2086,19 +2127,7 @@ class TeamCosEnv(gym.Env):
                     afwd_y = float(math.sin(rot_val))
                 except Exception:
                     afwd_x, afwd_y = 1.0, 0.0
-                self._debug_wall_repulsion(
-                    bid,
-                    dist,
-                    float(clearance),
-                    float(np.dot([afwd_x, afwd_y], [nx, ny]) if "afwd_x" in locals() else 0.0),
-                    applied_fwd,
-                    fb_fx,
-                    fb_fy,
-                    ctrl_fx,
-                    ctrl_fy,
-                    fx_tot,
-                    fy_tot,
-                )
+                self._debug_wall_repulsion(rep)
             except Exception:
                 pass
         except Exception:
@@ -2279,20 +2308,7 @@ class TeamCosEnv(gym.Env):
             learnable_hider_seen_flag,
         )
 
-    def _debug_wall_repulsion(
-        self,
-        bid,
-        dist,
-        clearance,
-        facing_dot,
-        applied_fwd,
-        fb_fx,
-        fb_fy,
-        ctrl_fx,
-        ctrl_fy,
-        fx_tot,
-        fy_tot,
-    ):
+    def _debug_wall_repulsion(self, rep: Optional[Dict[str, Any]]):
         """
         壁反発に関するデバッグ出力をまとめたヘルパー。
         既存のログ出力と低レベル診断をこのメソッドへ集約する。
@@ -2300,12 +2316,39 @@ class TeamCosEnv(gym.Env):
         if not (getattr(self, "debug_mode", False) and getattr(self, "WALL_DEBUG_VERBOSE", False)):
             return
         try:
+            # rep に含まれる値を優先してデバッグ出力を構築する
+            if rep is None:
+                rep = {}
+            dist = float(rep.get("dist", 0.0))
+            clearance = float(rep.get("clearance", 0.0))
+            applied_fwd = float(rep.get("applied_fwd", 0.0))
+            fb_fx = float(rep.get("fb_fx", 0.0))
+            fb_fy = float(rep.get("fb_fy", 0.0))
+            ctrl_fx = float(rep.get("ctrl_fx", 0.0))
+            ctrl_fy = float(rep.get("ctrl_fy", 0.0))
+            fx_tot = float(rep.get("fx_tot", 0.0))
+            fy_tot = float(rep.get("fy_tot", 0.0))
+            bid = int(rep.get("bid", int(self.body_ids.get(self.learnable_agent_key, 0))))
+
+            # facing_dot を再計算（エージェントの向きと法線が利用可能なら）
+            try:
+                nx = float(rep.get("nx", 0.0))
+                ny = float(rep.get("ny", 0.0))
+                rot_j = self.qpos_indices[self.learnable_agent_key]["rot"]
+                rot_val = float(self.data.qpos[self.model.jnt_qposadr[rot_j]])
+                afwd_x = float(math.cos(rot_val))
+                afwd_y = float(math.sin(rot_val))
+                facing_dot = float(np.dot([afwd_x, afwd_y], [nx, ny]))
+            except Exception:
+                facing_dot = float(rep.get("facing_dot", 0.0)) if rep.get("facing_dot") is not None else 0.0
+
             try:
                 self.debug_logger.print(
                     f"[DEBUG][wall_repulsion] step={self.current_step} agent={self.learnable_agent_key} dist={dist:.3f} clearance={clearance:.3f} facing_dot={facing_dot:.3f} applied_fwd={applied_fwd:.3f} fb=({fb_fx:.1f},{fb_fy:.1f}) ctrl=({ctrl_fx:.1f},{ctrl_fy:.1f}) fx={fx_tot:.1f} fy={fy_tot:.1f}"
                 )
             except Exception:
                 pass
+
             try:
                 aid = self.actuator_ids.get(f"{self.learnable_agent_key}_fwd")
                 ctrl_val = float(self.data.ctrl[aid]) if (aid is not None and aid < self.data.ctrl.shape[0]) else None
@@ -2742,7 +2785,7 @@ class TeamCosEnv(gym.Env):
                         if abs(ly) > 1.5:
                             continue
                         try:
-                            lx_min, lx_max, _ = self._compute_ramp_lx_bounds(rid, up)
+                            lx_min, lx_max, _ = self._compute_ramp_lx_bounds(rid)
                         except Exception:
                             lx_min, lx_max = -1.15, 0.666
                         prog = (lx - lx_min) / max(1e-6, (lx_max - lx_min))
