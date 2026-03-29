@@ -2020,7 +2020,7 @@ class TeamCosEnv(gym.Env):
         # 壁反発計算と適用をヘルパーに委譲
         try:
             # 返り値は現在使用していないため破棄する（副作用で data.xfrc_applied を更新）
-            self._compute_and_apply_wall_repulsion(learnable_agent_body_id, learnable_agent_pos, last_ctrl_f, applied_forward_env)
+            self._compute_and_apply_wall_repulsion()
         except Exception:
             # シミュレーションステップが中断されないように、反発ロジックのエラーを無視する
             pass
@@ -2226,7 +2226,7 @@ class TeamCosEnv(gym.Env):
         except Exception:
             pass
 
-    def _compute_and_apply_wall_repulsion(self, learnable_agent_body_id, learnable_agent_pos, last_ctrl_f, applied_forward_env):
+    def _compute_and_apply_wall_repulsion(self):
         """
         壁反発の中心ロジックをまとめて `data.xfrc_applied` に力を加え、
         必要なデバッグ値を辞書で返す。
@@ -2235,13 +2235,23 @@ class TeamCosEnv(gym.Env):
             dist, nx, ny, clearance, applied_fwd,
             fb_fx, fb_fy, ctrl_fx, ctrl_fy, fx_tot, fy_tot, bid, ncon
         """
-        bid = int(learnable_agent_body_id)
+        # 必要な状態はインスタンスから取得する（メソッドはクラス内で呼ばれるため）
+        try:
+            bid = int(self.body_ids[self.learnable_agent_key])
+        except Exception:
+            bid = 0
+        try:
+            learnable_agent_pos = self.data.xpos[bid]
+        except Exception:
+            learnable_agent_pos = (0.0, 0.0, 0.0)
         # 初期値
         dist = 1.0
         nx = 0.0
         ny = 0.0
         clearance = 1.0
-        applied_fwd = float(applied_forward_env if applied_forward_env is not None else 0.0)
+        # applied_forward_env と last_ctrl_f は last_debug_ctrl から取得する
+        last_ctrl_f = float(self.last_debug_ctrl.get(self.learnable_agent_key, (0.0, 0.0))[0])
+        applied_fwd = float(last_ctrl_f if last_ctrl_f is not None else 0.0)
         fb_fx = fb_fy = ctrl_fx = ctrl_fy = fx_tot = fy_tot = 0.0
 
         try:
