@@ -369,15 +369,8 @@ class TeamCosEnv(gym.Env):
             self.data,
             mode4_sdf_cell_size=self.mode4_sdf_cell_size,
         )
-        # ランプ周りの静的ジオメトリ情報を一度だけ計算してキャッシュする。
-        # ランプのサイズ（geom_size）は学習中に変わらないことが期待されるため、
-        # 毎ステップで model.geom_size を探索するコストを避ける。
+        # ランプ周りの静的ジオメトリ情報キャッシュ（準備は構造解析後に行う）
         self._ramp_static_cache: Dict[int, Dict[str, Any]] = {}
-        try:
-            self._prepare_ramp_static_cache()
-        except Exception:
-            # キャッシュ準備は最適化目的なので失敗してもフォールバックは許す
-            logger.exception("failed to prepare ramp static cache")
         self.viewer = None
         self.inference_policies = inference_policies or {}
         self._inference_models: Dict[str, Any] = {}
@@ -485,6 +478,14 @@ class TeamCosEnv(gym.Env):
             dtype=np.float64,
         )
         self._analyze_structure()
+        # ランプ静的キャッシュは構造解析後に準備する（ramp_ids 等が必要）
+        try:
+            self._prepare_ramp_static_cache()
+        except Exception:
+            try:
+                logger.exception("failed to prepare ramp static cache")
+            except Exception:
+                pass
         self._init_agent_intelligence()
         self._init_interaction_state()
 
@@ -1604,7 +1605,7 @@ class TeamCosEnv(gym.Env):
         self.debug_logger.log_policy_src(agent_key, source, self.current_step, force=True)
 
     # メッセージをログに記録。force=True の場合は、デバッグモードに関係なく直接ログに出力します。通常は DebugLogger を使用してログを記録しますが、force=True の場合は、メッセージが "[DEBUG]" で始まる場合は logger.debug を使用し、それ以外の場合は logger.info を使用して直接ログに出力します。これにより、重要なデバッグ情報を確実にログに記録できます。
-    def _dbg_print_throttled(self, key, message, force=False):
+    def _dbg_print_throttled(self, message, force=False):
         # `print_throttled` removed. Preserve `force` semantics by logging directly
         # when `force=True`, otherwise route through DebugLogger.print().
         if force:
@@ -2151,7 +2152,7 @@ class TeamCosEnv(gym.Env):
         done = self.current_step >= self.max_episode_steps
         # ランプ関連のデバッグ指標をヘルパーで取得
         try:
-            ramp_dbg = self._compute_ramp_metrics(learnable_agent_body_id, learnable_agent_pos, dbg_agent_z, dbg_agent_vz)
+            ramp_dbg = self._compute_ramp_metrics(learnable_agent_body_id, learnable_agent_pos, dbg_agent_z)
             dbg_ramp_progress = ramp_dbg.get("dbg_ramp_progress", None)
             dbg_ramp_lx = ramp_dbg.get("dbg_ramp_lx", None)
             dbg_ramp_ly = ramp_dbg.get("dbg_ramp_ly", None)
@@ -2752,7 +2753,7 @@ class TeamCosEnv(gym.Env):
         except Exception:
             pass
 
-    def _compute_ramp_metrics(self, learnable_agent_body_id, learnable_agent_pos, dbg_agent_z, dbg_agent_vz):
+    def _compute_ramp_metrics(self, learnable_agent_body_id, learnable_agent_pos, dbg_agent_z):
         """
         Compute ramp-related metrics and return them as a dict.
         This function was previously named `_compute_ramp_debug`. It now
