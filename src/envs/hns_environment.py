@@ -2019,11 +2019,77 @@ class TeamCosEnv(gym.Env):
         last_ctrl_t = float(last_ctrl[1])
         # 壁反発計算と適用をヘルパーに委譲
         try:
-            # 返り値は現在使用していないため破棄する（副作用で data.xfrc_applied を更新）
-            self._compute_and_apply_wall_repulsion()
+            # preserve the current applied_forward_env for the helper to read
+            try:
+                self._current_applied_forward_env = applied_forward_env
+            except Exception:
+                pass
+            rep = self._compute_and_apply_wall_repulsion()
+            dist = rep.get("dist", 0.0)
+            nx = rep.get("nx", 0.0)
+            ny = rep.get("ny", 0.0)
+            clearance = rep.get("clearance", 0.0)
+            applied_fwd = rep.get("applied_fwd", 0.0)
+            fb_fx = rep.get("fb_fx", 0.0)
+            fb_fy = rep.get("fb_fy", 0.0)
+            ctrl_fx = rep.get("ctrl_fx", 0.0)
+            ctrl_fy = rep.get("ctrl_fy", 0.0)
+            fx_tot = rep.get("fx_tot", 0.0)
+            fy_tot = rep.get("fy_tot", 0.0)
+            bid = int(rep.get("bid", int(learnable_agent_body_id)))
+            ncon = int(rep.get("ncon", int(getattr(self.data, "ncon", 0))))
+            # data.xfrc_applied に反映（元の書き込み順序を再現）
+            try:
+                if hasattr(self.data, "xfrc_applied"):
+                    if self.data.xfrc_applied.shape[1] >= 2:
+                        self.data.xfrc_applied[bid, 0] = float(self.data.xfrc_applied[bid, 0]) + float(fx_tot)
+                        self.data.xfrc_applied[bid, 1] = float(self.data.xfrc_applied[bid, 1]) + float(fy_tot)
+            except Exception:
+                pass
+            # 回転抑制処理（Mz の加算等）を呼び出す
+            try:
+                self._apply_rotation_suppression(bid, float(clearance))
+            except Exception:
+                pass
+            # verbose debug（afwd を再計算して facing_dot を作る）
+            try:
+                try:
+                    rot_j = self.qpos_indices[self.learnable_agent_key]["rot"]
+                    rot_val = float(self.data.qpos[self.model.jnt_qposadr[rot_j]])
+                    afwd_x = float(math.cos(rot_val))
+                    afwd_y = float(math.sin(rot_val))
+                except Exception:
+                    afwd_x, afwd_y = 1.0, 0.0
+                self._debug_wall_repulsion(
+                    bid,
+                    dist,
+                    float(clearance),
+                    float(np.dot([afwd_x, afwd_y], [nx, ny]) if "afwd_x" in locals() else 0.0),
+                    applied_fwd,
+                    fb_fx,
+                    fb_fy,
+                    ctrl_fx,
+                    ctrl_fy,
+                    fx_tot,
+                    fy_tot,
+                )
+            except Exception:
+                pass
         except Exception:
             # シミュレーションステップが中断されないように、反発ロジックのエラーを無視する
-            pass
+            dist = nx = ny = clearance = applied_fwd = 0.0
+            fb_fx = fb_fy = ctrl_fx = ctrl_fy = fx_tot = fy_tot = 0.0
+            bid = int(learnable_agent_body_id)
+            ncon = int(getattr(self.data, "ncon", 0))
+        finally:
+            try:
+                if hasattr(self, "_current_applied_forward_env"):
+                    delattr(self, "_current_applied_forward_env")
+            except Exception:
+                try:
+                    del self._current_applied_forward_env
+                except Exception:
+                    pass
 
         obs = self._normalize_obs(self._get_obs(idx_to_obs))
         reward = float(rb if self.target == "hider" else -rb)
@@ -2251,7 +2317,7 @@ class TeamCosEnv(gym.Env):
         clearance = 1.0
         # applied_forward_env と last_ctrl_f は last_debug_ctrl から取得する
         last_ctrl_f = float(self.last_debug_ctrl.get(self.learnable_agent_key, (0.0, 0.0))[0])
-        applied_fwd = float(last_ctrl_f if last_ctrl_f is not None else 0.0)
+        applied_fwd = float(getattr(self, "_current_applied_forward_env", last_ctrl_f if last_ctrl_f is not None else 0.0))
         fb_fx = fb_fy = ctrl_fx = ctrl_fy = fx_tot = fy_tot = 0.0
 
         try:
@@ -2279,7 +2345,7 @@ class TeamCosEnv(gym.Env):
                 clip = getattr(self, "WALL_REPULSION_CTRL_CLIP", None)
                 prev = float(getattr(self, "_wall_repulsion_ctrl_ema", 0.0))
                 # 入力は実際に環境で適用された前進値を使う
-                inp = float(applied_forward_env if applied_forward_env is not None else last_ctrl_f if last_ctrl_f is not None else 0.0)
+                inp = float(getattr(self, "_current_applied_forward_env", last_ctrl_f if last_ctrl_f is not None else 0.0))
                 ema = (1.0 - ctrl_lp) * prev + ctrl_lp * inp
                 if clip is not None:
                     try:
@@ -2328,7 +2394,7 @@ class TeamCosEnv(gym.Env):
             except Exception:
                 fb_fx = fb_fy = 0.0
 
-            # 合計力
+            # 合計力（計算のみ、書き込みは呼び出し元で行う）
             try:
                 fx_tot = float(fb_fx + ctrl_fx)
                 fy_tot = float(fb_fy + ctrl_fy)
@@ -2339,40 +2405,17 @@ class TeamCosEnv(gym.Env):
                     fy_tot = max(min(fy_tot, clamp_v), -clamp_v)
                 except Exception:
                     pass
-                # data.xfrc_applied に反映
-                try:
-                    if hasattr(self.data, "xfrc_applied"):
-                        # ensure shape
-                        if self.data.xfrc_applied.shape[1] >= 2:
-                            self.data.xfrc_applied[bid, 0] = float(self.data.xfrc_applied[bid, 0]) + fx_tot
-                            self.data.xfrc_applied[bid, 1] = float(self.data.xfrc_applied[bid, 1]) + fy_tot
-                except Exception:
-                    pass
             except Exception:
                 fx_tot = fy_tot = 0.0
-
-            # 回転抑制処理を呼び出す
-            try:
-                self._apply_rotation_suppression(bid, float(clearance))
-            except Exception:
-                pass
-
-            # verbose debug
-            try:
-                self._debug_wall_repulsion(
-                    bid, dist, float(clearance), float(np.dot([afwd_x, afwd_y], [nx, ny]) if "afwd_x" in locals() else 0.0), applied_fwd, fb_fx, fb_fy, ctrl_fx, ctrl_fy, fx_tot, fy_tot
-                )
-            except Exception:
-                pass
 
         except Exception:
             pass
 
-        # ncon (contacts) 取得
-        try:
-            ncon = int(getattr(self.data, "ncon", 0)) if hasattr(self.data, "ncon") else 0
-        except Exception:
-            ncon = 0
+            # ncon (contacts) 取得
+            try:
+                ncon = int(getattr(self.data, "ncon", 0)) if hasattr(self.data, "ncon") else 0
+            except Exception:
+                ncon = 0
 
         return {
             "dist": float(dist),

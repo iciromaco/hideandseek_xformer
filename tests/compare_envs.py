@@ -48,9 +48,13 @@ def sample_run(EnvClass, seed=1234):
         print(f"Failed to instantiate {EnvClass}:", e)
         raise
     try:
-        # deterministic seed via reset
+        # deterministic seed: fix Python and numpy RNGs and pass seed to env.reset when supported
+        import random
+
+        random.seed(seed)
+        np.random.seed(seed)
         try:
-            obs = env.reset()
+            obs = env.reset(seed=seed)
         except TypeError:
             obs = env.reset()
         # record copy of xfrc_applied before
