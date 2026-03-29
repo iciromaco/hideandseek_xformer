@@ -2283,40 +2283,32 @@ class TeamCosEnv(gym.Env):
             learnable_agent_pos=learnable_agent_pos,
             dbg_agent_z=dbg_agent_z,
         )
-        # デバッグ用: ランプ上判定に使った boost 値を常に出力する
+        # expose ramp boost under a neutral key (caller can decide to log it)
         try:
-            info["dbg_ramp_boost"] = float(self._ramp_boost_gain(self.learnable_agent_key))
+            info["ramp_boost"] = float(self._ramp_boost_gain(self.learnable_agent_key))
         except Exception:
             pass
-        # expose ramp metrics under neutral names (for training/inference) and
-        # keep legacy dbg_ keys for backward compatibility
+        # expose ramp metrics under neutral names (for training/inference)
         if dbg_ramp_lx is not None:
             info["ramp_lx"] = dbg_ramp_lx
-            info["dbg_ramp_lx"] = dbg_ramp_lx
         if dbg_ramp_ly is not None:
             info["ramp_ly"] = dbg_ramp_ly
-            info["dbg_ramp_ly"] = dbg_ramp_ly
         if dbg_ramp_facing is not None:
             info["ramp_facing"] = dbg_ramp_facing
-            info["dbg_ramp_facing"] = dbg_ramp_facing
         if dbg_ramp_rpos is not None:
             info["ramp_rpos_x"] = float(dbg_ramp_rpos[0])
             info["ramp_rpos_y"] = float(dbg_ramp_rpos[1])
-            info["dbg_ramp_rpos_x"] = float(dbg_ramp_rpos[0])
-            info["dbg_ramp_rpos_y"] = float(dbg_ramp_rpos[1])
-        # expose agent world z/vz under neutral names (avoid dbg_ prefix)
+
+        # expose agent world z/vz under neutral names
         info["agent_world_z"] = dbg_agent_z
-        info["dbg_agent_z"] = dbg_agent_z
         info["agent_world_vz"] = dbg_agent_vz
-        info["dbg_agent_vz"] = dbg_agent_vz
+
         if dbg_ramp_progress is not None:
             info["ramp_progress"] = dbg_ramp_progress
-            info["dbg_ramp_progress"] = dbg_ramp_progress
-        # climbing / reached-top diagnostics
+
+        # climbing / reached-top diagnostics (neutral keys only)
         info["ramp_climbing"] = bool(dbg_ramp_climbing)
-        info["dbg_ramp_climbing"] = bool(dbg_ramp_climbing)
         info["ramp_reached_top"] = bool(dbg_ramp_reached_top)
-        info["dbg_ramp_reached_top"] = bool(dbg_ramp_reached_top)
         self._dbg_collect_stats(reward, info)
 
         # cache the observation returned for the learnable agent
@@ -2639,46 +2631,27 @@ class TeamCosEnv(gym.Env):
             "is_detected": find,
             "lock_event": any_lock_event,
             "grab_event": any_grab_event,
-            "dbg_lock_pressed": any_lock_pressed,
             "lock_pressed": any_lock_pressed,
-            "dbg_grab_pressed": any_grab_pressed,
             "grab_pressed": any_grab_pressed,
-            "dbg_lock_target": any_lock_target,
             "lock_target": any_lock_target,
-            "dbg_grab_target": any_grab_target,
             "grab_target": any_grab_target,
-            "dbg_lock_btn_max": max_lock_btn,
             "lock_btn_max": max_lock_btn,
-            "dbg_grab_btn_max": max_grab_btn,
             "grab_btn_max": max_grab_btn,
-            "dbg_box_moving_count": moving_box_count,
             "box_moving_count": moving_box_count,
-            "dbg_ramp_moving_count": moving_ramp_count,
             "ramp_moving_count": moving_ramp_count,
-            "dbg_max_box_speed": float(max(box_speeds) if box_speeds else 0.0),
             "max_box_speed": float(max(box_speeds) if box_speeds else 0.0),
-            "dbg_max_ramp_speed": float(max(ramp_speeds) if ramp_speeds else 0.0),
             "max_ramp_speed": float(max(ramp_speeds) if ramp_speeds else 0.0),
-            "dbg_blocked_ramp_count": blocked_ramp_count,
             "blocked_ramp_count": blocked_ramp_count,
-            "dbg_boosted_agents": boosted_agents,
             "boosted_agents": boosted_agents,
-            "dbg_override_learnable_policy": bool(self.override_learnable_policy),
             "override_learnable_policy": bool(self.override_learnable_policy),
-            "dbg_model_policy_deterministic": bool(self.model_policy_deterministic),
             "model_policy_deterministic": bool(self.model_policy_deterministic),
-            "dbg_seek_gaze_cos_front_max": float(gaze_cos_front_max),
             "seek_gaze_cos_front_max": float(gaze_cos_front_max),
-            "dbg_seek_gaze_cos_front_dist_max": float(gaze_dist_max),
             "seek_gaze_cos_front_dist_max": float(gaze_dist_max),
-            "dbg_learnable_hider_seen": bool(learnable_hider_seen),
             "learnable_hider_seen": bool(learnable_hider_seen),
             "wall_distance": wall_dist,
             "agent_vz": agent_vz,
             "agent_vx": agent_vx,
             "agent_vy": agent_vy,
-            "dbg_last_ctrl_f": last_ctrl_f,
-            "dbg_last_ctrl_t": last_ctrl_t,
             # whether current step is within prep/warmup
             "in_prep": bool(self.current_step <= self.prep_steps),
             # 'applied_forward_model' is the raw model output; 'applied_forward' is what was
@@ -2797,37 +2770,27 @@ class TeamCosEnv(gym.Env):
             applied_forward_env=applied_forward_env,
         )
 
-        # add debug ramp and agent z/vz fields
+        # add ramp boost and agent z/vz fields (neutral keys only)
         try:
-            info["dbg_ramp_boost"] = float(self._ramp_boost_gain(self.learnable_agent_key))
+            info["ramp_boost"] = float(self._ramp_boost_gain(self.learnable_agent_key))
         except Exception:
             pass
 
         if dbg_ramp_lx is not None:
             info["ramp_lx"] = dbg_ramp_lx
-            info["dbg_ramp_lx"] = dbg_ramp_lx
         if dbg_ramp_ly is not None:
             info["ramp_ly"] = dbg_ramp_ly
-            info["dbg_ramp_ly"] = dbg_ramp_ly
         if dbg_ramp_facing is not None:
             info["ramp_facing"] = dbg_ramp_facing
-            info["dbg_ramp_facing"] = dbg_ramp_facing
         if dbg_ramp_rpos is not None:
             info["ramp_rpos_x"] = float(dbg_ramp_rpos[0])
             info["ramp_rpos_y"] = float(dbg_ramp_rpos[1])
-            info["dbg_ramp_rpos_x"] = float(dbg_ramp_rpos[0])
-            info["dbg_ramp_rpos_y"] = float(dbg_ramp_rpos[1])
         info["agent_world_z"] = dbg_agent_z
-        info["dbg_agent_z"] = dbg_agent_z
         info["agent_world_vz"] = agent_vz
-        info["dbg_agent_vz"] = agent_vz
         if dbg_ramp_progress is not None:
             info["ramp_progress"] = dbg_ramp_progress
-            info["dbg_ramp_progress"] = dbg_ramp_progress
         info["ramp_climbing"] = bool(dbg_ramp_climbing)
-        info["dbg_ramp_climbing"] = bool(dbg_ramp_climbing)
         info["ramp_reached_top"] = bool(dbg_ramp_reached_top)
-        info["dbg_ramp_reached_top"] = bool(dbg_ramp_reached_top)
 
         # collect stats and return
         try:
