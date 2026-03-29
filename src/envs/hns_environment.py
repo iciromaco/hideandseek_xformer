@@ -2244,14 +2244,15 @@ class TeamCosEnv(gym.Env):
         # ランプ関連のデバッグ指標をヘルパーで取得
         try:
             ramp_dbg = self._compute_ramp_metrics(learnable_agent_body_id, learnable_agent_pos, dbg_agent_z)
-            dbg_ramp_progress = ramp_dbg.get("dbg_ramp_progress", None)
             dbg_ramp_climbing = ramp_dbg.get("dbg_ramp_climbing", False)
             dbg_ramp_reached_top = ramp_dbg.get("dbg_ramp_reached_top", False)
             dbg_agent_z = ramp_dbg.get("dbg_agent_z", dbg_agent_z)
+            # assign ramp_progress directly into info-safe later; keep ramp_dbg for field extraction
+            dbg_ramp_progress = ramp_dbg.get("dbg_ramp_progress", None)
         except Exception:
-            dbg_ramp_progress = None
             dbg_ramp_climbing = False
             dbg_ramp_reached_top = False
+            dbg_ramp_progress = None
         # assemble reward and info via helper to improve readability
         reward, done, info = self._finalize_reward_and_info(
             rb=rb,
@@ -2295,8 +2296,9 @@ class TeamCosEnv(gym.Env):
         info["agent_world_z"] = dbg_agent_z
         info["agent_world_vz"] = agent_vz
 
-        if dbg_ramp_progress is not None:
-            info["ramp_progress"] = dbg_ramp_progress
+        # assign ramp_progress directly from ramp_dbg if available
+        if "ramp_dbg" in locals() and (v := ramp_dbg.get("dbg_ramp_progress", None)) is not None:
+            info["ramp_progress"] = v
 
         # climbing / reached-top diagnostics (neutral keys only)
         info["ramp_climbing"] = bool(dbg_ramp_climbing)
