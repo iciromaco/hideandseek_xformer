@@ -1146,14 +1146,23 @@ def evaluate_fixed_ramp_climb(mode, target, agent, device, episodes=3, max_steps
             next_obs, _, term, trun, info = env.step(action)
             history.update(next_obs)
             obs = next_obs
-            if "dbg_ramp_height" in info:
+            # prefer neutral key names produced by the env; fall back to legacy dbg_ keys
+            if "agent_world_z" in info:
+                h = float(info["agent_world_z"])
+            elif "dbg_ramp_height" in info:
                 h = float(info["dbg_ramp_height"])
-                if h > max_height:
-                    max_height = h
-            if "dbg_ramp_progress" in info:
+            else:
+                h = -float("inf")
+            if h > max_height:
+                max_height = h
+            if "ramp_progress" in info:
+                p = float(info["ramp_progress"])
+            elif "dbg_ramp_progress" in info:
                 p = float(info["dbg_ramp_progress"])
-                if p > max_progress:
-                    max_progress = p
+            else:
+                p = -float("inf")
+            if p > max_progress:
+                max_progress = p
             done = bool(term or trun)
             if done:
                 break

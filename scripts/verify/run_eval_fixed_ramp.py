@@ -162,13 +162,12 @@ def main():
                         print(f"[GEOM_BOTTOMS] {s}")
                 except Exception:
                     pass
-            # always print agent height (dbg_agent_z) and vertical velocity (dbg_agent_vz)
+            # always print agent height and vertical velocity; prefer neutral keys
             dbg_boost = info.get("dbg_ramp_boost")
-            # prefer new key names but accept old names for compatibility
-            dbg_h = info.get("dbg_agent_z", info.get("dbg_ramp_height"))
-            dbg_vz = info.get("dbg_agent_vz", info.get("agent_vz"))
-            dbg_p = info.get("dbg_ramp_progress")
-            print(f"ep={ep} step={step} dbg_agent_z={dbg_h} dbg_agent_vz={dbg_vz} dbg_ramp_boost={dbg_boost} dbg_ramp_progress={dbg_p}")
+            dbg_h = info.get("agent_world_z", info.get("dbg_agent_z", info.get("dbg_ramp_height")))
+            dbg_vz = info.get("agent_world_vz", info.get("dbg_agent_vz", info.get("agent_vz")))
+            dbg_p = info.get("ramp_progress", info.get("dbg_ramp_progress"))
+            print(f"ep={ep} step={step} agent_world_z={dbg_h} agent_world_vz={dbg_vz} ramp_progress={dbg_p} dbg_ramp_boost={dbg_boost}")
             if term or trun:
                 break
     env.close()

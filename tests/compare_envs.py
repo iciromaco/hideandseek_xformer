@@ -43,25 +43,55 @@ import numpy as np
 
 def sample_run(EnvClass, seed=1234):
     try:
-        env = EnvClass(debug_mode=True)
+        try:
+            env = EnvClass(debug_mode=True, seed=seed)
+        except TypeError:
+            # EnvClass doesn't accept seed at construction; seed globals and instantiate
+            import random
+
+            random.seed(seed)
+            np.random.seed(seed)
+            try:
+                import torch
+
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+            except Exception:
+                pass
+            env = EnvClass(debug_mode=True)
     except Exception as e:
         print(f"Failed to instantiate {EnvClass}:", e)
         raise
     try:
-        # deterministic seed: fix Python and numpy RNGs and pass seed to env.reset when supported
-        import random
-
-        random.seed(seed)
-        np.random.seed(seed)
+        # env was seeded at construction; call reset without re-seeding
         try:
-            obs = env.reset(seed=seed)
+            obs = env.reset()
         except TypeError:
             obs = env.reset()
-        # record copy of xfrc_applied before
+        # record copies of key arrays/state before step
         try:
             xfrc_before = None if not hasattr(env.data, "xfrc_applied") else env.data.xfrc_applied.copy()
         except Exception:
             xfrc_before = None
+        try:
+            qpos_before = None if not hasattr(env.data, "qpos") else env.data.qpos.copy()
+        except Exception:
+            qpos_before = None
+        try:
+            qvel_before = None if not hasattr(env.data, "qvel") else env.data.qvel.copy()
+        except Exception:
+            qvel_before = None
+        try:
+            # wall_distance helper if available
+            if hasattr(env, "vis_engine") and hasattr(env, "body_ids") and hasattr(env, "learnable_agent_key"):
+                bid = env.body_ids[env.learnable_agent_key]
+                wp = env.data.xpos[bid]
+                wall_before = float(env.vis_engine.wall_distance(wp[0], wp[1]))
+            else:
+                wall_before = None
+        except Exception:
+            wall_before = None
         # use a fixed action
         action = [0.5, 0.0, 0.0, 0.0]
         try:
@@ -69,11 +99,28 @@ def sample_run(EnvClass, seed=1234):
         except Exception as e:
             print(f"step() raised for {EnvClass}:", e)
             raise
-        # capture xfrc after
+        # capture copies of key arrays/state after step
         try:
             xfrc_after = None if not hasattr(env.data, "xfrc_applied") else env.data.xfrc_applied.copy()
         except Exception:
             xfrc_after = None
+        try:
+            qpos_after = None if not hasattr(env.data, "qpos") else env.data.qpos.copy()
+        except Exception:
+            qpos_after = None
+        try:
+            qvel_after = None if not hasattr(env.data, "qvel") else env.data.qvel.copy()
+        except Exception:
+            qvel_after = None
+        try:
+            if hasattr(env, "vis_engine") and hasattr(env, "body_ids") and hasattr(env, "learnable_agent_key"):
+                bid = env.body_ids[env.learnable_agent_key]
+                wp = env.data.xpos[bid]
+                wall_after = float(env.vis_engine.wall_distance(wp[0], wp[1]))
+            else:
+                wall_after = None
+        except Exception:
+            wall_after = None
         # tidy
         try:
             env.close()
@@ -84,6 +131,12 @@ def sample_run(EnvClass, seed=1234):
             "out": out,
             "xfrc_before": xfrc_before,
             "xfrc_after": xfrc_after,
+            "qpos_before": qpos_before,
+            "qpos_after": qpos_after,
+            "qvel_before": qvel_before,
+            "qvel_after": qvel_after,
+            "wall_before": wall_before,
+            "wall_after": wall_after,
         }
 
     except Exception:

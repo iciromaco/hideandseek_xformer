@@ -290,9 +290,35 @@ class TeamCosEnv(gym.Env):
         action_repeat=16,
         learnable_turn_scale=1.0,
         control_mode: str = "auto",
+        seed: Optional[int] = None,
         USE_VIEWER: bool = False,
         human_key_bindings: Optional[Dict[str, Any]] = None,
     ):
+        # apply deterministic seed at instantiation when provided
+        try:
+            if seed is not None:
+                import random as _py_random
+
+                _py_random.seed(int(seed))
+                np.random.seed(int(seed))
+                try:
+                    import torch as _torch
+
+                    _torch.manual_seed(int(seed))
+                    if _torch.cuda.is_available():
+                        _torch.cuda.manual_seed_all(int(seed))
+                except Exception:
+                    pass
+                try:
+                    self._init_seed = int(seed)
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                logger.exception("failed to apply deterministic seed in __init__")
+            except Exception:
+                pass
+
         super().__init__()
         self.n_seekers = int(n_seekers)
         self.n_hiders = int(n_hiders)
@@ -2096,7 +2122,7 @@ class TeamCosEnv(gym.Env):
         done = self.current_step >= self.max_episode_steps
         # ランプ関連のデバッグ指標をヘルパーで取得
         try:
-            ramp_dbg = self._compute_ramp_debug(learnable_agent_body_id, learnable_agent_pos, dbg_agent_z, dbg_agent_vz)
+            ramp_dbg = self._compute_ramp_metrics(learnable_agent_body_id, learnable_agent_pos, dbg_agent_z, dbg_agent_vz)
             dbg_ramp_progress = ramp_dbg.get("dbg_ramp_progress", None)
             dbg_ramp_lx = ramp_dbg.get("dbg_ramp_lx", None)
             dbg_ramp_ly = ramp_dbg.get("dbg_ramp_ly", None)
@@ -2146,22 +2172,34 @@ class TeamCosEnv(gym.Env):
             info["dbg_ramp_boost"] = float(self._ramp_boost_gain(self.learnable_agent_key))
         except Exception:
             pass
-        # 追加デバッグ出力
+        # expose ramp metrics under neutral names (for training/inference) and
+        # keep legacy dbg_ keys for backward compatibility
         if dbg_ramp_lx is not None:
+            info["ramp_lx"] = dbg_ramp_lx
             info["dbg_ramp_lx"] = dbg_ramp_lx
         if dbg_ramp_ly is not None:
+            info["ramp_ly"] = dbg_ramp_ly
             info["dbg_ramp_ly"] = dbg_ramp_ly
         if dbg_ramp_facing is not None:
+            info["ramp_facing"] = dbg_ramp_facing
             info["dbg_ramp_facing"] = dbg_ramp_facing
         if dbg_ramp_rpos is not None:
+            info["ramp_rpos_x"] = float(dbg_ramp_rpos[0])
+            info["ramp_rpos_y"] = float(dbg_ramp_rpos[1])
             info["dbg_ramp_rpos_x"] = float(dbg_ramp_rpos[0])
             info["dbg_ramp_rpos_y"] = float(dbg_ramp_rpos[1])
+        # expose agent world z/vz under neutral names (avoid dbg_ prefix)
+        info["agent_world_z"] = dbg_agent_z
         info["dbg_agent_z"] = dbg_agent_z
+        info["agent_world_vz"] = dbg_agent_vz
         info["dbg_agent_vz"] = dbg_agent_vz
         if dbg_ramp_progress is not None:
+            info["ramp_progress"] = dbg_ramp_progress
             info["dbg_ramp_progress"] = dbg_ramp_progress
         # climbing / reached-top diagnostics
+        info["ramp_climbing"] = bool(dbg_ramp_climbing)
         info["dbg_ramp_climbing"] = bool(dbg_ramp_climbing)
+        info["ramp_reached_top"] = bool(dbg_ramp_reached_top)
         info["dbg_ramp_reached_top"] = bool(dbg_ramp_reached_top)
         self._dbg_collect_stats(reward, info)
 
@@ -2472,22 +2510,39 @@ class TeamCosEnv(gym.Env):
             "lock_event": any_lock_event,
             "grab_event": any_grab_event,
             "dbg_lock_pressed": any_lock_pressed,
+            "lock_pressed": any_lock_pressed,
             "dbg_grab_pressed": any_grab_pressed,
+            "grab_pressed": any_grab_pressed,
             "dbg_lock_target": any_lock_target,
+            "lock_target": any_lock_target,
             "dbg_grab_target": any_grab_target,
+            "grab_target": any_grab_target,
             "dbg_lock_btn_max": max_lock_btn,
+            "lock_btn_max": max_lock_btn,
             "dbg_grab_btn_max": max_grab_btn,
+            "grab_btn_max": max_grab_btn,
             "dbg_box_moving_count": moving_box_count,
+            "box_moving_count": moving_box_count,
             "dbg_ramp_moving_count": moving_ramp_count,
+            "ramp_moving_count": moving_ramp_count,
             "dbg_max_box_speed": float(max(box_speeds) if box_speeds else 0.0),
+            "max_box_speed": float(max(box_speeds) if box_speeds else 0.0),
             "dbg_max_ramp_speed": float(max(ramp_speeds) if ramp_speeds else 0.0),
+            "max_ramp_speed": float(max(ramp_speeds) if ramp_speeds else 0.0),
             "dbg_blocked_ramp_count": blocked_ramp_count,
+            "blocked_ramp_count": blocked_ramp_count,
             "dbg_boosted_agents": boosted_agents,
+            "boosted_agents": boosted_agents,
             "dbg_override_learnable_policy": bool(self.override_learnable_policy),
+            "override_learnable_policy": bool(self.override_learnable_policy),
             "dbg_model_policy_deterministic": bool(self.model_policy_deterministic),
+            "model_policy_deterministic": bool(self.model_policy_deterministic),
             "dbg_seek_gaze_cos_front_max": float(gaze_cos_front_max),
+            "seek_gaze_cos_front_max": float(gaze_cos_front_max),
             "dbg_seek_gaze_cos_front_dist_max": float(gaze_dist_max),
+            "seek_gaze_cos_front_dist_max": float(gaze_dist_max),
             "dbg_learnable_hider_seen": bool(learnable_hider_seen),
+            "learnable_hider_seen": bool(learnable_hider_seen),
             "wall_distance": wall_dist,
             "agent_vz": agent_vz,
             "agent_vx": agent_vx,
@@ -2654,10 +2709,12 @@ class TeamCosEnv(gym.Env):
         except Exception:
             pass
 
-    def _compute_ramp_debug(self, learnable_agent_body_id, learnable_agent_pos, dbg_agent_z, dbg_agent_vz):
+    def _compute_ramp_metrics(self, learnable_agent_body_id, learnable_agent_pos, dbg_agent_z, dbg_agent_vz):
         """
-        ランプ判定と関連デバッグ指標を計算して辞書で返す。
-        既存の step() ブロックと同じ値を返すように実装する。
+        Compute ramp-related metrics and return them as a dict.
+        This function was previously named `_compute_ramp_debug`. It now
+        returns the same diagnostic values but under a neutral helper name
+        because several metrics are used during training/evaluation.
         """
         dbg_ramp_progress = None
         dbg_ramp_lx = None
