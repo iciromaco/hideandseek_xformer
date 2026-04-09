@@ -18,6 +18,9 @@ rrepo-mirror-filter2.git/
 *.json
 *.pkl
 *.db
+*.pth
+*.bak
+*.zip
 temp*.*
 uv.lock
 
@@ -27,4 +30,5 @@ logs/
 plots/
 plots_new/
 plots_old/
+repo-mirror*/
 
