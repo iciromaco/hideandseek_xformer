@@ -184,6 +184,7 @@ class TeamCosEnv(gym.Env):
                  shared_team_prefix=None,
                  dist_bonus_scale=None,
                  base_reward_scale=None):
+        # print("dist_bonus_scale=", dist_bonus_scale, "base_reward_scale=", base_reward_scale)
         super().__init__()
         self.n_seekers = int(n_seekers)
         self.n_hiders = int(n_hiders)
@@ -1248,7 +1249,6 @@ class TeamCosEnv(gym.Env):
             dist_far_ratio = min(min_seeker_dist / 12.0, 1.0)
             seeker_proximity_penalty = (1.0 - dist_far_ratio)
             dist_bonus = -seeker_proximity_penalty
-
 
         BASE_R = float(self.BASE_REWARD_SCALE)
         BONUS_R = float(self.DIST_BONUS_SCALE) 

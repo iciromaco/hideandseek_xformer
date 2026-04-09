@@ -117,8 +117,8 @@ class TeamCosEnv(gym.Env):
         n = max(len(self._debug_reward_buffer), 1)
         avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
         hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
-        wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
-        print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} WallDist(mean/min/max)={wd_arr.mean():.3f}/{wd_arr.min():.3f}/{wd_arr.max():.3f}")
+        # don't print WallDist when buffer may be empty; show core stats only
+        print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f}")
         self._debug_reward_buffer.clear()
         self._debug_hide_buffer.clear()
         self._debug_wall_distance_buffer.clear()

@@ -312,7 +312,8 @@ ENV_CONFIG = {
     "action_repeat": _cfg("action_repeat", "10", int, RUNTIME_OVERRIDES),
     # allow overriding distance-bonus scale from TOML or runtime overrides
     "dist_bonus_scale": _cfg("dist_bonus_scale", hp.get("dist_bonus_scale", 0.48), float, RUNTIME_OVERRIDES),
-}
+    "base_reward_scale": _cfg("base_reward_scale", hp.get("base_reward_scale", 1.0), float, RUNTIME_OVERRIDES),
+    }
 
 RAMP_CHECK_ENABLED = _cfg("ramp_check_enabled", "0", _to_bool, RUNTIME_OVERRIDES)
 RAMP_CHECK_INTERVAL = _cfg("ramp_check_interval", str(hp.get("save_interval", 50)), int, RUNTIME_OVERRIDES)
@@ -1600,9 +1601,18 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                         out = agent.get_action_and_value(seq)
                     action = out[0].cpu().numpy().reshape(-1)
             else:
-                if env.target == "hider" and getattr(env, "override_learnable_policy", False):
-                    action = env.npcs[env.learnable_agent_key].get_action(obs, idx)
-                else:
+                # If no model is loaded, prefer a rule-based NPC for the learnable agent
+                # when one is available. This ensures the driver doesn't supply a
+                # zero action vector when rule-based control exists.
+                try:
+                    npcs = getattr(env, 'npcs', {}) or {}
+                    if (not model_loaded) and (env.learnable_agent_key in npcs):
+                        action = env.npcs[env.learnable_agent_key].get_action(obs, idx)
+                    elif env.target == "hider" and getattr(env, "override_learnable_policy", False):
+                        action = env.npcs[env.learnable_agent_key].get_action(obs, idx)
+                    else:
+                        action = np.zeros(env.action_space.shape, dtype=np.float32)
+                except Exception:
                     action = np.zeros(env.action_space.shape, dtype=np.float32)
 
             next_obs, base_r, term, trun, info = env.step(action)
@@ -1680,6 +1690,8 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                         "base_reward": float(base_r),
                         "reward": float(reward),
                         "custom_component": float(reward - base_r),
+                        "applied_forward": info.get("applied_forward") if isinstance(info, dict) else None,
+                        "dbg_last_ctrl_f": info.get("dbg_last_ctrl_f") if isinstance(info, dict) else None,
                     }
                 )
 
@@ -1697,7 +1709,8 @@ def run_debug_or_playback(env, agent, device, model_loaded):
         # Print per-step debug summary if we collected logs
         if step_logs:
             try:
-                arr_forward = [s["action"][0] for s in step_logs if s.get("action")]
+                # use the actually applied forward value (from env info) rather than the raw action array
+                arr_forward = [s["applied_forward"] for s in step_logs if s.get("applied_forward") is not None]
                 arr_speed = [s["speed"] for s in step_logs]
                 arr_custom = [s["custom_component"] for s in step_logs]
                 vis_count = sum(1 for s in step_logs if s.get("enemy_visible"))
@@ -1723,7 +1736,12 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                                 pass
                         return v
 
-                    fname = f"debug_step_logs_ep{episode}.jsonl"
+                    out_dir = os.path.join("logs", "debug")
+                    try:
+                        os.makedirs(out_dir, exist_ok=True)
+                    except Exception:
+                        pass
+                    fname = os.path.join(out_dir, f"debug_step_logs_ep{episode}.jsonl")
                     with open(fname, "w") as jf:
                         for s in step_logs:
                             safe = {k: _to_primitive(v) for k, v in (s.items() if isinstance(s, dict) else {})}

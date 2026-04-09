@@ -111,7 +111,11 @@ use_custom_reward = false
 npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 10_000_000
-wandb_run_name = "hider_forRB_100M"
+wandb_run_name = "hider_forRB_10M"
+# dist_bonus_scale = 0.4
+# base_reward_scale = 0.5
+dist_bonus_scale = 0.0
+base_reward_scale = 1.0
 
 [runtime.trainhider_forRB_withC]
 # Train hider against rule-based opponents; with custom reward enabled
@@ -161,7 +165,7 @@ ramp_check_episodes = 1
 ramp_check_steps = 6000
 play_episodes = 1
 num_envs = 1
-	debug_log_interval_steps = 50
+debug_log_interval_steps = 50
 
 ## 学習ベース設定
 [base]
