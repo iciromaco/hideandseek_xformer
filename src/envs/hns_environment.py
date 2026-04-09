@@ -1065,8 +1065,8 @@ class TeamCosEnv(gym.Env):
             seeker_proximity_penalty = 0.2 * (1.0 - dist_far_ratio)
             dist_bonus = -seeker_proximity_penalty
         
-        # team_reward = base + dist_bonus
-        team_reward = 0.0
+        team_reward = base + dist_bonus
+        # team_reward = 0.0
         
         return team_reward, bool(seen_count > 0), bool(learnable_hider_seen)
 

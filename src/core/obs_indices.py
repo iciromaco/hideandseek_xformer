@@ -9,7 +9,19 @@ from typing import Final, List
 
 
 class SelfSchema:
-    """自己情報用スキーマ (5次元固定)"""
+    """自己情報用スキーマ (5次元固定)
+
+    フィールド説明:
+    - `VEL_X`, `VEL_Y`: エージェント基準（body-frame）で表現した重心速度成分。
+      具体的にはワールド座標系の速度をエージェントの向きに対して
+      -rot で回転して得た成分（`VEL_X` は前方成分、`VEL_Y` は左方成分）。
+    - `ROT`: ワールド座標系のヨー角（ラジアン）。
+    - `COS_ROT` / `SIN_ROT`: `cos(ROT)` / `sin(ROT)`。
+
+    注: `VEL_*` は body-frame 表現、`ROT` は world-frame 表現という点で
+    フレームが混在しているので取り扱いに注意すること。
+    """
+
     def __init__(self, start: int = 0):
         self.SLICE: Final = slice(start, start + 5)
         self.VEL_X: Final = start + 0

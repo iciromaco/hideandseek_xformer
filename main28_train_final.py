@@ -1700,22 +1700,17 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                 arr_forward = [s["action"][0] for s in step_logs if s.get("action")]
                 arr_speed = [s["speed"] for s in step_logs]
                 arr_custom = [s["custom_component"] for s in step_logs]
-                arr_det_forward = [s["det_action"][0] for s in step_logs if s.get("det_action")]
-                arr_samp_forward = [s["sampled_action"][0] for s in step_logs if s.get("sampled_action")]
                 vis_count = sum(1 for s in step_logs if s.get("enemy_visible"))
                 nearest_list = [s["nearest_enemy_dist"] for s in step_logs if s.get("nearest_enemy_dist") is not None]
                 import numpy as _np
                 forward_mean = float(_np.mean(arr_forward)) if arr_forward else 0.0
-                det_forward_mean = float(_np.mean(arr_det_forward)) if arr_det_forward else float('nan')
-                samp_forward_mean = float(_np.mean(arr_samp_forward)) if arr_samp_forward else float('nan')
                 speed_mean = float(_np.mean(arr_speed)) if arr_speed else 0.0
                 custom_mean = float(_np.mean(arr_custom)) if arr_custom else 0.0
                 nearest_mean = float(_np.mean(nearest_list)) if nearest_list else float("nan")
                 print(
                     f"[DebugLog] ep={episode} logged_steps={len(step_logs)} forward_mean={forward_mean:.3f} "
                     f"speed_mean={speed_mean:.3f} enemy_vis={vis_count}/{len(step_logs)} "
-                    f"nearest_mean={nearest_mean:.3f} custom_mean={custom_mean:.4f} "
-                    f"det_forward_mean={det_forward_mean:.3f} samp_forward_mean={samp_forward_mean:.3f}"
+                    f"nearest_mean={nearest_mean:.3f} custom_mean={custom_mean:.4f}"
                 )
                 try:
                     def _to_primitive(v):

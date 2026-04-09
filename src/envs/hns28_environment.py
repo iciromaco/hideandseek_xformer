@@ -115,12 +115,11 @@ class TeamCosEnv(gym.Env):
 
         self._debug_step_counter += 1
 
-        # periodic logging
+        # periodic logging (only print stats that are reliably collected)
         if self._debug_step_counter >= self._debug_log_interval:
             avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
             hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
-            wd_arr = np.array(self._debug_wall_distance_buffer, dtype=np.float32) if self._debug_wall_distance_buffer else np.array([0.0])
-            print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f} WallDist(mean/min/max)={wd_arr.mean():.3f}/{wd_arr.min():.3f}/{wd_arr.max():.3f}")
+            print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f}")
             self._debug_reward_buffer.clear()
             self._debug_hide_buffer.clear()
             self._debug_wall_distance_buffer.clear()
@@ -289,6 +288,11 @@ class TeamCosEnv(gym.Env):
         # 可視性キャッシュをデフォルト（すべて False）にリセットします。キーセットは変更しません。
         try:
             self._cached_vis = {}
+            # 内側ループ: 各シーカーがこのハイダーを見ているかを調べる
+            # 注意: 学習対象がシーカーの場合（learnable_agent_key がシーカーである場合）は
+            # 内側ループ内で `learnable_hider_seen` を立てる（学習シーカーがこのハイダーを見ているか）。
+            # 学習対象がハイダーの場合は、内側ループを抜けた後に外側で `seen` を確認して
+            # `learnable_hider_seen` を設定する（このハイダーは任意のシーカーに見られたか）。
             for sk in self.seeker_keys:
                 sid = self._resolve_body_id(sk)
                 for hk in self.hider_keys:
@@ -1228,8 +1232,7 @@ class TeamCosEnv(gym.Env):
         """
         if seen_count == 0:
             base = 1.0
-            # 可視距離が記録されていない場合は直近のワールド距離を猶予として使う
-            dist_ratio = min(min_seeker_dist / 12.0, 1.0)
+            # 可視距離が記録されていない場合は直近のワールド距離を猶予として使う          
             if min_seeker_dist == float("inf"):
                 recent = getattr(self, "_recent_min_seeker_dists", [])
                 recent_has_finite = any((d != float("inf")) for d in recent)
@@ -1237,14 +1240,20 @@ class TeamCosEnv(gym.Env):
                     dist_ratio = min(min_world_dist / 12.0, 1.0)
                 else:
                     dist_ratio = 0.0
-            dist_bonus = float(self.DIST_BONUS_SCALE) * dist_ratio
+            else:
+                dist_ratio = min(min_seeker_dist / 12.0, 1.0)
+            dist_bonus = dist_ratio
         else:
             base = -float(seen_count) / float(len(self.hider_keys))
             dist_far_ratio = min(min_seeker_dist / 12.0, 1.0)
-            seeker_proximity_penalty = float(self.DIST_BONUS_SCALE) * (1.0 - dist_far_ratio)
+            seeker_proximity_penalty = (1.0 - dist_far_ratio)
             dist_bonus = -seeker_proximity_penalty
 
-        team_reward = float(self.BASE_REWARD_SCALE) * base + dist_bonus
+
+        BASE_R = float(self.BASE_REWARD_SCALE)
+        BONUS_R = float(self.DIST_BONUS_SCALE) 
+
+        team_reward = BASE_R * base + BONUS_R * dist_bonus
 
         # 最近の履歴を更新（deque maxlen=3）
         try:
@@ -1284,7 +1293,10 @@ class TeamCosEnv(gym.Env):
         # seeker->hider 可視性を直接計算して、見えているHiderの数と最小距離を求める
         seen_count = 0
         # seeker->hider visibilityがあるペアの中での最小距離（距離ボーナスの算出に使用）
-        min_seeker_dist = float("inf")
+        min_seen_dist = float("inf")
+        # 方向ごとの最小距離を別途収集し、後で優先ルールで決定する
+        min_sk_to_h = float("inf")
+        min_h_to_sk = float("inf")
         # 学習対象のHiderがSeekerから見えているかどうか
         learnable_hider_seen = False 
         for hk in self.hider_keys:
@@ -1320,23 +1332,40 @@ class TeamCosEnv(gym.Env):
                     except Exception:
                         vis_h_sk = False
 
-                # どちらかの方向に視界がある場合に、min_seeker_dist を更新する
-                if vis_h_sk or vis_sk_h:
-                    min_seeker_dist = min(min_seeker_dist, dist)
+                # 各向きごとに最短距離を別々に計算する。
+                # - Seeker->Hider の可視がある場合は min_sk_to_h を更新
+                # - Hider->Seeker の可視がある場合は min_h_to_sk を更新
+                if vis_sk_h:
+                    min_sk_to_h = min(min_sk_to_h, dist)
+                if vis_h_sk:
+                    min_h_to_sk = min(min_h_to_sk, dist)
 
                 if vis_sk_h:
+                    # このハイダーはこのシーカーに見えている
                     seen = True
                     if sk == self.learnable_agent_key:
                         learnable_hider_seen = True
-                    break
+                    # break をせず、他のシーカーもチェックし続ける。
+                    # これにより、より近い（小さい）可視距離を持つシーカーが
+                    # 存在する場合に `min_seeker_dist` を正しく最小化できる。
 
             if seen:
                 seen_count += 1
 
+            # 学習対象がハイダーであれば、外側ループ（このハイダー単位）の結果を反映する
             if hk == self.learnable_agent_key:
                 learnable_hider_seen = bool(seen)
 
-        return self._finalize_team_reward(seen_count, min_seeker_dist, min_world_dist, learnable_hider_seen)
+        # 優先ルール:
+        # - まず Seeker->Hider の可視距離群が存在すればその最小値を使用
+        # - そうでなければ Hider->Seeker の最小値を使用する
+        if min_sk_to_h != float("inf"):
+            min_seen_dist = min_sk_to_h
+        else:
+            min_seen_dist = min_h_to_sk
+
+        return self._finalize_team_reward(seen_count, min_seen_dist, min_world_dist, learnable_hider_seen)
+
 
     # --- 可視性計算の実装 ---
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
@@ -1472,6 +1501,10 @@ class TeamCosEnv(gym.Env):
         bid = self._resolve_body_id(ak)
         ps, rv = d.xpos[bid], float(d.qpos[m.jnt_qposadr[self.qpos_indices[ak]['rot']]])
         vax, vay = m.jnt_dofadr[self.qpos_indices[ak]['x']], m.jnt_dofadr[self.qpos_indices[ak]['y']]
+        # 注意: ここではワールド座標系の速度をエージェント基準（body-frame）に回転している。
+        # 具体的には速度ベクトルを -rv で回転させ、前方/左方成分を得る。
+        # そのため o[si.VEL_X] はエージェント前方向成分（正=前）、o[si.VEL_Y] は左方向成分（正=左）を表す。
+        # 一方で o[si.ROT] はワールド座標系のヨー角（rv）をそのまま格納する（ラジアン）。
         cos_r, sin_r = math.cos(-rv), math.sin(-rv)
         si = self.idx.SELF
         o[si.VEL_X] = d.qvel[vax] * cos_r - d.qvel[vay] * sin_r
