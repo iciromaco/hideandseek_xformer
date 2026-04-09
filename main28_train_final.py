@@ -1243,6 +1243,9 @@ def run_train_vector(
                         float(RW_HIDE_SEEKER_GAZE_PENALTY),
                         float(RW_SEEK_GAZE_REWARD),
                     )
+                else:
+                    # when not using custom reward, use the base reward batch prepared earlier
+                    reward_np = reward_batch_for_numba
                 reward_compute_sec_sum += time.perf_counter() - reward_t0
 
                 global_step += num_envs
@@ -2009,7 +2012,6 @@ def run():
         try:
             return run_human_mode(_resolve_runtime_target())
         except Exception as exc:
-            import traceback
             print("run_human_mode failed with exception:")
             traceback.print_exc()
             return 2
