@@ -1,0 +1,269 @@
+# hparams_main27.toml
+# 実行時プロファイル選択（train / debug）
+[runtime]
+active_profile = "train"
+
+# runtime.common: train/debug 共通の実行設定
+[runtime.common]
+# 環境構成
+num_seekers = 1
+num_hiders = 2
+num_boxes = 2
+num_ramps = 1
+# 1観測あたりのアクション繰り返し回数
+action_repeat = 10
+# MODE4（HybridSphere）用の静的SDFグリッド解像度[m]
+mode4_sdf_cell_size = 0.05
+# デバッグ表示
+show_turn_lines = false
+# policy_source ログ制御（大量ログ抑制）
+policy_source_log = false
+policy_source_log_each_reset = false
+debug_log_interval_steps = 200
+# 全エージェントでモデルを共有するランタイムフラグ（true にすると set_shared_team_policy_state を利用）
+shared_team_policy = true
+# 報酬・評価系
+use_custom_reward = true
+# 前進飽和抑制（常時前進ボーナスは使わない）
+rw_move_sat_penalty = 0.02
+# 壁張り付き対策（全エージェント共通）
+rw_wall_stick_penalty = 0.15
+agent_head_clearance = 0.2  # 壁近判定閾値（全エージェント共通）
+wall_near_margin = 0.4  # 壁近マージン（エージェント表面からの近接閾値）
+rw_still_speed_threshold = 0.1  # 静止判定速度閾値（全エージェント共通）
+rw_hide_visible_near_penalty = 0.05
+rw_hide_seeker_gaze_penalty = 0.03
+rw_seek_gaze_reward = 0.03
+rw_wall_avoid_penalty = 0.15
+ramp_check_enabled = false
+ramp_check_viewer = false
+ramp_check_force_uphill = false
+ramp_check_episodes = 3
+ramp_check_steps = 220
+# 実行基盤
+wandb_enabled = true
+num_envs = 10
+
+# 速度・移動関連閾値
+move_sat_threshold = 1.0
+turn_sat_threshold = 1.0
+idle_speed_threshold = 0.1
+move_incentive_speed_threshold = 0.3
+
+# runtime.trainseeker_forRB: 学習向け設定 Seeker
+# ルールベースHider相手にSeekerを学習させる
+[runtime.trainseeker_forRB]
+train_mode = true
+use_viewer = false
+training_target = "seeker"
+train_other_hider_policy = "rule"
+train_other_seeker_policy = "rule"
+use_custom_reward = false
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "seeker_forRB_10M"
+
+# runtime.trainseeker_forRB_withC: 学習向け設定 Seeker
+# ルールベースHider相手にSeekerを学習させる
+[runtime.trainseeker_forRB_withC]
+train_mode = true
+use_viewer = false
+training_target = "seeker"
+train_other_hider_policy = "rule"
+train_other_seeker_policy = "rule"
+use_custom_reward = true
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "seeker_forRB_10M"
+
+# runtime.trainhider: 学習向け設定
+# ルールベースまたはモデルベースSeeker相手のHiderの学習
+[runtime.train]
+train_mode = true
+use_viewer = false
+training_target = "hider"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "hider_10M"
+
+[runtime.optuna]
+train_mode = true
+use_viewer = false
+training_target = "hider"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 30000
+wandb_run_name = "wall_only_confirm_1M"
+
+# runtime.debug: 再生/検証向け設定
+[runtime.debug]
+train_mode = false
+debug_hider_policy = "model_if_available"
+debug_seeker_policy = "model_if_available"
+# model_policy_deterministic = true
+debug_symmetric_hider_policy = false
+npc_only_debug = false
+# play_episodes = 100
+auto_tune_hparams = false
+play_episodes = 1
+num_envs = 1
+debug_log_interval_steps = 200
+
+
+# Human 操作モード: 手動ビューワでの検証用プロファイル
+[runtime.human]
+train_mode = false
+use_viewer = true
+training_target = "seeker"
+# デフォルトはモデルがあればモデル、それ以外はルールベースで検証
+debug_hider_policy = "rule"
+debug_seeker_policy = "model_if_available"
+# ランプ確認関連を有効化して手動で上り検証
+ramp_check_enabled = true
+ramp_check_viewer = true
+ramp_check_force_uphill = true
+ramp_check_episodes = 1
+ramp_check_steps = 600
+play_episodes = 1
+num_envs = 1
+debug_log_interval_steps = 50
+
+# When true, the learnable agent will accept external/manual actions continuously
+# while this profile is active. This enables persistent teleoperation from the viewer.
+human_mode = true
+
+# Human（キーボード）操作設定: 矢印キーで手動操作できるようにする
+# アプリ側でこのフラグを参照してキーボード入力ハンドラを有効化してください
+human_control = true
+human_control_scheme = "keyboard"
+# 操作スケール（必要に応じて調整）
+human_action_repeat = 1
+# キー割り当て（参考）: Up/Down = 前進/後退, Left/Right = 回転
+# 実際のバインドは viewer 側の実装がこれらの設定を参照して行います
+
+# runtime.train1: Viewer 表示ありの学習環境
+[runtime.train1]
+train_mode = true
+use_viewer = true
+training_target = "hider"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 100_000_000
+wandb_run_name = "train1"
+num_envs = 1
+
+# runtime.trainseeker: 学習向け設定 Seeker
+[runtime.trainseeker]
+train_mode = true
+use_viewer = false
+training_target = "seeker"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "wall_only_confirm_10M"
+
+[base]
+# 隠れ層
+hidden_dim = 256
+# シーケンス長
+seq_len = 16
+# 総ステップ数
+total_timesteps = 500000
+# 1回のロールアウト長
+rollout_steps = 128
+# 1更新あたりの学習エポック数
+update_epochs = 4
+# ミニバッチサイズ（rollout_steps の約数推奨）
+minibatch_size = 64
+# 学習率
+learning_rate = 3.0e-4
+# 割引率
+gamma = 0.995
+# GAE λ
+gae_lambda = 0.95
+# PPOクリップ係数
+clip_coef = 0.20
+# Value loss 係数
+vf_coef = 0.5
+# Entropy 係数（探索強度）
+ent_coef = 0.001
+# --- スケジューリング設定 ---
+ent_coef_schedule = "linear"
+ent_coef_final = 0.0001
+learning_rate_schedule = "linear"
+learning_rate_final = 0.00005
+# 勾配クリップ
+max_grad_norm = 0.5
+# ログ/保存間隔（update単位）
+log_interval = 10
+save_interval = 50
+
+# defaults.<team>: team別の自動調整デフォルト
+[defaults.seeker]
+learning_rate = 2.2e-4
+clip_coef = 0.18
+ent_coef = 6.0e-4
+update_epochs = 4
+
+[defaults.hider]
+learning_rate = 2.0e-4
+clip_coef = 0.20
+ent_coef = 2.0e-3
+update_epochs = 6
+
+# presets.<team>.<env_signature>: 環境構成シグネチャごとの固定プリセット
+# env_signature 形式: s{seekers}_h{hiders}_b{boxes}_r{ramps}
+[presets.seeker.s1_h2_b2_r1]
+total_timesteps = 600000
+rollout_steps = 192
+update_epochs = 5
+minibatch_size = 96
+learning_rate = 2.0e-4
+clip_coef = 0.17
+ent_coef = 6.0e-4
+log_interval = 5
+save_interval = 25
+
+[presets.seeker.s2_h3_b2_r3]
+total_timesteps = 900000
+rollout_steps = 256
+update_epochs = 4
+minibatch_size = 128
+learning_rate = 1.7e-4
+clip_coef = 0.18
+ent_coef = 7.0e-4
+log_interval = 5
+save_interval = 25
+
+[presets.hider.s1_h2_b2_r1]
+total_timesteps = 700000
+rollout_steps = 192
+update_epochs = 6
+minibatch_size = 96
+learning_rate = 1.8e-4
+clip_coef = 0.20
+ent_coef = 2.2e-3
+log_interval = 5
+save_interval = 25
+
+[presets.hider.s2_h3_b2_r3]
+total_timesteps = 1000000
+rollout_steps = 256
+update_epochs = 6
+minibatch_size = 128
+learning_rate = 1.6e-4
+clip_coef = 0.20
+ent_coef = 2.4e-3
+log_interval = 5
+save_interval = 25

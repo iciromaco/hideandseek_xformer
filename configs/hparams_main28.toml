@@ -1,0 +1,243 @@
+## hparams_main28.toml — 整理版
+
+## 実行プロファイル
+[runtime]
+active_profile = "train"
+
+## 共通設定 (train / debug など共通で使う値)
+
+[runtime.common]
+# environment
+action_repeat = 10
+mode4_sdf_cell_size = 0.05
+show_turn_lines = false
+
+# logging / debug
+debug_log_interval_steps = 200
+wandb_enabled = true
+num_envs = 10
+
+# policy / runtime flags
+shared_team_policy = true
+use_custom_reward = true
+
+# physics / geometry
+agent_head_clearance = 0.2
+wall_near_margin = 0.4
+wall_safe = 1.0
+
+# speed thresholds
+idle_speed_threshold = 0.1
+move_incentive_speed_threshold = 0.3
+move_sat_threshold = 1.0
+turn_sat_threshold = 1.0
+
+# distance scaling
+
+## 報酬系（学習側のカスタム報酬を簡潔にまとめる）
+[rewards]
+rw_move_ctrl_cost = 0.001
+rw_move_incentive = 0.02
+rw_move_sat_penalty = 0.02
+rw_hide_visible_near_penalty = 0.05
+rw_hide_seeker_gaze_penalty = 0.03
+rw_seek_gaze_reward = 0.03
+rw_seek_visible_bonus = 0.05
+
+## runtime プロファイル定義
+[runtime.train]
+train_mode = true
+use_viewer = false
+training_target = "hider"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+wandb_run_name = "hider_10M"
+
+[runtime.trainseeker]
+train_mode = true
+use_viewer = false
+training_target = "seeker"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "wall_only_confirm_10M"
+
+[runtime.trainseeker_forRB]
+train_mode = true
+use_viewer = false
+training_target = "seeker"
+train_other_hider_policy = "rule"
+train_other_seeker_policy = "rule"
+use_custom_reward = false
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "seeker_forRB_100M"
+
+[runtime.trainseeker_forRB_withC]
+train_mode = true
+use_viewer = false
+training_target = "seeker"
+train_other_hider_policy = "rule"
+train_other_seeker_policy = "rule"
+use_custom_reward = true
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "seeker_forRB_10M"
+
+[runtime.ruleonly]
+# Monitor rule-based agents in default env signature (s1_h2_b2_r1)
+train_mode = false
+use_viewer = true
+debug_hider_policy = "rule"
+debug_seeker_policy = "rule"
+play_episodes = 1
+num_envs = 1
+debug_log_interval_steps = 50
+
+[runtime.trainhider_forRB]
+# Train hider against rule-based opponents; no custom reward
+train_mode = true
+use_viewer = false
+training_target = "hider"
+train_other_hider_policy = "rule"
+train_other_seeker_policy = "rule"
+use_custom_reward = false
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "hider_forRB_100M"
+
+[runtime.trainhider_forRB_withC]
+# Train hider against rule-based opponents; with custom reward enabled
+train_mode = true
+use_viewer = false
+training_target = "hider"
+train_other_hider_policy = "rule"
+train_other_seeker_policy = "rule"
+use_custom_reward = true
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "hider_forRB_10M"
+
+[runtime.optuna]
+train_mode = true
+use_viewer = false
+training_target = "hider"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 30_000
+wandb_run_name = "wall_only_confirm_1M"
+
+[runtime.debug]
+train_mode = false
+debug_hider_policy = "model_if_available"
+debug_seeker_policy = "model_if_available"
+debug_symmetric_hider_policy = false
+npc_only_debug = false
+auto_tune_hparams = false
+play_episodes = 1
+num_envs = 1
+debug_log_interval_steps = 200
+
+[runtime.human]
+train_mode = false
+use_viewer = true
+training_target = "seeker"
+debug_hider_policy = "rule"
+debug_seeker_policy = "model_if_available"
+ramp_check_enabled = true
+ramp_check_viewer = true
+ramp_check_force_uphill = true
+ramp_check_episodes = 1
+ramp_check_steps = 6000
+play_episodes = 1
+num_envs = 1
+	debug_log_interval_steps = 50
+
+## 学習ベース設定
+[base]
+hidden_dim = 256
+seq_len = 16
+total_timesteps = 500_000
+rollout_steps = 128
+update_epochs = 4
+minibatch_size = 64
+learning_rate = 3.0e-4
+gamma = 0.995
+gae_lambda = 0.95
+clip_coef = 0.20
+vf_coef = 0.5
+ent_coef = 0.001
+ent_coef_schedule = "linear"
+ent_coef_final = 0.0001
+learning_rate_schedule = "linear"
+learning_rate_final = 0.00005
+max_grad_norm = 0.5
+log_interval = 10
+save_interval = 50
+
+[defaults.seeker]
+learning_rate = 2.2e-4
+clip_coef = 0.18
+ent_coef = 6.0e-4
+update_epochs = 4
+
+[defaults.hider]
+learning_rate = 2.0e-4
+clip_coef = 0.20
+ent_coef = 2.0e-3
+update_epochs = 6
+
+## プリセット（環境シグネチャごと）
+[presets.seeker.s1_h2_b2_r1]
+total_timesteps = 600_000
+rollout_steps = 192
+update_epochs = 5
+minibatch_size = 96
+learning_rate = 2.0e-4
+clip_coef = 0.17
+ent_coef = 6.0e-4
+log_interval = 5
+save_interval = 25
+
+[presets.seeker.s2_h3_b2_r3]
+total_timesteps = 900_000
+rollout_steps = 256
+update_epochs = 4
+minibatch_size = 128
+learning_rate = 1.7e-4
+clip_coef = 0.18
+ent_coef = 7.0e-4
+log_interval = 5
+save_interval = 25
+
+[presets.hider.s1_h2_b2_r1]
+total_timesteps = 700_000
+rollout_steps = 192
+update_epochs = 6
+minibatch_size = 96
+learning_rate = 1.8e-4
+clip_coef = 0.20
+ent_coef = 2.2e-3
+log_interval = 5
+save_interval = 25
+
+[presets.hider.s2_h3_b2_r3]
+total_timesteps = 1_000_000
+rollout_steps = 256
+update_epochs = 6
+minibatch_size = 128
+learning_rate = 1.6e-4
+clip_coef = 0.20
+ent_coef = 2.4e-3
+log_interval = 5
+save_interval = 25

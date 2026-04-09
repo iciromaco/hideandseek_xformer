@@ -1,0 +1,29 @@
+# Manual TOML for ramp climb manual verification
+[runtime]
+active_profile = "debug"
+
+[runtime.common]
+num_seekers = 1
+num_hiders = 2
+num_boxes = 2
+num_ramps = 1
+action_repeat = 10
+ramp_check_enabled = true
+ramp_check_viewer = true
+ramp_check_force_uphill = true
+ramp_check_episodes = 1
+ramp_check_steps = 600
+wandb_enabled = false
+num_envs = 1
+debug_log_interval_steps = 50
+
+[runtime.debug]
+train_mode = false
+use_viewer = true
+debug_hider_policy = "model_if_available"
+debug_seeker_policy = "model_if_available"
+play_episodes = 1
+
+[base]
+hidden_dim = 256
+seq_len = 16

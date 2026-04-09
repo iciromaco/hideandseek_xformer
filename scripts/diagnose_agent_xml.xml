@@ -1,0 +1,85 @@
+
+<mujoco>
+  <option gravity="0 0 -9.81" timestep="0.005"/>
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1=".1 .2 .3" rgb2=".2 .3 .4" width="300" height="300"/>
+    <material name="grid" texture="grid" texrepeat="1 1" reflectance="0.2"/>
+    <mesh name="ramp_mesh" 
+          vertex="-0.6666 -0.5 0.0 0.6666 -0.5 0.0 0.6666 -0.5 1.0 -0.6666 0.5 0.0 0.6666 0.5 0.0 0.6666 0.5 1.0"
+          face="0 1 2 3 5 4 0 3 4 0 4 1 1 4 5 1 5 2 2 5 3 2 3 0"/>
+  </asset>
+  <worldbody>
+    <light pos="0 0 12" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <camera name="overview" pos="0 13 13" euler="2.35 0 -3.14" mode="fixed" />
+        
+    <geom name="floor" type="plane" size="6.0 6.0 0.1" material="grid" friction="1.1 0.15 0.003"/>
+    <geom name="wall_n" type="box" size="6.15 0.1 2.0" pos="0 6.1 2.0" rgba="0.65 0.65 0.65 0.35" friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"/>
+    <geom name="wall_s" type="box" size="6.15 0.1 2.0" pos="0 -6.1 2.0" rgba="0.65 0.65 0.65 0.35" friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"/>
+    <geom name="wall_e" type="box" size="0.1 6.0 2.0" pos="6.1 0 2.0" rgba="0.65 0.65 0.65 0.35" friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"/>
+    <geom name="wall_w" type="box" size="0.1 6.0 2.0" pos="-6.1 0 2.0" rgba="0.65 0.65 0.65 0.35" friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"/>
+    <geom name="maze_w0" type="box" size="1.5 0.2 0.5" pos="3.0 1.5 0.5" rgba="0 0.7 0.7 1" friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"/>
+    <geom name="maze_w1" type="box" size="1.5 0.2 0.5" pos="-3.0 -1.5 0.5" rgba="0 0.7 0.7 1" friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"/>
+    <geom name="maze_w2" type="box" size="0.2 1.5 0.5" pos="0.0 -3.0 0.5" rgba="0 0.7 0.7 1" friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"/>
+    <geom name="maze_w3" type="box" size="0.2 1.5 0.5" pos="0.0 3.0 0.5" rgba="0 0.7 0.7 1" friction="0.05 0.05 0.05" solref="0.01 1" solimp="0.95 0.99 0.001"/>
+ 
+        <body name="ramp1_body" pos="0 0 0" quat="1.000000 0 0 0.000000">
+            <inertial pos="0.3 0 0.25" mass="60.0" diaginertia="10 10 20"/>
+            <joint type="free" name="ramp1_joint" damping="90.0"/>
+            <geom name="ramp1_geom" type="mesh" mesh="ramp_mesh" contype="0" conaffinity="0" rgba="0 1 0 1"/>
+            <geom name="ramp1_slope_surface" type="box" size="0.8333 0.5 0.02" pos="0 0 0.516" euler="0 -36.87 0" rgba="0 1 0 0.3" friction="1.35 0.22 0.01"/>
+            <geom name="ramp1_back_panel" type="box" size="0.02 0.5 0.5" pos="0.6666 0 0.5" rgba="0 1 0 0.3" friction="1.35 0.22 0.01"/>
+            <geom name="ramp1_inner_weight" type="box" size="0.3333 0.5 0.25" pos="0.3333 0 0.25" rgba="0 1 0 0.3" mass="30.0" solimp="0.95 0.99 0.001" friction="1.35 0.22 0.01"/>
+    </body> 
+    <body name="box1_body" pos="0 0 0.5" quat="1.000000 0 0 0.000000">
+            <joint name="box1_joint" type="free" damping="28.0"/>
+            <geom name="box1_geom" type="box" size="0.6 0.6 0.5" mass="22.0" rgba="0.75 0.55 0.3 1" friction="1.2 0.08 0.003"/>
+    </body>
+    <body name="box2_body" pos="0 0 0.5" quat="1.000000 0 0 0.000000">
+            <joint name="box2_joint" type="free" damping="28.0"/>
+            <geom name="box2_geom" type="box" size="0.6 0.6 0.5" mass="22.0" rgba="0.75 0.55 0.3 1" friction="1.2 0.08 0.003"/>
+    </body> 
+        <body name="s_anchor" pos="0 0 0.6" quat="1.000000 0 0 0.000000">
+    <joint name="s_x" type="slide" axis="1 0 0" damping="30.0"/>
+    <joint name="s_y" type="slide" axis="0 1 0" damping="30.0"/>
+    <joint name="s_z" type="slide" axis="0 0 1" damping="16.0" limited="true" range="-0.7 1.2"/>
+      <joint name="s_rot" type="hinge" axis="0 0 1" damping="25.0"/>
+            <body name="s_body">
+                <site name="s_thrust" pos="0 0 0"/>
+                <!-- Temporary: capsule-only for grounding/COM experiments -->
+                <geom name="s_capsule" type="capsule" size="0.3 0.3" rgba="0.75 0.1 0.1 1" mass="4" friction="1.2 0.12 0.003"/>
+            </body>
+    </body> 
+        <body name="h1_anchor" pos="0 0 0.6" quat="1.000000 0 0 0.000000">
+    <joint name="h1_x" type="slide" axis="1 0 0" damping="30.0"/>
+    <joint name="h1_y" type="slide" axis="0 1 0" damping="30.0"/>
+    <joint name="h1_z" type="slide" axis="0 0 1" damping="16.0" limited="true" range="-0.7 1.2"/>
+      <joint name="h1_rot" type="hinge" axis="0 0 1" damping="25.0"/>
+            <body name="h1_body">
+                <site name="h1_thrust" pos="0 0 0"/>
+                <!-- Temporary: capsule-only for grounding/COM experiments -->
+                <geom name="h1_capsule" type="capsule" size="0.3 0.3" rgba="0.35 0.7 1.0 1" mass="4" friction="1.2 0.12 0.003"/>
+            </body>
+    </body>
+        <body name="h2_anchor" pos="0 0 0.6" quat="1.000000 0 0 0.000000">
+    <joint name="h2_x" type="slide" axis="1 0 0" damping="30.0"/>
+    <joint name="h2_y" type="slide" axis="0 1 0" damping="30.0"/>
+    <joint name="h2_z" type="slide" axis="0 0 1" damping="16.0" limited="true" range="-0.7 1.2"/>
+      <joint name="h2_rot" type="hinge" axis="0 0 1" damping="25.0"/>
+            <body name="h2_body">
+                <site name="h2_thrust" pos="0 0 0"/>
+                <!-- Temporary: capsule-only for grounding/COM experiments -->
+                <geom name="h2_capsule" type="capsule" size="0.3 0.3" rgba="0.1 0.6000000000000001 0.9 1" mass="4" friction="1.2 0.12 0.003"/>
+            </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <general name="s_fwd" site="s_thrust" gear="1 0 0 0 0 0" gainprm="700" ctrlrange="-1 1"/>
+    <general name="s_turn" joint="s_rot" gear="0.5" gainprm="120" ctrlrange="-1 1"/>
+
+    <general name="h1_fwd" site="h1_thrust" gear="1 0 0 0 0 0" gainprm="700" ctrlrange="-1 1"/>
+    <general name="h1_turn" joint="h1_rot" gear="0.5" gainprm="120" ctrlrange="-1 1"/>
+
+    <general name="h2_fwd" site="h2_thrust" gear="1 0 0 0 0 0" gainprm="700" ctrlrange="-1 1"/>
+    <general name="h2_turn" joint="h2_rot" gear="0.5" gainprm="120" ctrlrange="-1 1"/>
+</actuator>
+</mujoco>

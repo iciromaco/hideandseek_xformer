@@ -1,0 +1,31 @@
+"""
+Backup copy of main27_train_final.py (saved before restoring from main28)
+"""
+
+import sys
+import os
+import time
+import argparse
+import traceback
+import numpy as np
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from src.core.constants import P_SCALE
+import gymnasium as gym
+from functools import partial
+from numba import njit, prange
+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import toml as tomllib  # pip install toml
+
+try:
+    import wandb
+except Exception as exc:
+    print(f"Exception in wandb import: {exc}")
+    wandb = None
+
+# This file is a plain copy of main27_train_final.py.bak content saved as a safety backup.

@@ -1,0 +1,95 @@
+HideAndSeek_Transformer プロジェクト引き継ぎ資料
+1. プロジェクト概要と進捗
+MuJoCo物理エンジンを用いた「2 Hiders vs 1 Seeker（かくれんぼ）」のマルチエージェント強化学習環境において、PPO + Transformerを用いたエージェントを育成・共進化させるプロジェクト。
+
+演習の変遷
+第14-16回 (main15.py): LSTM版PPOの実装。環境構築（壁、スロープ、箱、ロック機能）と共進化基盤の確立。
+第17回: 記憶メカニズムをLSTMからTransformer (Encoder-only) へ刷新。
+第18回 (main18_optimization.py):
+最適化: ゼロコピーバッファ、視界判定キャッシュ、環境依存並列化を実装しSPSを改善。
+感度分析: 環境ごとの最適パラメータを特定（SEQ_LEN=8, HIDDEN=64など）。
+安定化: 継続学習（チェックポイント）機能の実装、ログ出力の適正化。
+第19回 (main19_reward_optimization.py):
+報酬最適化: Optunaを用いて、エピソード長（生存時間）を最大化する報酬パラメータを自動探索するスクリプト。
+第20回 (main20_behavior_analysis.py):
+行動分析: 学習済みモデルの挙動（ヒートマップ、距離推移など）を可視化するツール。
+第21回 (main21_layer0_runner.py):
+基礎行動（Layer 0）: 「まずは敵から逃げる」能力を確実に獲得させるための特化型学習スクリプト。SB3を使わずmain18の資産を継承して実装。
+2. 現在の技術スタックと動作環境
+言語/FW: Python 3.x, PyTorch, Gymnasium, Stable-Baselines3 (参考), MuJoCo
+環境依存制御:
+Windows (Intel/AMD): 環境変数 OMP_NUM_THREADS=1 等を設定し、CPU競合を回避。
+Mac (Apple Silicon): 環境変数の制限を行わない方が高速であるため、制限をスキップ。
+3. 決定事項と設計思想
+軽量Transformer: 感度分析に基づき HIDDEN_DIM=64, LAYERS=2, HEADS=2, SEQ_LEN=8 を採用。
+ObsHistoryのゼロコピー化: リングバッファのダブルバッファリングにより torch.cat を排除し高速化。
+視界判定のキャッシュ: 重いRayCastをFOV判定と分離し、微小移動（<5cm）時は前回の結果を再利用。
+エピソード境界: done=True 時にバッファをゼロクリアせず、文脈を維持したまま上書きする。
+公平な比較: パラメータ探索時は LOAD_EXISTING_MODELS=False, FIXED_SEED=1 とする。
+4. 【重要】過去のトラブルと解決策（Lessons Learned）
+※再発防止のため厳守
+
+WandBログ切れ: エピソードごとの生データ記録はデータ数が膨大になるため廃止。「更新（Update）ごとの平均値」のみを記録する。
+継続学習のSPS異常: global_step を引き継ぐ際、経過時間で単純に割るとSPSが異常値になる。(current_step - start_step) / elapsed_time で計算する。
+Viewerモードのクラッシュ: USE_VIEWER=True 時は環境数が強制的に1になる。コード内の NUM_ENVS 定数ではなく、動的に設定される actual_num_envs を使用する。
+Transformerの警告: 固定長シーケンスの場合 enable_nested_tensor=True は不要かつ警告が出るため、明示的に False にする。
+パラメータ置換のバグ (main19): re.sub で数値を置換する際は r"1" ではなく r"g<1>" を使用する。
+モデル破壊 (main19): refinement モードでモデル名を変えない場合、終了時に上書きされてしまう。スクリプト内で torch.save をコメントアウトする処理を入れる。
+構文エラー (main19): 単純な置換でインデントが崩れることがあるため、ブロックごとのコメントアウトではなく pass 等で構文を維持する。
+5. 主要ファイル構成
+main18_optimization.py: ベースとなる学習スクリプト（v18.62）。
+main19_reward_optimization.py: Optuna自動探索スクリプト（v2.4）。
+main20_behavior_analysis.py: 行動分析・可視化スクリプト（v20.2）。
+main21_layer0_runner.py: 逃走行動特化の学習スクリプト（v21.12）。
+HideAndSeek_Transformer 開発継続用マスターガイド
+1. プロジェクト概要
+MuJoCo物理エンジンを用いた「2 Hiders vs 1 Seeker（かくれんぼ）」のマルチエージェント強化学習プロジェクト。
+
+アルゴリズム: PPO + Transformer (Encoder-only)
+環境: Gymnasiumベースのカスタム環境 (main18_optimization.py を基盤とする)
+フェーズ: 第23回実験（Layer 2: チーム戦略と視界勾配報酬）
+2. 厳守すべきコーディング規約（プロンプト・コントラクト）
+新しいコードを生成する際は、以下のルールを必ず守ること。これらは過去のランタイムエラーやSPS低下を回避するために確立された「最適解」である。
+
+A. 構文とスタイル
+1行1ステートメントの原則: if 文や for ループ、代入処理を1行にまとめない。
+セミコロン (;) の完全排除: Pythonの構文エラーを避けるため、ステートメントの区切りにセミコロンを絶対に使用しない。
+複数行への完全展開: if agent_id == 0: ... などの短い分岐も、必ずコロンの後に改行してインデントすること。
+詳解日本語コメント: 各ロジックの物理的・数学的背景、配列インデックスの意味を日本語で詳細に記述すること。
+B. パフォーマンス最適化 (SPS 1400+ の維持)
+ゼロアロケーション観測生成: np.concatenate や np.array() の動的生成をホットループ内で禁止。obs_prealloc.copy() へのスライス代入 (obs[start:end] = val) を徹底する。
+徹底したメモ化: _get_obs は (agent_id, skip_lidar) をキーとして、同一物理ステップ内の再計算を完全にスキップする。
+ObsHistory (ダブルバッファリング): 履歴バッファを2倍（seq_len * 2）確保し、2箇所に同時書き込みすることで、読み出し時の roll や cat を排除（スライス View のみで取得）。
+二乗距離判定: キャッシュ判定や AI の到達判定に np.linalg.norm (平方根) を使わず、二乗距離比較 (dx*dx + dy*dy < threshold_sq) を行う。
+3. 観測ベクトル仕様 (全53次元)
+エージェントに与えられる情報のインデックス構成。
+
+00-04: 自身 [ローカル速度(2), 角度(1), cos(1), sin(1)]
+05-16: Lidar [12方向の距離]
+17-24: Box 1 [相対位置(2), 相対速度(2), cos(1), sin(1), ロック状態(1), 可視フラグ(1)]
+25-32: Box 2 [Box 1 と同様]
+33-39: Ramp [相対位置(2), 相対速度(2), cos(1), sin(1), 可視フラグ(1)]
+40-44: 敵 (Seeker/Hider) [相対位置(2), 相対速度(2), 可視フラグ(1)]
+45-51: 味方 (Hider) [相対位置(2), 相対速度(2), cos(1), sin(1), 可視フラグ(1)]
+52: ステータス [掴み状態(1)]
+不可視マスク: オブジェクトが見えない時は、位置・速度を 0.0 ではなく 2.0 (遠方マスク) に設定し、可視フラグのみ 0.0 とする。
+
+4. 報酬とエピソード設計
+固定長エピソード: 捕獲されても終了せず、MAX_STEPS = 300 まで継続（リカバリー学習のため）。
+視界勾配報酬:
+隠蔽中: +REWARD_HIDDEN_BONUS
+視認中: -cos(theta) * COS_PENALTY_SCALE (シーカーの真正面ほど大ダメージ)
+チーム共有報酬: チーム報酬 = $R_{Hider1} + R_{Hider2}$。相棒の失敗も自分の責任とする。
+客観的指標: Optuna の最適化目標は「報酬」ではなく「生存ステップ数 (Hidden:)」に設定（報酬ハッキング防止）。
+5. 現在のファイル構成
+main18_optimization.py: 基盤となる Agent クラス等の定義。
+main23_runner_cos.py: Layer 2 最適化版学習スクリプト (最新版 v25.64)。
+main23_optuna_search.py: Hiddenステップ数を目標としたパラメータ探索スクリプト。
+main23_analysis.py: 探索結果の感度解析ツール。
+6. 既知のバグと対策 (Lessons Learned)
+TypeError: mj_ray の戻り値をアンパックする際は、キャッシュヒット時も必ず (hit_id, dist) のタプルを返すこと。
+Hidden: nan: AsyncVectorEnv 経由で統計を取る際は、final_info のリスト内を走査して episode と hidden_steps を同期して抽出すること。
+エントロピー消失: 最適化中に ent_coef のログ記録が省かれないよう注意。
+7. 次のタスク
+現在の報酬パラメータでの学習曲線の安定性確認。
+Seeker 側の AI をルールベースから学習モデル (refinement) に切り替えた共進化の開始。

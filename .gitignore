@@ -1,0 +1,30 @@
+runs/ 
+wandb/ 
+__pycache__/  
+*.py[cod]
+optuna_temp/ 
+sensitivity_results/
+sensitivity_results_multiseed/
+optuna_temp/
+trial_initial_???/
+tiial_refinement_???/
+trial???/
+optuna_results/trial_*/*
+checkpoints/
+# 作業フォルダ
+repo-mirror.git/
+rrepo-mirror-filter2.git/
+*.pt
+*.json
+*.pkl
+*.db
+temp*.*
+uv.lock
+
+# User-requested ignores
+tests/
+logs/
+plots/
+plots_new/
+plots_old/
+
