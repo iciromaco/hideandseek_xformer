@@ -77,6 +77,8 @@ npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 10_000_000
 wandb_run_name = "seeker_forRB_100M"
+dist_bonus_scale = 1.0
+base_reward_scale = 0.0
 
 [runtime.trainseeker_forRB_withC]
 train_mode = true

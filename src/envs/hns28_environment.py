@@ -234,8 +234,8 @@ class TeamCosEnv(gym.Env):
             else:
                 ens.sort(key=lambda k: (0 if k.startswith("s") else 1, k))
             self._ens_orderings[ak] = ens
-        # keep a short history (last 3) of recent min seeker distances
-        # so we can apply a grace period when visibility is temporarily lost.
+        # keep a short history (last 3) of hider->seeker visible distances only.
+        # used for a short grace period when visibility is temporarily lost.
         self._recent_min_seeker_dists = deque(maxlen=3)
 
         self.model = mujoco.MjModel.from_xml_string(self._build_dynamic_xml())
@@ -1226,15 +1226,15 @@ class TeamCosEnv(gym.Env):
         return obs, reward, False, done, info
 
     # --- 報酬計算の実装 ---
-    def _finalize_team_reward(self, seen_count, min_seeker_dist, min_world_dist, learnable_hider_seen):
+    def _finalize_team_reward(self, seen_count, min_seen_dist, min_world_dist, min_hider_view_dist, learnable_hider_seen):
         """Common tail for team reward computation.
 
         Returns (team_reward, any_seen, learnable_hider_seen)
         """
         if seen_count == 0:
             base = 1.0
-            # 可視距離が記録されていない場合は直近のワールド距離を猶予として使う          
-            if min_seeker_dist == float("inf"):
+            # hider->seeker 可視距離が記録されていない場合は直近のワールド距離を猶予として使う
+            if min_hider_view_dist == float("inf"):
                 recent = getattr(self, "_recent_min_seeker_dists", [])
                 recent_has_finite = any((d != float("inf")) for d in recent)
                 if recent_has_finite and min_world_dist != float("inf"):
@@ -1242,11 +1242,11 @@ class TeamCosEnv(gym.Env):
                 else:
                     dist_ratio = 0.0
             else:
-                dist_ratio = min(min_seeker_dist / 12.0, 1.0)
+                dist_ratio = min(min_hider_view_dist / 12.0, 1.0)
             dist_bonus = dist_ratio
         else:
             base = -float(seen_count) / float(len(self.hider_keys))
-            dist_far_ratio = min(min_seeker_dist / 12.0, 1.0)
+            dist_far_ratio = min(min_seen_dist / 12.0, 1.0)
             seeker_proximity_penalty = (1.0 - dist_far_ratio)
             dist_bonus = -seeker_proximity_penalty
 
@@ -1257,10 +1257,10 @@ class TeamCosEnv(gym.Env):
 
         # 最近の履歴を更新（deque maxlen=3）
         try:
-            self._recent_min_seeker_dists.append(min_seeker_dist)
+            self._recent_min_seeker_dists.append(min_hider_view_dist)
         except Exception:
             self._recent_min_seeker_dists = deque(maxlen=3)
-            self._recent_min_seeker_dists.append(min_seeker_dist)
+            self._recent_min_seeker_dists.append(min_hider_view_dist)
 
         return team_reward, bool(seen_count > 0), bool(learnable_hider_seen)
 
@@ -1292,11 +1292,10 @@ class TeamCosEnv(gym.Env):
 
         # seeker->hider 可視性を直接計算して、見えているHiderの数と最小距離を求める
         seen_count = 0
-        # seeker->hider visibilityがあるペアの中での最小距離（距離ボーナスの算出に使用）
+        # seeker->hider visibilityがあるペアの中での最小距離（seenペナルティの算出に使用）
         min_seen_dist = float("inf")
-        # 方向ごとの最小距離を別途収集し、後で優先ルールで決定する
-        min_sk_to_h = float("inf")
-        min_h_to_sk = float("inf")
+        # hider->seeker visibilityがあるペアの最小距離（未検知時の距離ボーナスに使用）
+        min_hider_view_dist = float("inf")
         # 学習対象のHiderがSeekerから見えているかどうか
         learnable_hider_seen = False 
         for hk in self.hider_keys:
@@ -1333,12 +1332,12 @@ class TeamCosEnv(gym.Env):
                         vis_h_sk = False
 
                 # 各向きごとに最短距離を別々に計算する。
-                # - Seeker->Hider の可視がある場合は min_sk_to_h を更新
-                # - Hider->Seeker の可視がある場合は min_h_to_sk を更新
+                # - Seeker->Hider の可視がある場合は seen側距離を更新
+                # - Hider->Seeker の可視がある場合は hider視点距離を更新
                 if vis_sk_h:
-                    min_sk_to_h = min(min_sk_to_h, dist)
+                    min_seen_dist = min(min_seen_dist, dist)
                 if vis_h_sk:
-                    min_h_to_sk = min(min_h_to_sk, dist)
+                    min_hider_view_dist = min(min_hider_view_dist, dist)
 
                 if vis_sk_h:
                     # このハイダーはこのシーカーに見えている
@@ -1356,15 +1355,13 @@ class TeamCosEnv(gym.Env):
             if hk == self.learnable_agent_key:
                 learnable_hider_seen = bool(seen)
 
-        # 優先ルール:
-        # - まず Seeker->Hider の可視距離群が存在すればその最小値を使用
-        # - そうでなければ Hider->Seeker の最小値を使用する
-        if min_sk_to_h != float("inf"):
-            min_seen_dist = min_sk_to_h
-        else:
-            min_seen_dist = min_h_to_sk
-
-        return self._finalize_team_reward(seen_count, min_seen_dist, min_world_dist, learnable_hider_seen)
+        return self._finalize_team_reward(
+            seen_count,
+            min_seen_dist,
+            min_world_dist,
+            min_hider_view_dist,
+            learnable_hider_seen,
+        )
 
 
     # --- 可視性計算の実装 ---
