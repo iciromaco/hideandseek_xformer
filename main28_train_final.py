@@ -1150,7 +1150,6 @@ def run_train_vector(
             blocked_ramp_sum = 0
             hidden_steps = 0
             wall_stick_steps = 0
-            wall_stick_seen_steps = 0
             entropy_sum = 0.0
             entropy_count = 0
             reward_compute_sec_sum = 0.0
@@ -1309,8 +1308,6 @@ def run_train_vector(
                         pass
                     if is_wall_stick:
                         wall_stick_steps += 1
-                        if seen_learnable:
-                            wall_stick_seen_steps += 1
                     rewards_sum += float(reward_np[i])
 
                 for i in range(num_envs):
@@ -1406,7 +1403,6 @@ def run_train_vector(
             hide_rate = hidden_steps / max(hp["rollout_steps"] * num_envs, 1)
             # learnable_seen_rate removed (dbg_learnable_hider_seen deprecated)
             wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"] * num_envs, 1)
-            wall_stick_seen_ratio = wall_stick_seen_steps / max(wall_stick_steps, 1)
             avg_reward = rewards_sum / (hp["rollout_steps"] * num_envs)
             avg_blocked_ramp = blocked_ramp_sum / (hp["rollout_steps"] * num_envs)
             avg_entropy = entropy_sum / max(entropy_count, 1)
@@ -1440,7 +1436,6 @@ def run_train_vector(
                     "train/entropy": avg_entropy,
                     # "train/learnable_seen_rate": removed,
                     "train/wall_stick_ratio": wall_stick_ratio,
-                    "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
                     "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,
                     "perf/env_step_ms_per_step": env_step_ms_per_step,
                     "perf/reward_to_env_time_ratio": reward_time_ratio,
