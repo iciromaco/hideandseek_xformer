@@ -8,7 +8,7 @@ active_profile = "train"
 
 [runtime.common]
 # environment
-action_repeat = 10
+action_repeat =  8 # 10
 mode4_sdf_cell_size = 0.05
 show_turn_lines = false
 
@@ -69,7 +69,7 @@ wandb_run_name = "wall_only_confirm_10M"
 
 [runtime.trainseeker_forRB]
 train_mode = true
-use_viewer = false
+use_viewer = true
 training_target = "seeker"
 train_other_hider_policy = "rule"
 train_other_seeker_policy = "rule"
@@ -147,7 +147,7 @@ debug_seeker_policy = "model_if_available"
 debug_symmetric_hider_policy = false
 npc_only_debug = false
 auto_tune_hparams = false
-play_episodes = 1
+play_episodes = 10
 num_envs = 1
 debug_log_interval_steps = 200
 team_reward_gain = 1.0
@@ -177,7 +177,7 @@ total_timesteps = 500_000
 rollout_steps = 128
 update_epochs = 4
 minibatch_size = 64
-learning_rate = 3.0e-4
+learning_rate = 1.0e-4 # 3.0e-4
 gamma = 0.995
 gae_lambda = 0.95
 clip_coef = 0.20

@@ -99,7 +99,6 @@ class TeamCosEnv(gym.Env):
         self._debug_wall_distance_buffer = []
         self._debug_step_counter = 0
         self._debug_log_interval = getattr(self, 'debug_logger', None) and getattr(self.debug_logger, 'log_interval_steps', 100) or 100
-        # last computed team reward components (for debug logging)
         self._last_team_base = 0.0
         self._last_team_dist = 0.0
         self._last_team_base_contrib = 0.0
@@ -167,7 +166,6 @@ class TeamCosEnv(gym.Env):
     GRAB_BREAK_DIST = 2.8
     GEAR_CAP = 0.4
     RAMP_BOOST_FWD = 0.8 # 0.35
-    # New reward parametrization: global gain and mix weight
     TEAM_REWARD_GAIN = 1.0
     DIST_BONUS_WEIGHT = 0.5 # ボーナスの比率が５割ならベースは５割
     OBJECT_PLANAR_LOCK = True
@@ -182,8 +180,7 @@ class TeamCosEnv(gym.Env):
                  debug_log_interval_steps=200,
                  mode4_sdf_cell_size=0.05,
                  debug_mode=False,
-                 action_repeat=16,
-                 # shared policy injection (optional, external manager can pass model)
+                 action_repeat=8,
                  shared_policy_model=None,
                  shared_policy_seq_len=8,
                  shared_policy_hidden_dim=128,
@@ -1266,10 +1263,6 @@ class TeamCosEnv(gym.Env):
         else:
             base = -float(seen_count) / float(len(self.hider_keys))
 
-        # distance-based reward is computed independently of seen_count.
-        # Hider-perspective distance bonus: use recorded hider->seeker view distance
-        # when available; otherwise if recent history indicates any finite
-        # observation use min_world_dist as a fallback.
         if min_hider_view_dist != float("inf"):
             dist_ratio_hider = min(min_hider_view_dist / 12.0, 1.0)
         else:
@@ -1281,10 +1274,6 @@ class TeamCosEnv(gym.Env):
                 dist_ratio_hider = 0.0
         hider_dist_bonus = float(dist_ratio_hider)
 
-        # Seeker-perspective distance bonus: negative proximity penalty when
-        # seekers see hiders (closer -> larger penalty). If min_seen_dist is
-        # not available, consult recent seeker-view history and fallback to
-        # min_world_dist when appropriate.
         if min_seen_dist != float("inf"):
             dist_far_ratio = min(min_seen_dist / 12.0, 1.0)
             seeker_proximity = (1.0 - dist_far_ratio)

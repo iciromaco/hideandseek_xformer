@@ -37,7 +37,7 @@ sys.path.append(
 ) 
 
 from envs.hns28_environment import TeamCosEnv
-from models.ppo_transformer_v2 import AgentV2
+from models.ppo_transformer_v3 import AgentV3
 from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
 
 
@@ -1107,6 +1107,14 @@ def run_train_vector(
     rollout_values = torch.zeros((hp["rollout_steps"], num_envs), device=device)
 
     num_updates = max(1, hp["total_timesteps"] // (hp["rollout_steps"] * num_envs))
+    # SMOKE_RUN=1 なら短時間確認用に1更新だけ実行する
+    try:
+        import os
+        if os.environ.get("SMOKE_RUN") == "1":
+            num_updates = 1
+            print("[SMOKE_RUN] limiting to 1 update for smoke test")
+    except Exception:
+        pass
     global_step = 0
     train_start_time = time.time()
     print(
@@ -1133,6 +1141,11 @@ def run_train_vector(
     try:
         info_buffer = []
         viewer_started = False
+        # 簡易ハイパラチェック
+        if not isinstance(hp.get("ent_coef", None), (int, float)):
+            print("[WARN] ent_coef not set or invalid; using default")
+        if not isinstance(hp.get("learning_rate", None), (int, float)):
+            print("[WARN] learning_rate not set or invalid; using default")
         for update in range(1, num_updates + 1):
             # --- ent_coef/learning_rateスケジューリング ---
             frac = 1.0 - (update - 1) / max(num_updates - 1, 1)
@@ -1150,6 +1163,10 @@ def run_train_vector(
             blocked_ramp_sum = 0
             hidden_steps = 0
             wall_stick_steps = 0
+            # action statistics
+            cont_action_sum = np.zeros(2, dtype=np.float64)
+            disc_action_sum = np.zeros(2, dtype=np.float64)
+            action_stat_count = 0
             entropy_sum = 0.0
             entropy_count = 0
             reward_compute_sec_sum = 0.0
@@ -1169,6 +1186,14 @@ def run_train_vector(
                 with torch.no_grad():
                     action, logp, _, value = agent.get_action_and_value(seq)
                 action_np = action.cpu().numpy()
+                # accumulate action stats: cont (0:forward,1:steer), disc (2:grab,3:lock)
+                try:
+                    # sum across envs for this step
+                    cont_action_sum += action_np[:, 0:2].sum(axis=0)
+                    disc_action_sum += action_np[:, 2:4].sum(axis=0)
+                    action_stat_count += action_np.shape[0]
+                except Exception:
+                    pass
                 step_t0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = envs.step(action_np)
                 # Viewer 更新（可能なら）およびクローズ検出
@@ -1289,8 +1314,6 @@ def run_train_vector(
                     is_detected = bool(_info_at(info, "is_detected", i, False))
                     if not is_detected:
                         hidden_steps += 1
-                    # dbg_learnable_hider_seen removed; default to False for downstream checks
-                    seen_learnable = False
                     # 壁張り付き判定: info や観測を優先的に参照するユーティリティを使う
                     next_speed = math.sqrt(
                         float(next_obs[i, reward_idx_cache["self_vel_x"]])**2 +
@@ -1401,7 +1424,6 @@ def run_train_vector(
             elapsed = max(time.time() - train_start_time, 1e-6)
             sps = int(global_step / elapsed)
             hide_rate = hidden_steps / max(hp["rollout_steps"] * num_envs, 1)
-            # learnable_seen_rate removed (dbg_learnable_hider_seen deprecated)
             wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"] * num_envs, 1)
             avg_reward = rewards_sum / (hp["rollout_steps"] * num_envs)
             avg_blocked_ramp = blocked_ramp_sum / (hp["rollout_steps"] * num_envs)
@@ -1424,7 +1446,14 @@ def run_train_vector(
                     episodes=RAMP_CHECK_EPISODES,
                     max_steps=RAMP_CHECK_STEPS,
                 )
-                # last_ramp_eval = ramp_eval  # 未使用のため削除
+
+            # compute mean action stats
+            if action_stat_count > 0:
+                cont_action_mean = (cont_action_sum / action_stat_count).tolist()
+                disc_action_rate = (disc_action_sum / action_stat_count).tolist()
+            else:
+                cont_action_mean = [0.0, 0.0]
+                disc_action_rate = [0.0, 0.0]
 
             if wandb_run is not None:
                 payload = {
@@ -1434,8 +1463,11 @@ def run_train_vector(
                     "train/hide_rate": hide_rate,
                     "train/avg_reward": avg_reward,
                     "train/entropy": avg_entropy,
-                    # "train/learnable_seen_rate": removed,
                     "train/wall_stick_ratio": wall_stick_ratio,
+                    "train/cont_action_forward_mean": cont_action_mean[0],
+                    "train/cont_action_steer_mean": cont_action_mean[1],
+                    "train/disc_grab_rate": disc_action_rate[0],
+                    "train/disc_lock_rate": disc_action_rate[1],
                     "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,
                     "perf/env_step_ms_per_step": env_step_ms_per_step,
                     "perf/reward_to_env_time_ratio": reward_time_ratio,
@@ -1498,17 +1530,11 @@ def run_train_vector(
                         "env/dbg_seek_gaze_cos_front_max": gaze_max,
                     }
                 )
-                # Debug: show gaze_count and which keys are being logged
-                # try:
-                #    print(f"[GazeDebug] Step={global_step} gaze_count={gaze_count} payload_keys={list(payload.keys())}")
-                # except Exception:
-                #    pass
+
                 wandb_run.log(payload, step=global_step)
 
             if update % hp["log_interval"] == 0:
                 print(f"Upd {update}/{num_updates} Step={global_step} SPS={sps} HideRate={hide_rate:.2f} WallStick={wall_stick_ratio:.2f} AvgR={avg_reward:.3f}")
-
-            # Removed collection/printing of per-step wall_distance statistics (kept training core logs via wandb)
 
             if update % hp["save_interval"] == 0:
                 _atomic_save(model_path)
@@ -1634,6 +1660,7 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                 compute_custom_reward(obs, next_obs, action, base_r, idx, env.target, info, reward_idx_cache=reward_idx_cache)
                 if USE_CUSTOM_REWARD else base_r
             )
+            # reward = 0.0 # ⭐️ デバッグ用に報酬をゼロに固定（環境の挙動を観察しやすくするため）
             history.update(next_obs)
             ep_reward += reward
             step_count += 1
@@ -2090,7 +2117,7 @@ def run():
         f"EPOCHS={hp['update_epochs']}"
     )
 
-    agent = AgentV2(obs_dim, act_dim, HIDDEN_DIM, SEQ_LEN).to(device)
+    agent = AgentV3(obs_dim, act_dim, HIDDEN_DIM, SEQ_LEN).to(device)
     wandb_run = init_wandb_run(hp, model_path, runtime_target) if TRAIN_MODE else None
     model_loaded = False
     should_load_model = True

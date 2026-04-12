@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from src.models.ppo_transformer_v2 import AgentV2
+from src.models.ppo_transformer_v3 import AgentV3
 
 
 class PolicyAdapter:
@@ -50,7 +50,7 @@ class PolicyAdapter:
         env.shared_policy_hidden_dim = int(hidden_dim)
         obs_dim = int(env.observation_space.shape[0])
         act_dim = int(env.action_space.shape[0])
-        policy_model = AgentV2(obs_dim, act_dim, env.shared_policy_hidden_dim, env.shared_policy_seq_len)
+        policy_model = AgentV3(obs_dim, act_dim, env.shared_policy_hidden_dim, env.shared_policy_seq_len)
         policy_model.load_state_dict(state_dict)
         policy_model.eval()
         env.shared_policy_model = policy_model
@@ -74,7 +74,7 @@ class PolicyAdapter:
 
         obs_dim = int(env.observation_space.shape[0])
         act_dim = int(env.action_space.shape[0])
-        policy_model = AgentV2(obs_dim, act_dim, int(hidden_dim), int(seq_len))
+        policy_model = AgentV3(obs_dim, act_dim, int(hidden_dim), int(seq_len))
         policy_model.load_state_dict(state_dict)
         policy_model.eval()
 
