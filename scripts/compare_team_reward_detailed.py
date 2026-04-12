@@ -88,7 +88,7 @@ def main():
             pre_obs, pre_state = capture_pre(env)
             env.step(np.zeros(4, dtype=np.float32))
             try:
-                s_res = env._compute_team_reward_state(pre_state_by_agent=pre_state)
+                s_res = env._compute_team_reward_state()
             except Exception as e:
                 s_res = ("ERR", str(e))
             # observational implementation removed; use state result for comparison

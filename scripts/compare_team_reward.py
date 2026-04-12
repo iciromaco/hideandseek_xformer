@@ -44,7 +44,7 @@ def main():
             obs, reward, done, info = ret
         # compare team reward implementations
         try:
-            s_res = env._compute_team_reward_state(pre_state_by_agent=pre_state)
+            s_res = env._compute_team_reward_state()
         except Exception as e:
             s_res = ("ERR", str(e))
         # observational implementation removed; use state-based result

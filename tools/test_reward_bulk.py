@@ -42,7 +42,7 @@ def build_pre_dicts(env):
 
 def compare_rewards(env, pre_obs_by_agent, pre_state_by_agent):
     try:
-        r_state = env._compute_team_reward_state(pre_state_by_agent=pre_state_by_agent)
+        r_state = env._compute_team_reward_state()
     except Exception as e:
         return False, None, f"_compute_team_reward_state raised: {e}"
 

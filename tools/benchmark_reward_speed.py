@@ -50,12 +50,12 @@ def benchmark(n_iters=1000):
 
     # warmup state-based
     for _ in range(10):
-        env._compute_team_reward_state(pre_state_by_agent=pre_state_by_agent)
+        env._compute_team_reward_state()
 
     # benchmark state-based only (observational implementation removed)
     t0 = time.perf_counter()
     for _ in range(n_iters):
-        env._compute_team_reward_state(pre_state_by_agent=pre_state_by_agent)
+        env._compute_team_reward_state()
     t1 = time.perf_counter()
     state_time = t1 - t0
 

@@ -1165,7 +1165,7 @@ class TeamCosEnv(gym.Env):
         box_speeds = [self._body_speed_xy(bid) for bid in self.box_ids]
         moving_box_count = int(sum(1 for v in box_speeds if v > 0.06))
         
-        rb, find = self._compute_team_reward_state(pre_state_by_agent=pre_state_by_agent)
+        rb, find = self._compute_team_reward_state()
 
         for i, ak in enumerate(self.agent_keys):
             if ak == self.learnable_agent_key and not self.override_learnable_policy:
@@ -1325,30 +1325,18 @@ class TeamCosEnv(gym.Env):
         return team_reward, bool(seen_count > 0)
 
     # 互換性確認のため元実装を保持しつつ、状態ベースの報酬計算を行う新しい関数を定義
-    def _compute_team_reward_state(self, pre_state_by_agent=None):
-        """状態ベースの報酬計算（互換性確認のため元実装を保持）。
+    def _compute_team_reward_state(self):
+        """状態ベースの報酬計算（post-step の可視性を使用）。
 
-        新しい実装と同じ形式のタプルを返します:
-        (team_reward, any_seen)
+        返り値はタプルです: (team_reward, any_seen)
         """
         if self.current_step <= self.prep_steps:
             return 0.0, False
 
         # seeker->hider visibilityがあるペアの中での最小距離（距離ボーナスの算出に使用）
         # 全ペアの直線距離の最小値も計算しておく（visibilityが最近失われた場合のフォールバック用）
+        # 全ペアの直線距離の最小値は以下の可視性ループ内で算出する（重複計算を避ける）
         min_world_dist = float("inf")
-        try:
-            for sk in self.seeker_keys:
-                sid = self._resolve_body_id(sk)
-                spos = self._body_pos(sid)
-                for hk in self.hider_keys:
-                    hid = self._resolve_body_id(hk)
-                    hpos = self._body_pos(hid)
-                    d = math.hypot(float(hpos[0] - spos[0]), float(hpos[1] - spos[1]))
-                    if d < min_world_dist:
-                        min_world_dist = d
-        except Exception:
-            min_world_dist = float("inf")
 
         # seeker->hider 可視性を直接計算して、見えているHiderの数と最小距離を求める
         seen_count = 0
@@ -1356,6 +1344,12 @@ class TeamCosEnv(gym.Env):
         min_seen_dist = float("inf")
         # hider->seeker visibilityがあるペアの最小距離（未検知時の距離ボーナスに使用）
         min_hider_view_dist = float("inf")
+
+        # post-step の現在状態に基づいて可視性キャッシュを計算する
+        try:
+            cache = self._compute_visibility_cache()
+        except Exception:
+            cache = {}
 
         for hk in self.hider_keys:
             hid = self._resolve_body_id(hk)
@@ -1367,19 +1361,19 @@ class TeamCosEnv(gym.Env):
                 sid = self._resolve_body_id(sk)
                 spos = self._body_pos(sid)
                 srot = self._agent_rot(sk)
-                dx = float(hpos[0] - spos[0])
-                dy = float(hpos[1] - spos[1])
-                dist = math.hypot(dx, dy)
+                dist = math.hypot(float(hpos[0] - spos[0]), float(hpos[1] - spos[1]))
+                if dist < min_world_dist:
+                    min_world_dist = dist
 
                 # seeker->hider 可視性
                 try:
-                    vis_sk_h = bool(self._cached_vis.get((sid, hid), False))
+                    vis_sk_h = bool(cache.get((sid, hid), False))
                 except Exception:
                     vis_sk_h = bool(self._is_vis(spos, srot, hpos, sid, hid))
 
                 # hider->seeker 可視性: まず逆方向キャッシュを参照し、なければ _is_vis を使用する
                 try:
-                    cached_rev = self._cached_vis.get((hid, sid), None)
+                    cached_rev = cache.get((hid, sid), None)
                 except Exception:
                     cached_rev = None
                 if cached_rev is not None:
@@ -1394,21 +1388,13 @@ class TeamCosEnv(gym.Env):
                 # - Seeker->Hider の可視がある場合は seen側距離を更新
                 # - Hider->Seeker の可視がある場合は hider視点距離を更新
                 if vis_sk_h:
+                    seen = True
                     min_seen_dist = min(min_seen_dist, dist) # シーカーから見えているハイダーの中での最小距離を更新
                 if vis_h_sk:
                     min_hider_view_dist = min(min_hider_view_dist, dist)
 
-                if vis_sk_h:
-                    # このハイダーはこのシーカーに見えている
-                    seen = True
-                    # break をせず、他のシーカーもチェックし続ける。
-                    # これにより、より近い（小さい）可視距離を持つシーカーが
-                    # 存在する場合に `min_seeker_dist` を正しく最小化できる。
-
             if seen:
                 seen_count += 1
-
-            # 学習対象の個別フラグは統計用のため削除
 
         return self._finalize_team_reward(
             seen_count, # 視認されているハイダーの個数
@@ -1417,11 +1403,14 @@ class TeamCosEnv(gym.Env):
             min_hider_view_dist,  # ハイダー→シーカー方向の「可視時の」最小距離
         )
 
-
     # --- 可視性計算の実装 ---
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
-        rel = t_pos - pos; dist = math.hypot(float(rel[0]), float(rel[1])) + 1e-8
-        if dist > L_SCALE or (math.cos(rot)*(rel[0]/dist) + math.sin(rot)*(rel[1]/dist)) < 0.38: return False
+        rel = t_pos - pos
+        dx = float(rel[0])
+        dy = float(rel[1])
+        dist = math.hypot(dx, dy) + 1e-8
+        if dist > L_SCALE or (math.cos(rot) * (dx / dist) + math.sin(rot) * (dy / dist)) < 0.38:
+            return False
         return self.vis_engine.is_visible(pos, t_pos, body_exclude=my_id, target_body_id=t_id)
 
     # --- 可視性キャッシュの構築 ---
