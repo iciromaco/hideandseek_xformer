@@ -432,7 +432,7 @@ class TeamCosEnv(gym.Env):
         qlen = self.data.qvel.shape[0]
         vx = self.data.qvel[vadr] if vadr < qlen else 0.0
         vy = self.data.qvel[vadr + 1] if (vadr + 1) < qlen else 0.0
-        return math.sqrt(vx ** 2 + vy ** 2)
+        return math.hypot(vx, vy)
 
     # 指定した体IDのXY平面での位置を返すヘルパー関数（データへのビュー）
     def _body_pos(self, bid):
@@ -1329,7 +1329,7 @@ class TeamCosEnv(gym.Env):
         """状態ベースの報酬計算（互換性確認のため元実装を保持）。
 
         新しい実装と同じ形式のタプルを返します:
-        (team_reward, any_seen, learnable_hider_seen)
+        (team_reward, any_seen)
         """
         if self.current_step <= self.prep_steps:
             return 0.0, False
@@ -1356,8 +1356,7 @@ class TeamCosEnv(gym.Env):
         min_seen_dist = float("inf")
         # hider->seeker visibilityがあるペアの最小距離（未検知時の距離ボーナスに使用）
         min_hider_view_dist = float("inf")
-        # 学習対象のHiderがSeekerから見えているかどうか
-        learnable_hider_seen = False 
+
         for hk in self.hider_keys:
             hid = self._resolve_body_id(hk)
             hpos = self._body_pos(hid)
@@ -1370,7 +1369,7 @@ class TeamCosEnv(gym.Env):
                 srot = self._agent_rot(sk)
                 dx = float(hpos[0] - spos[0])
                 dy = float(hpos[1] - spos[1])
-                dist = math.sqrt(dx * dx + dy * dy)
+                dist = math.hypot(dx, dy)
 
                 # seeker->hider 可視性
                 try:
@@ -1402,8 +1401,6 @@ class TeamCosEnv(gym.Env):
                 if vis_sk_h:
                     # このハイダーはこのシーカーに見えている
                     seen = True
-                    if sk == self.learnable_agent_key:
-                        learnable_hider_seen = True
                     # break をせず、他のシーカーもチェックし続ける。
                     # これにより、より近い（小さい）可視距離を持つシーカーが
                     # 存在する場合に `min_seeker_dist` を正しく最小化できる。
@@ -1411,9 +1408,7 @@ class TeamCosEnv(gym.Env):
             if seen:
                 seen_count += 1
 
-            # 学習対象がハイダーであれば、外側ループ（このハイダー単位）の結果を反映する
-            if hk == self.learnable_agent_key:
-                learnable_hider_seen = bool(seen)
+            # 学習対象の個別フラグは統計用のため削除
 
         return self._finalize_team_reward(
             seen_count, # 視認されているハイダーの個数
@@ -1425,7 +1420,7 @@ class TeamCosEnv(gym.Env):
 
     # --- 可視性計算の実装 ---
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
-        rel = t_pos - pos; dist = math.sqrt(np.sum(rel**2)) + 1e-8
+        rel = t_pos - pos; dist = math.hypot(float(rel[0]), float(rel[1])) + 1e-8
         if dist > L_SCALE or (math.cos(rot)*(rel[0]/dist) + math.sin(rot)*(rel[1]/dist)) < 0.38: return False
         return self.vis_engine.is_visible(pos, t_pos, body_exclude=my_id, target_body_id=t_id)
 
@@ -1589,7 +1584,7 @@ class TeamCosEnv(gym.Env):
             o[b_idx.REL_X] = d_w[0] * cos_r - d_w[1] * sin_r
             o[b_idx.REL_Y] = d_w[0] * sin_r + d_w[1] * cos_r
             b_vadr = m.jnt_dofadr[m.body_jntadr[tid]]
-            b_speed = math.sqrt(d.qvel[b_vadr] ** 2 + d.qvel[b_vadr + 1] ** 2)
+            b_speed = math.hypot(d.qvel[b_vadr], d.qvel[b_vadr + 1])
             o[b_idx.IS_MOVING] = 1.0 if b_speed > 0.05 else 0.0
             o[b_idx.IS_LOCKED] = 1.0 if self.object_state[f"b{i+1}"]["mode"] == "locked" else 0.0
             # 箱の向き情報（自分基準の相対yaw角）を観測にセット
@@ -1607,7 +1602,7 @@ class TeamCosEnv(gym.Env):
             o[r_idx.REL_X] = d_w_r[0] * cos_r - d_w_r[1] * sin_r
             o[r_idx.REL_Y] = d_w_r[0] * sin_r + d_w_r[1] * cos_r
             r_vadr = m.jnt_dofadr[m.body_jntadr[rid]]
-            r_speed = math.sqrt(d.qvel[r_vadr] ** 2 + d.qvel[r_vadr + 1] ** 2)
+            r_speed = math.hypot(d.qvel[r_vadr], d.qvel[r_vadr + 1])
             o[r_idx.IS_MOVING] = 1.0 if r_speed > 0.05 else 0.0
             o[r_idx.IS_LOCKED] = 1.0 if self.object_state[f"ramp{i+1}"]["mode"] == "locked" else 0.0
             # スロープの向き情報（自分基準の相対yaw角）を観測にセット
