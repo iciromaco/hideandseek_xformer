@@ -98,6 +98,11 @@ class TeamCosEnv(gym.Env):
         self._debug_wall_distance_buffer = []
         self._debug_step_counter = 0
         self._debug_log_interval = getattr(self, 'debug_logger', None) and getattr(self.debug_logger, 'log_interval_steps', 100) or 100
+        # last computed team reward components (for debug logging)
+        self._last_team_base = 0.0
+        self._last_team_dist = 0.0
+        self._last_team_base_contrib = 0.0
+        self._last_team_dist_contrib = 0.0
 
     def _debug_collect_stats(self, reward, info):
         if not self.debug_mode:
@@ -161,8 +166,9 @@ class TeamCosEnv(gym.Env):
     GRAB_BREAK_DIST = 2.8
     GEAR_CAP = 0.4
     RAMP_BOOST_FWD = 0.8 # 0.35
-    DIST_BONUS_SCALE = 0.48
-    BASE_REWARD_SCALE = 1.0
+    # New reward parametrization: global gain and mix weight
+    TEAM_REWARD_GAIN = 1.0
+    DIST_BONUS_WEIGHT = 0.5 # ボーナスの比率が５割ならベースは５割
     OBJECT_PLANAR_LOCK = True
     RAMP_LOCKED_SPEED_EPS = 0.035
     FREE_OBJ_LINEAR_DAMP = 0.90
@@ -182,9 +188,8 @@ class TeamCosEnv(gym.Env):
                  shared_policy_hidden_dim=128,
                  shared_team_policy=False,
                  shared_team_prefix=None,
-                 dist_bonus_scale=None,
-                 base_reward_scale=None):
-        # print("dist_bonus_scale=", dist_bonus_scale, "base_reward_scale=", base_reward_scale)
+                 team_reward_gain=None,
+                 dist_bonus_weight=None):
         super().__init__()
         self.n_seekers = int(n_seekers)
         self.n_hiders = int(n_hiders)
@@ -202,18 +207,16 @@ class TeamCosEnv(gym.Env):
         self.debug_logger = DebugLogger(enabled=debug_mode, log_interval_steps=debug_log_interval_steps)
         self.action_repeat = action_repeat
         self._init_debug_stats()
-        # 構築時に距離ボーナス係数を上書きできるようにする
-        if dist_bonus_scale is not None:
-            try:
-                self.DIST_BONUS_SCALE = float(dist_bonus_scale)
-            except Exception:
-                pass
-        # 基本報酬スケールの上書きを許可する（チーム報酬の `base` 項に重みをかける）
-        if base_reward_scale is not None:
-            try:
-                self.BASE_REWARD_SCALE = float(base_reward_scale)
-            except Exception:
-                pass
+        # Prefer explicit constructor overrides; otherwise fall back to class defaults
+        if team_reward_gain is not None:
+            self.TEAM_REWARD_GAIN = float(team_reward_gain)
+        else:
+            self.TEAM_REWARD_GAIN = float(self.__class__.TEAM_REWARD_GAIN)
+
+        if dist_bonus_weight is not None:
+            self.DIST_BONUS_WEIGHT = float(dist_bonus_weight)
+        else:
+            self.DIST_BONUS_WEIGHT = float(self.__class__.DIST_BONUS_WEIGHT)
         if self.n_seekers == 1:
             self.seeker_keys = ["s"]
         else:
@@ -237,6 +240,9 @@ class TeamCosEnv(gym.Env):
         # keep a short history (last 3) of hider->seeker visible distances only.
         # used for a short grace period when visibility is temporarily lost.
         self._recent_min_seeker_dists = deque(maxlen=3)
+        # also keep recent history of seeker->hider visible distances
+        # (used as a small fallback or for analysis symmetry)
+        self._recent_min_hider_dists = deque(maxlen=3)
 
         self.model = mujoco.MjModel.from_xml_string(self._build_dynamic_xml())
         self.data = mujoco.MjData(self.model)
@@ -1159,7 +1165,7 @@ class TeamCosEnv(gym.Env):
         box_speeds = [self._body_speed_xy(bid) for bid in self.box_ids]
         moving_box_count = int(sum(1 for v in box_speeds if v > 0.06))
         
-        rb, find, learnable_hider_seen = self._compute_team_reward_state(pre_state_by_agent=pre_state_by_agent)
+        rb, find = self._compute_team_reward_state(pre_state_by_agent=pre_state_by_agent)
 
         for i, ak in enumerate(self.agent_keys):
             if ak == self.learnable_agent_key and not self.override_learnable_policy:
@@ -1213,47 +1219,96 @@ class TeamCosEnv(gym.Env):
             "dbg_override_learnable_policy": bool(self.override_learnable_policy),
             "dbg_model_policy_deterministic": bool(self.model_policy_deterministic),
             
-            "dbg_learnable_hider_seen": bool(learnable_hider_seen),
+            # removed dbg_learnable_hider_seen: deprecated, used only for statistics
             "agent_vz": agent_vz,
             "agent_vx": agent_vx,
             "agent_vy": agent_vy,
             "dbg_last_ctrl_f": last_ctrl_f,
             "dbg_last_ctrl_t": last_ctrl_t,
             "applied_forward": applied_forward_learnable,
+            "dbg_team_base": float(getattr(self, "_last_team_base", 0.0)),
+            "dbg_team_dist": float(getattr(self, "_last_team_dist", 0.0)),
+            "dbg_team_base_contrib": float(getattr(self, "_last_team_base_contrib", 0.0)),
+            "dbg_team_dist_contrib": float(getattr(self, "_last_team_dist_contrib", 0.0)),
         }
         self._debug_collect_stats(reward, info)
         
         return obs, reward, False, done, info
 
     # --- 報酬計算の実装 ---
-    def _finalize_team_reward(self, seen_count, min_seen_dist, min_world_dist, min_hider_view_dist, learnable_hider_seen):
+    def _finalize_team_reward(self, seen_count, min_seen_dist, min_world_dist, min_hider_view_dist):
         """Common tail for team reward computation.
-
-        Returns (team_reward, any_seen, learnable_hider_seen)
+        seen_count: 視認されている（少なくとも一人のシーカーに見えている）ハイダーの個数。ゼロなら「見つかっていない」ケースとして扱う。
+        min_seen_dist: 現在「視認されている」ペア群の中での最小距離（シーカー↔ハイダーの直線距離、単位はメートル想定）
+        min_world_dist: 可視性を無視した全ペアの直線距離の最小値。可視距離情報が無い
+        min_hider_view_dist: ハイダー→シーカー方向の「可視時の」最小距離。可視情報が未記録／存在しない場合は float("inf") 
+        Returns (team_reward, any_seen)
         """
+        # base reward: positive when nobody seen, negative proportional to
+        # number of seen hiders otherwise.
         if seen_count == 0:
             base = 1.0
-            # hider->seeker 可視距離が記録されていない場合は直近のワールド距離を猶予として使う
-            if min_hider_view_dist == float("inf"):
-                recent = getattr(self, "_recent_min_seeker_dists", [])
-                recent_has_finite = any((d != float("inf")) for d in recent)
-                if recent_has_finite and min_world_dist != float("inf"):
-                    dist_ratio = min(min_world_dist / 12.0, 1.0)
-                else:
-                    dist_ratio = 0.0
-            else:
-                dist_ratio = min(min_hider_view_dist / 12.0, 1.0)
-            dist_bonus = dist_ratio
         else:
             base = -float(seen_count) / float(len(self.hider_keys))
+
+        # distance-based reward is computed independently of seen_count.
+        # Hider-perspective distance bonus: use recorded hider->seeker view distance
+        # when available; otherwise if recent history indicates any finite
+        # observation use min_world_dist as a fallback.
+        if min_hider_view_dist != float("inf"):
+            dist_ratio_hider = min(min_hider_view_dist / 12.0, 1.0)
+        else:
+            recent_h = getattr(self, "_recent_min_seeker_dists", [])
+            recent_has_finite_h = any((d != float("inf")) for d in recent_h)
+            if recent_has_finite_h and min_world_dist != float("inf"):
+                dist_ratio_hider = min(min_world_dist / 12.0, 1.0)
+            else:
+                dist_ratio_hider = 0.0
+        hider_dist_bonus = float(dist_ratio_hider)
+
+        # Seeker-perspective distance bonus: negative proximity penalty when
+        # seekers see hiders (closer -> larger penalty). If min_seen_dist is
+        # not available, consult recent seeker-view history and fallback to
+        # min_world_dist when appropriate.
+        if min_seen_dist != float("inf"):
             dist_far_ratio = min(min_seen_dist / 12.0, 1.0)
             seeker_proximity_penalty = (1.0 - dist_far_ratio)
-            dist_bonus = -seeker_proximity_penalty
+            seeker_dist_bonus = -seeker_proximity_penalty
+        else:
+            recent_s = getattr(self, "_recent_min_hider_dists", [])
+            recent_has_finite_s = any((d != float("inf")) for d in recent_s)
+            if recent_has_finite_s and min_world_dist != float("inf"):
+                dist_far_ratio2 = min(min_world_dist / 12.0, 1.0)
+                seeker_proximity_penalty2 = (1.0 - dist_far_ratio2)
+                seeker_dist_bonus = -seeker_proximity_penalty2
+            else:
+                seeker_dist_bonus = 0.0
 
-        BASE_R = float(self.BASE_REWARD_SCALE)
-        BONUS_R = float(self.DIST_BONUS_SCALE) 
+        # total distance bonus is the sum of hider- and seeker-perspective terms
+        dist_bonus = float(hider_dist_bonus + seeker_dist_bonus)
 
-        team_reward = BASE_R * base + BONUS_R * dist_bonus
+        # 設定済みのクラス属性を使用する（コンストラクタで設定されたもの）
+        team_reward_gain = float(self.TEAM_REWARD_GAIN)
+        dist_bonus_weight = float(self.DIST_BONUS_WEIGHT)
+        # print(f"Debug: team_reward_gain={team_reward_gain}, dist_bonus_weight={dist_bonus_weight}, base={base:.3f}, dist_bonus={dist_bonus:.3f}")
+
+        # separate contributions for easier debugging/inspection
+        base_contrib = team_reward_gain * (1.0 - dist_bonus_weight) * base
+        dist_contrib = team_reward_gain * dist_bonus_weight * dist_bonus
+        team_reward = float(base_contrib + dist_contrib)
+
+        # expose both raw and contribution components for debugging/telemetry
+        try:
+            self._last_team_base = float(base)
+            self._last_team_dist = float(dist_bonus)
+            self._last_team_base_contrib = float(base_contrib)
+            self._last_team_dist_contrib = float(dist_contrib)
+        except Exception:
+            # defensive: ensure attributes exist
+            self._last_team_base = float(base)
+            self._last_team_dist = float(dist_bonus)
+            self._last_team_base_contrib = float(base_contrib)
+            self._last_team_dist_contrib = float(dist_contrib)
 
         # 最近の履歴を更新（deque maxlen=3）
         try:
@@ -1261,8 +1316,13 @@ class TeamCosEnv(gym.Env):
         except Exception:
             self._recent_min_seeker_dists = deque(maxlen=3)
             self._recent_min_seeker_dists.append(min_hider_view_dist)
+        try:
+            self._recent_min_hider_dists.append(min_seen_dist)
+        except Exception:
+            self._recent_min_hider_dists = deque(maxlen=3)
+            self._recent_min_hider_dists.append(min_seen_dist)
 
-        return team_reward, bool(seen_count > 0), bool(learnable_hider_seen)
+        return team_reward, bool(seen_count > 0)
 
     # 互換性確認のため元実装を保持しつつ、状態ベースの報酬計算を行う新しい関数を定義
     def _compute_team_reward_state(self, pre_state_by_agent=None):
@@ -1272,7 +1332,7 @@ class TeamCosEnv(gym.Env):
         (team_reward, any_seen, learnable_hider_seen)
         """
         if self.current_step <= self.prep_steps:
-            return 0.0, False, False
+            return 0.0, False
 
         # seeker->hider visibilityがあるペアの中での最小距離（距離ボーナスの算出に使用）
         # 全ペアの直線距離の最小値も計算しておく（visibilityが最近失われた場合のフォールバック用）
@@ -1335,7 +1395,7 @@ class TeamCosEnv(gym.Env):
                 # - Seeker->Hider の可視がある場合は seen側距離を更新
                 # - Hider->Seeker の可視がある場合は hider視点距離を更新
                 if vis_sk_h:
-                    min_seen_dist = min(min_seen_dist, dist)
+                    min_seen_dist = min(min_seen_dist, dist) # シーカーから見えているハイダーの中での最小距離を更新
                 if vis_h_sk:
                     min_hider_view_dist = min(min_hider_view_dist, dist)
 
@@ -1356,11 +1416,10 @@ class TeamCosEnv(gym.Env):
                 learnable_hider_seen = bool(seen)
 
         return self._finalize_team_reward(
-            seen_count,
-            min_seen_dist,
-            min_world_dist,
-            min_hider_view_dist,
-            learnable_hider_seen,
+            seen_count, # 視認されているハイダーの個数
+            min_seen_dist, # シーカー→ハイダー方向の「可視時の」最小距離
+            min_world_dist, # 可視性を無視した全ペアの最小距離
+            min_hider_view_dist,  # ハイダー→シーカー方向の「可視時の」最小距離
         )
 
 

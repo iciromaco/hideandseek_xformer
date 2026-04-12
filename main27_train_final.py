@@ -1293,7 +1293,6 @@ def run_train_vector(
             max_ramp_speed = 0.0
             blocked_ramp_sum = 0
             hidden_steps = 0
-            learnable_seen_steps = 0
             wall_stick_steps = 0
             wall_stick_seen_steps = 0
             entropy_sum = 0.0
@@ -1438,9 +1437,8 @@ def run_train_vector(
                     is_detected = bool(_info_at(info, "is_detected", i, False))
                     if not is_detected:
                         hidden_steps += 1
-                    seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, is_detected))
-                    if seen_learnable:
-                        learnable_seen_steps += 1
+                    # dbg_learnable_hider_seen removed; default to False for downstream checks
+                    seen_learnable = False
                     # 壁張り付き判定: info や観測を優先的に参照するユーティリティを使う
                     next_speed = math.sqrt(
                         float(next_obs[i, reward_idx_cache["self_vel_x"]])**2 +
@@ -1553,7 +1551,7 @@ def run_train_vector(
             elapsed = max(time.time() - train_start_time, 1e-6)
             sps = int(global_step / elapsed)
             hide_rate = hidden_steps / max(hp["rollout_steps"] * num_envs, 1)
-            learnable_seen_rate = learnable_seen_steps / max(hp["rollout_steps"] * num_envs, 1)
+            # learnable_seen_rate removed (dbg_learnable_hider_seen deprecated)
             wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"] * num_envs, 1)
             wall_stick_seen_ratio = wall_stick_seen_steps / max(wall_stick_steps, 1)
             avg_reward = rewards_sum / (hp["rollout_steps"] * num_envs)
@@ -1587,7 +1585,7 @@ def run_train_vector(
                     "train/hide_rate": hide_rate,
                     "train/avg_reward": avg_reward,
                     "train/entropy": avg_entropy,
-                    "train/learnable_seen_rate": learnable_seen_rate,
+                    # "train/learnable_seen_rate": removed,
                     "train/wall_stick_ratio": wall_stick_ratio,
                     "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
                     "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,

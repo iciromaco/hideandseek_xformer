@@ -158,11 +158,13 @@ def main():
         # compute/collect reward components by calling env helper and by local metrics
         try:
             if hasattr(env, '_compute_team_reward_state'):
-                rb, seen_bool, learnable_seen = env._compute_team_reward_state()
+                rb, seen_bool = env._compute_team_reward_state()
             else:
-                rb, seen_bool, learnable_seen = env._compute_team_reward()
+                rb, seen_bool = env._compute_team_reward()
+            learnable_seen = False
         except Exception:
-            rb, seen_bool, learnable_seen = (float('nan'), False, False)
+            rb, seen_bool = float('nan'), False
+            learnable_seen = False
 
         # compute min_seeker_dist and seen_count locally to capture numeric count
         min_seeker_dist = 9999.0
@@ -190,7 +192,7 @@ def main():
 
         team_rb_list.append(float(rb))
         team_seen_bool_list.append(bool(seen_bool))
-        team_learnable_hider_seen_list.append(bool(learnable_seen))
+        team_learnable_hider_seen_list.append(False)
         team_min_seeker_dist_list.append(float(min_seeker_dist if min_seeker_dist < 9998.0 else float('nan')))
 
         print(f'FRAME {i}: model_out[:4]={out[:4]} -> env.ctrl[first4]={ctrl[:4]} vel={vel:.3f} reward={reward:.3f}')

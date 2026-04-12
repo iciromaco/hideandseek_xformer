@@ -95,8 +95,8 @@ def main():
             o_res = s_res
 
             equal = False
-            if isinstance(s_res, tuple) and isinstance(o_res, tuple) and len(s_res) == 3 and len(o_res) == 3:
-                diffs = [abs(float(s_res[i]) - float(o_res[i])) for i in range(3)]
+            if isinstance(s_res, tuple) and isinstance(o_res, tuple) and len(s_res) == 2 and len(o_res) == 2:
+                diffs = [abs(float(s_res[i]) - float(o_res[i])) for i in range(2)]
                 equal = not any(d > 1e-6 for d in diffs)
             if not equal:
                 pairs = analyze_frame(env)

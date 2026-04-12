@@ -74,8 +74,8 @@ def main():
     print('pre_state_by_agent keys:', list(pre_state_by_agent.keys())[:10])
 
     try:
-        r_state, f_state, lh_state = env._compute_team_reward_state(pre_state_by_agent=pre_state_by_agent)
-        print('_compute_team_reward_state ->', r_state, f_state, lh_state)
+        r_state, f_state = env._compute_team_reward_state(pre_state_by_agent=pre_state_by_agent)
+        print('_compute_team_reward_state ->', r_state, f_state)
     except Exception as e:
         print('_compute_team_reward_state ERROR', e)
         traceback.print_exc()

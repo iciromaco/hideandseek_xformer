@@ -50,11 +50,11 @@ def main():
         # observational implementation removed; use state-based result
         o_res = s_res
 
-        if not (isinstance(s_res, tuple) and isinstance(o_res, tuple) and len(s_res) == 3 and len(o_res) == 3):
+        if not (isinstance(s_res, tuple) and isinstance(o_res, tuple) and len(s_res) == 2 and len(o_res) == 2):
             mismatches.append((step, s_res, o_res))
         else:
             # numeric compare with small tolerance
-            diffs = [abs(float(s_res[i]) - float(o_res[i])) for i in range(3)]
+            diffs = [abs(float(s_res[i]) - float(o_res[i])) for i in range(2)]
             if any(d > 1e-6 for d in diffs):
                 mismatches.append((step, s_res, o_res, diffs))
 

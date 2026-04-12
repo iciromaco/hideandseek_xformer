@@ -912,7 +912,7 @@ class TeamCosEnv(gym.Env):
             )
         )
         
-        rb, find, learnable_hider_seen = self._compute_team_reward()
+        rb, find = self._compute_team_reward()
 
         for i, ak in enumerate(self.agent_keys):
             if ak == self.learnable_agent_key and not self.override_learnable_policy:
@@ -977,7 +977,7 @@ class TeamCosEnv(gym.Env):
             "dbg_override_learnable_policy": bool(self.override_learnable_policy),
             "dbg_model_policy_deterministic": bool(self.model_policy_deterministic),
             
-            "dbg_learnable_hider_seen": bool(learnable_hider_seen),
+            # removed dbg_learnable_hider_seen: deprecated, used only for statistics
             "wall_distance": wall_dist,
             "agent_vz": agent_vz,
             "agent_vx": agent_vx,
@@ -992,7 +992,7 @@ class TeamCosEnv(gym.Env):
 
     def _compute_team_reward(self):
         if self.current_step <= self.prep_steps:
-            return 0.0, False, False
+            return 0.0, False
 
         seen_count = 0
         min_seeker_dist = 13.0
@@ -1068,7 +1068,7 @@ class TeamCosEnv(gym.Env):
         team_reward = base + dist_bonus
         # team_reward = 0.0
         
-        return team_reward, bool(seen_count > 0), bool(learnable_hider_seen)
+        return team_reward, bool(seen_count > 0)
 
     def _is_vis(self, pos, rot, t_pos, my_id, t_id):
         rel = t_pos - pos; dist = math.sqrt(np.sum(rel**2)) + 1e-8

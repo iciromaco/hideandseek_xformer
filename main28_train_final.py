@@ -83,6 +83,12 @@ def _cli_compare_profiles_from_argv(argv=None):
     return [p.strip().lower() for p in str(raw).split(",") if p.strip()]
 
 
+def _cli_eval_train_from_argv(argv=None):
+    """CLIから --eval-train フラグをチェック（trainingプロファイルで推論評価）"""
+    args = list(sys.argv[1:] if argv is None else argv)
+    return "--eval-train" in args
+
+
 def _get_available_runtime_profiles(path):
     """TOMLから利用可能なプロファイルを取得"""
     try:
@@ -210,10 +216,17 @@ def _parse_cli_args(argv=None):
         action="store_true",
         help="実行例のみ表示して終了",
     )
+    parser.add_argument(
+        "--eval-train",
+        action="store_true",
+        help="trainingプロファイルの設定で推論評価を1エピソードだけ実行する（学習ループには入らない）",
+    )
     args, _ = parser.parse_known_args(argv)
     if args.examples:
         print(cli_examples)
         raise SystemExit(0)
+
+    return args
 
 
 def _to_bool(value):
@@ -244,6 +257,7 @@ def _cfg(name, default, cast=None, overrides=None):
 # CLI設定の取得
 CLI_PROFILE_OVERRIDE = _cli_profile_override_from_argv()
 CLI_COMPARE_PROFILES = _cli_compare_profiles_from_argv()
+CLI_EVAL_TRAIN = _cli_eval_train_from_argv()
 
 # 利用可能なプロファイルの取得
 AVAILABLE_RUNTIME_PROFILES = _get_available_runtime_profiles(CONFIG_PATH)
@@ -266,6 +280,24 @@ if runtime_profile:
     hp.update(runtime_profile)
 if RUNTIME_OVERRIDES:
     hp.update(RUNTIME_OVERRIDES)
+
+# If CLI requested an evaluation using the training profile, force the profile
+# to 'train' but run in inference/playback mode for a single episode.
+if CLI_EVAL_TRAIN:
+    train_profile = config.get("runtime", {}).get("train", {}) or {}
+    # rebuild hp from base + common + train
+    hp = dict(config.get("base", {}))
+    runtime_common = config.get("runtime", {}).get("common", {}) or {}
+    hp.update(runtime_common)
+    hp.update(train_profile)
+    # force inference-like settings
+    hp["train_mode"] = False
+    hp["play_episodes"] = 1
+    hp["num_envs"] = 1
+    # prefer no viewer by default for headless runs
+    hp["use_viewer"] = False
+    RUN_PROFILE = "train"
+    RUN_PROFILE_SOURCE = "cli(--eval-train)"
 
 # フラグの初期化
 # プロファイルで指定した値（hp）をデフォルトにし、さらに CLI/ランタイムオーバーライドで上書きする。
@@ -310,10 +342,10 @@ ENV_CONFIG = {
     "show_turn_lines": SHOW_TURN_LINES,
     "debug_log_interval_steps": _cfg("debug_log_interval_steps", "200", int, RUNTIME_OVERRIDES),
     "action_repeat": _cfg("action_repeat", "10", int, RUNTIME_OVERRIDES),
-    # allow overriding distance-bonus scale from TOML or runtime overrides
-    "dist_bonus_scale": _cfg("dist_bonus_scale", hp.get("dist_bonus_scale", 0.48), float, RUNTIME_OVERRIDES),
-    "base_reward_scale": _cfg("base_reward_scale", hp.get("base_reward_scale", 1.0), float, RUNTIME_OVERRIDES),
-    }
+    # team-reward parametrization (use explicit new keys only)
+    "team_reward_gain": _cfg("team_reward_gain", hp.get("team_reward_gain", 1.0), float, RUNTIME_OVERRIDES),
+    "dist_bonus_weight": _cfg("dist_bonus_weight", hp.get("dist_bonus_weight", 0.5), float, RUNTIME_OVERRIDES),
+}
 
 RAMP_CHECK_ENABLED = _cfg("ramp_check_enabled", "0", _to_bool, RUNTIME_OVERRIDES)
 RAMP_CHECK_INTERVAL = _cfg("ramp_check_interval", str(hp.get("save_interval", 50)), int, RUNTIME_OVERRIDES)
@@ -448,22 +480,6 @@ def _build_reward_index_cache(idx):
         "enemy_quat_1": np.asarray([int(en.QUAT_1) for en in idx.OTHERS], dtype=np.int32),
     }
 
-def _min_lidar_from_obs(obs, lidar_indices):
-    """観測からLiDAー最小値を取得"""
-    # 前方3方向のみ（中央＋左右1つずつ）
-    n = len(lidar_indices)
-    if n < 3:
-        # fallback: 全方向
-        indices = lidar_indices
-    else:
-        center = n // 2
-        indices = [lidar_indices[center - 1], lidar_indices[center], lidar_indices[center + 1]]
-    lidar_min = 1.0
-    for lidar_idx in indices:
-        value = float(obs[int(lidar_idx)])
-        if value < lidar_min:
-            lidar_min = value
-    return lidar_min
 
 # 各エージェントごとに1つだけキャッシュ（idx, reward_idx_cacheのid）
 _wall_stick_state_cache = {}
@@ -486,7 +502,6 @@ def _is_wall_stick_state(obs, idx, reward_idx_cache=None, speed=None, info=None,
         wall_near = (wall_distance - AGENT_RADIUS) < WALL_NEAR_MARGIN
     if wall_near is None:
         cache = reward_idx_cache if reward_idx_cache is not None else _build_reward_index_cache(idx)
-        lidar_indices = cache["lidar"]
         # idx.LIDAR_FRONT_IDXをそのまま使う（範囲チェック不要）
         front_indices = np.array(idx.LIDAR_FRONT_IDX, dtype=np.int32)
         lidar_min = 1.0
@@ -659,7 +674,7 @@ def env_signature(config):
 
 def model_path_for_config(target, config):
     """モデルの保存・読み込み用パスを一意に決定する"""
-    fname = f"HNS_V27_{target}_s{config.get('n_seekers', 1)}_h{config.get('n_hiders', 2)}_b{config.get('n_boxes', 2)}_r{config.get('n_ramps', 1)}.pt"
+    fname = f"HNS_{target}_s{config.get('n_seekers', 1)}_h{config.get('n_hiders', 2)}_b{config.get('n_boxes', 2)}_r{config.get('n_ramps', 1)}.pt"
     return os.path.join("checkpoints", fname)
 
 
@@ -830,8 +845,8 @@ def _set_override_learnable_policy(env, vec_envs, enabled):
     return False
 
 
-def _set_model_policy_deterministic(env, vec_envs, enabled):
-    """モデルポリシーを決定論的に設定"""
+def _set_model_det(env, vec_envs, enabled):
+    """モデルポリシーを決定論的に設定（短縮名）"""
     if vec_envs is not None:
         try:
             vec_envs.call("set_model_policy_deterministic", bool(enabled))
@@ -863,7 +878,7 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
         seeker_mode = _normalize_policy_mode(DEBUG_SEEKER_POLICY)
 
     model_policy_deterministic = MODEL_POLICY_DETERMINISTIC
-    det_sync_ok = _set_model_policy_deterministic(env, vec_envs, model_policy_deterministic)
+    det_sync_ok = _set_model_det(env, vec_envs, model_policy_deterministic)
 
     # デバッグモードでは、単一の「学習可能な」エージェントは概念上のものに過ぎません。
     # ある役割に対してモデルが存在する場合、その役割のすべてのエージェントに適用し、
@@ -935,7 +950,6 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
 
 
 def safe_close_vector_env(vec_envs):
-    """ベクター環境を安全にクローズ"""
     if vec_envs is None:
         return
     try:
@@ -1135,7 +1149,6 @@ def run_train_vector(
             max_ramp_speed = 0.0
             blocked_ramp_sum = 0
             hidden_steps = 0
-            learnable_seen_steps = 0
             wall_stick_steps = 0
             wall_stick_seen_steps = 0
             entropy_sum = 0.0
@@ -1277,9 +1290,8 @@ def run_train_vector(
                     is_detected = bool(_info_at(info, "is_detected", i, False))
                     if not is_detected:
                         hidden_steps += 1
-                    seen_learnable = bool(_info_at(info, "dbg_learnable_hider_seen", i, is_detected))
-                    if seen_learnable:
-                        learnable_seen_steps += 1
+                    # dbg_learnable_hider_seen removed; default to False for downstream checks
+                    seen_learnable = False
                     # 壁張り付き判定: info や観測を優先的に参照するユーティリティを使う
                     next_speed = math.sqrt(
                         float(next_obs[i, reward_idx_cache["self_vel_x"]])**2 +
@@ -1392,7 +1404,7 @@ def run_train_vector(
             elapsed = max(time.time() - train_start_time, 1e-6)
             sps = int(global_step / elapsed)
             hide_rate = hidden_steps / max(hp["rollout_steps"] * num_envs, 1)
-            learnable_seen_rate = learnable_seen_steps / max(hp["rollout_steps"] * num_envs, 1)
+            # learnable_seen_rate removed (dbg_learnable_hider_seen deprecated)
             wall_stick_ratio = wall_stick_steps / max(hp["rollout_steps"] * num_envs, 1)
             wall_stick_seen_ratio = wall_stick_seen_steps / max(wall_stick_steps, 1)
             avg_reward = rewards_sum / (hp["rollout_steps"] * num_envs)
@@ -1426,7 +1438,7 @@ def run_train_vector(
                     "train/hide_rate": hide_rate,
                     "train/avg_reward": avg_reward,
                     "train/entropy": avg_entropy,
-                    "train/learnable_seen_rate": learnable_seen_rate,
+                    # "train/learnable_seen_rate": removed,
                     "train/wall_stick_ratio": wall_stick_ratio,
                     "train/wall_stick_seen_ratio": wall_stick_seen_ratio,
                     "perf/reward_compute_ms_per_step": reward_compute_ms_per_step,
@@ -1560,11 +1572,15 @@ def run_debug_or_playback(env, agent, device, model_loaded):
     num_updates = max(1, num_episodes // log_interval)
 
     for episode in range(num_episodes):
-        obs, _ = env.reset()
+        # generate and log per-episode seed, then reset env with it for reproducibility
         if MODEL_POLICY_DETERMINISTIC:
             seed = 123456789
-            torch.manual_seed(seed)
-            np.random.seed(seed)
+        else:
+            seed = int(np.random.randint(0, 2**31 - 1))
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        obs, _ = env.reset(seed=int(seed))
+        print(f"[DBG] Episode={episode} seed={seed}")
         history.prime_single(obs)
         done = False
         ep_reward = 0.0
@@ -1695,6 +1711,10 @@ def run_debug_or_playback(env, agent, device, model_loaded):
                         "custom_component": float(reward - base_r),
                         "applied_forward": info.get("applied_forward") if isinstance(info, dict) else None,
                         "dbg_last_ctrl_f": info.get("dbg_last_ctrl_f") if isinstance(info, dict) else None,
+                        "dbg_team_base": info.get("dbg_team_base") if isinstance(info, dict) else None,
+                        "dbg_team_dist": info.get("dbg_team_dist") if isinstance(info, dict) else None,
+                        "dbg_team_base_contrib": info.get("dbg_team_base_contrib") if isinstance(info, dict) else None,
+                        "dbg_team_dist_contrib": info.get("dbg_team_dist_contrib") if isinstance(info, dict) else None,
                     }
                 )
 
