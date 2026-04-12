@@ -69,7 +69,7 @@ wandb_run_name = "wall_only_confirm_10M"
 
 [runtime.trainseeker_forRB]
 train_mode = true
-use_viewer = false
+use_viewer = true
 training_target = "seeker"
 train_other_hider_policy = "rule"
 train_other_seeker_policy = "rule"

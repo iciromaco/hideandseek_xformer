@@ -1,6 +1,7 @@
 # src/envs/hns28_environment.py
 # hns28_environment.py 
 import math
+import os
 from collections import deque
 from src.core.constants import P_SCALE, L_SCALE, R_SCALE, V_SCALE
 import gymnasium as gym
@@ -866,6 +867,12 @@ class TeamCosEnv(gym.Env):
                     arr = model.get_deterministic_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
                 else:
                     arr = model.get_action_and_value(seq_t)[0].cpu().numpy().reshape(-1)
+            # Optional debug: print raw model outputs when enabled
+            try:
+                if os.environ.get('HNS_DEBUG_POLICY', '0').lower() in ('1', 'true', 'yes'):
+                    print(f"[POLICY_DBG] agent={agent_key} raw_action={arr}")
+            except Exception:
+                pass
             if arr.size >= 4:
                 return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
             if arr.size >= 2:
@@ -878,6 +885,11 @@ class TeamCosEnv(gym.Env):
                 self._log_policy_source(agent_key, "callable")
                 pred = policy(norm_obs)
                 arr = np.asarray(pred).reshape(-1)
+                try:
+                    if os.environ.get('HNS_DEBUG_POLICY', '0').lower() in ('1', 'true', 'yes'):
+                        print(f"[POLICY_DBG] agent={agent_key} callable_action={arr}")
+                except Exception:
+                    pass
                 if arr.size >= 4:
                     return float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])
                 if arr.size >= 2:
@@ -1110,7 +1122,10 @@ class TeamCosEnv(gym.Env):
                 norm_obs = self._normalize_obs(self._get_obs(i))
                 f, t, lck, grb = self._policy_action(ak, norm_obs)
 
-            f = self.GEAR_CAP * f 
+            # Apply forward actuator scaling (no sign flip).
+            # NOTE: previous experiments inverted the sign here; revert to
+            # the canonical mapping so scripted agents keep original behavior.
+            f = self.GEAR_CAP * float(f)
             # xpos/xquatへの直接的な依存を避けるため、観測データからブースト値を計算する
             obs_raw = self._get_obs(i)
             # ボディIDをキーとして、事前にキャッシュされた観測と状態を保存（タイミングの関係で直接アクセスできないため）
@@ -1272,15 +1287,15 @@ class TeamCosEnv(gym.Env):
         # min_world_dist when appropriate.
         if min_seen_dist != float("inf"):
             dist_far_ratio = min(min_seen_dist / 12.0, 1.0)
-            seeker_proximity_penalty = (1.0 - dist_far_ratio)
-            seeker_dist_bonus = -seeker_proximity_penalty
+            seeker_proximity = (1.0 - dist_far_ratio)
+            seeker_dist_bonus = -seeker_proximity
         else:
             recent_s = getattr(self, "_recent_min_hider_dists", [])
             recent_has_finite_s = any((d != float("inf")) for d in recent_s)
             if recent_has_finite_s and min_world_dist != float("inf"):
                 dist_far_ratio2 = min(min_world_dist / 12.0, 1.0)
-                seeker_proximity_penalty2 = (1.0 - dist_far_ratio2)
-                seeker_dist_bonus = -seeker_proximity_penalty2
+                seeker_proximity2 = (1.0 - dist_far_ratio2)
+                seeker_dist_bonus = -seeker_proximity2
             else:
                 seeker_dist_bonus = 0.0
 
@@ -1322,6 +1337,21 @@ class TeamCosEnv(gym.Env):
             self._recent_min_hider_dists = deque(maxlen=3)
             self._recent_min_hider_dists.append(min_seen_dist)
 
+        # 詳細デバッグ出力（環境変数で有効化）
+        try:
+            dbg_flag = os.environ.get('HNS_DEBUG_REWARD', '0')
+        except Exception:
+            dbg_flag = '0'
+        if dbg_flag.lower() in ('1', 'true', 'yes'):
+            print(
+                f"[REWARD_DBG] seen_count={seen_count} base={base:.4f} "
+                f"hider_dist_bonus={hider_dist_bonus:.4f} seeker_dist_bonus={seeker_dist_bonus:.4f} "
+                f"dist_bonus={dist_bonus:.4f} base_contrib={base_contrib:.4f} "
+                f"dist_contrib={dist_contrib:.4f} team_reward={team_reward:.4f} "
+                f"min_seen_dist={min_seen_dist:.4f} min_world_dist={min_world_dist:.4f} "
+                f"min_hider_view_dist={min_hider_view_dist:.4f}"
+            )
+
         return team_reward, bool(seen_count > 0)
 
     # 互換性確認のため元実装を保持しつつ、状態ベースの報酬計算を行う新しい関数を定義
@@ -1351,6 +1381,9 @@ class TeamCosEnv(gym.Env):
         except Exception:
             cache = {}
 
+        # デバッグ用：ペアごとの可視性・距離ログ収集
+        pair_logs = []
+
         for hk in self.hider_keys:
             hid = self._resolve_body_id(hk)
             hpos = self._body_pos(hid)
@@ -1365,24 +1398,25 @@ class TeamCosEnv(gym.Env):
                 if dist < min_world_dist:
                     min_world_dist = dist
 
-                # seeker->hider 可視性
-                try:
-                    vis_sk_h = bool(cache.get((sid, hid), False))
-                except Exception:
-                    vis_sk_h = bool(self._is_vis(spos, srot, hpos, sid, hid))
-
-                # hider->seeker 可視性: まず逆方向キャッシュを参照し、なければ _is_vis を使用する
-                try:
-                    cached_rev = cache.get((hid, sid), None)
-                except Exception:
-                    cached_rev = None
-                if cached_rev is not None:
-                    vis_h_sk = bool(cached_rev)
+                # seeker->hider 可視性: キャッシュがなければ計算する
+                cached_fwd = cache.get((sid, hid))
+                if cached_fwd is None:
+                    try:
+                        vis_sk_h = bool(self._is_vis(spos, srot, hpos, sid, hid))
+                    except Exception:
+                        vis_sk_h = False
                 else:
+                    vis_sk_h = bool(cached_fwd)
+
+                # hider->seeker 可視性: キャッシュがなければ計算する（順方向と対称）
+                cached_rev = cache.get((hid, sid))
+                if cached_rev is None:
                     try:
                         vis_h_sk = bool(self._is_vis(hpos, hrot, spos, hid, sid))
                     except Exception:
                         vis_h_sk = False
+                else:
+                    vis_h_sk = bool(cached_rev)
 
                 # 各向きごとに最短距離を別々に計算する。
                 # - Seeker->Hider の可視がある場合は seen側距離を更新
@@ -1393,8 +1427,23 @@ class TeamCosEnv(gym.Env):
                 if vis_h_sk:
                     min_hider_view_dist = min(min_hider_view_dist, dist)
 
+                # collect pair info for debug
+                try:
+                    pair_logs.append((sk, hk, vis_sk_h, vis_h_sk, float(dist)))
+                except Exception:
+                    pass
+
             if seen:
                 seen_count += 1
+
+        # 詳細ペアログ出力（環境変数で有効化）
+        try:
+            dbg_pairs = os.environ.get('HNS_DEBUG_REWARD', '0')
+        except Exception:
+            dbg_pairs = '0'
+        if dbg_pairs.lower() in ('1', 'true', 'yes'):
+            for sk, hk, vskh, vhsk, d in pair_logs:
+                print(f"[REWARD_PAIR] {sk}->{hk} vis_sk_h={int(bool(vskh))} vis_h_sk={int(bool(vhsk))} dist={d:.3f}")
 
         return self._finalize_team_reward(
             seen_count, # 視認されているハイダーの個数
@@ -1440,26 +1489,26 @@ class TeamCosEnv(gym.Env):
                 for hk in self.hider_keys:
                     hid = self._resolve_body_id(hk)
                     # hider pose: prefer provided pre-state if available
-                    tpos = None
+                    hpos = None
                     hrot = None
                     if pre_state_by_agent is not None:
-                        t_pre = pre_state_by_agent.get(hid)
-                        if t_pre is not None:
-                            tpos = t_pre.get('pos')
-                            hrot = t_pre.get('rot')
-                    if tpos is None:
-                        tpos = self._body_pos(hid)
+                        h_pre = pre_state_by_agent.get(hid)
+                        if h_pre is not None:
+                            hpos = h_pre.get('pos')
+                            hrot = h_pre.get('rot')
+                    if hpos is None:
+                        hpos = self._body_pos(hid)
                     if hrot is None:
                         try:
                             hrot = self._agent_rot(hk)
                         except Exception:
                             hrot = None
                     try:
-                        vis_sk_h = bool(self._is_vis(spos, srot, tpos, sid, hid))
+                        vis_sk_h = bool(self._is_vis(spos, srot, hpos, sid, hid))
                     except Exception:
                         vis_sk_h = False
                     try:
-                        vis_h_sk = bool(self._is_vis(tpos, hrot if hrot is not None else srot, spos, hid, sid))
+                        vis_h_sk = bool(self._is_vis(hpos, hrot if hrot is not None else srot, spos, hid, sid))
                     except Exception:
                         vis_h_sk = False
                     # 両方向のデータをキャッシュに保存する
