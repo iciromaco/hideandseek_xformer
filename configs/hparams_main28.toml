@@ -69,7 +69,7 @@ wandb_run_name = "wall_only_confirm_10M"
 
 [runtime.trainseeker_forRB]
 train_mode = true
-use_viewer = true
+use_viewer = false
 training_target = "seeker"
 train_other_hider_policy = "rule"
 train_other_seeker_policy = "rule"
@@ -152,7 +152,7 @@ num_envs = 1
 debug_log_interval_steps = 200
 team_reward_gain = 1.0
 dist_bonus_weight = 1.0
-model_policy_deterministic = true
+# model_policy_deterministic = true
 
 [runtime.human]
 train_mode = false
