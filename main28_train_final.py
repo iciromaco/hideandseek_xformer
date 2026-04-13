@@ -29,6 +29,17 @@ except Exception as exc:
     print(f"Exception in wandb import: {exc}")
     wandb = None
 
+import warnings
+try:
+    # suppress noisy dependency-version warnings from requests on startup
+    from requests.packages.urllib3.exceptions import RequestsDependencyWarning
+    warnings.filterwarnings("ignore", category=RequestsDependencyWarning)
+except Exception:
+    pass
+
+    # Enable verbose gradient debug logs if environment variable GRAD_DBG=1
+    GRAD_DBG_ENABLED = os.environ.get("GRAD_DBG", "0") == "1"
+
 # sys.path拡張（src配下の独自モジュール用）
 sys.path.append(
     os.path.abspath(
@@ -39,6 +50,9 @@ sys.path.append(
 from envs.hns28_environment import TeamCosEnv
 from models.ppo_transformer_v3 import AgentV3
 from agents.scripted_agents import RuleBasedSeeker, RuleBasedHider
+
+# Model tag to avoid overwriting legacy checkpoints. Can be overridden via env var MODEL_TAG.
+MODEL_TAG = os.environ.get("MODEL_TAG", "V3")
 
 
 # ============================================================================
@@ -673,8 +687,16 @@ def env_signature(config):
 
 
 def model_path_for_config(target, config):
-    """モデルの保存・読み込み用パスを一意に決定する"""
-    fname = f"HNS_{target}_s{config.get('n_seekers', 1)}_h{config.get('n_hiders', 2)}_b{config.get('n_boxes', 2)}_r{config.get('n_ramps', 1)}.pt"
+    """モデルの保存・読み込み用パスを一意に決定する
+
+    ファイル名に `MODEL_TAG` を含めておくことで、AgentV2 の既存チェックポイントを
+    上書きせずに AgentV3 用の新しいファイルを使えるようにします。必要なら環境変数
+    `MODEL_TAG=V2` などで上書きできます。
+    """
+    fname = (
+        f"HNS_{MODEL_TAG}_{target}_s{config.get('n_seekers', 1)}_h{config.get('n_hiders', 2)}"
+        f"_b{config.get('n_boxes', 2)}_r{config.get('n_ramps', 1)}.pt"
+    )
     return os.path.join("checkpoints", fname)
 
 
@@ -892,24 +914,24 @@ def configure_team_policy_modes(env, vec_envs, ref_env, runtime_target, primary_
     if hider_mode == POLICY_MODEL_IF_AVAILABLE and hider_state is None:
         hider_state, hider_path = _maybe_load_model_state("hider")
         if hider_state is None:
-            print(f"Hider policy: fallback to rule (missing model: {hider_path})")
+            print(f"Hider policy: fallback to rule (missing model: {hider_path}) [tag={MODEL_TAG}]")
             if hasattr(ref_env, "policy_adapter"):
                 ref_env.policy_adapter.set_override_learnable_policy(True)
             elif hasattr(ref_env, "set_override_learnable_policy"):
                 ref_env.set_override_learnable_policy(True)
         else:
-            print(f"Hider model loaded from: {hider_path}")
+            print(f"Hider model (tag={MODEL_TAG}) loaded from: {hider_path}")
 
     if seeker_mode == POLICY_MODEL_IF_AVAILABLE and seeker_state is None:
         seeker_state, seeker_path = _maybe_load_model_state("seeker")
         if seeker_state is None:
-            print(f"Seeker policy: fallback to rule (missing model: {seeker_path})")
+            print(f"Seeker policy: fallback to rule (missing model: {seeker_path}) [tag={MODEL_TAG}]")
             if hasattr(ref_env, "policy_adapter"):
                 ref_env.policy_adapter.set_override_learnable_policy(True)
             elif hasattr(ref_env, "set_override_learnable_policy"):
                 ref_env.set_override_learnable_policy(True)
         else:
-            print(f"Seeker model loaded from: {seeker_path}")
+            print(f"Seeker model (tag={MODEL_TAG}) loaded from: {seeker_path}")
 
     if hider_mode == POLICY_MODEL_IF_AVAILABLE:
         ok = _apply_policy_state(env, vec_envs, hider_keys, hider_state, "Hider inference policy")
@@ -1141,6 +1163,54 @@ def run_train_vector(
     try:
         info_buffer = []
         viewer_started = False
+        # diagnostics dir
+        diag_dir = os.path.join(os.getcwd(), "diagnostics")
+        os.makedirs(diag_dir, exist_ok=True)
+
+        def _check_model_and_optimizer_nans(update, mb_info=None):
+            # scan parameters
+            for name, p in agent.named_parameters():
+                if p is None:
+                    continue
+                try:
+                    if torch.isnan(p).any() or torch.isinf(p).any():
+                        print(f"[MODEL_NAN] param {name} contains NaN/Inf at update={update} mb={mb_info}")
+                        # save diagnostic snapshot
+                        dump = {
+                            'update': update,
+                            'mb_info': mb_info,
+                            'param_name': name,
+                            'param': p.detach().cpu(),
+                            'state_dict': agent.state_dict(),
+                            'optimizer_state': optimizer.state_dict() if optimizer is not None else None,
+                        }
+                        fn = os.path.join(diag_dir, f"nan_dump_update{update}_{name.replace('/', '_')}.pt")
+                        try:
+                            torch.save(dump, fn)
+                            print(f"[MODEL_NAN] dumped diagnostics to {fn}")
+                        except Exception as _:
+                            print("[MODEL_NAN] failed to write diagnostic dump")
+                        raise RuntimeError(f"Detected NaN/Inf in parameter {name}")
+                except Exception:
+                    # be robust to non-Tensor params
+                    pass
+            # scan optimizer state
+            if optimizer is not None:
+                for sid, state in optimizer.state.items():
+                    for k, v in list(state.items()):
+                        if isinstance(v, torch.Tensor):
+                            try:
+                                if torch.isnan(v).any() or torch.isinf(v).any():
+                                    print(f"[OPT_NAN] optimizer state for param id {sid} key {k} contains NaN/Inf at update={update} mb={mb_info}")
+                                    fn = os.path.join(diag_dir, f"opt_nan_update{update}_sid{sid}_{k}.pt")
+                                    try:
+                                        torch.save({'update': update, 'mb_info': mb_info, 'state_key': k, 'tensor': v.detach().cpu()}, fn)
+                                        print(f"[OPT_NAN] dumped optimizer tensor to {fn}")
+                                    except Exception:
+                                        pass
+                                    raise RuntimeError(f"Detected NaN/Inf in optimizer state {k} for id {sid}")
+                            except Exception:
+                                pass
         # 簡易ハイパラチェック
         if not isinstance(hp.get("ent_coef", None), (int, float)):
             print("[WARN] ent_coef not set or invalid; using default")
@@ -1419,7 +1489,55 @@ def run_train_vector(
                     optimizer.zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(agent.parameters(), hp["max_grad_norm"])
+                    # detect NaN/Inf in gradients and dump minibatch causing it
+                    try:
+                        for n, p in agent.named_parameters():
+                            if p.grad is None:
+                                continue
+                            if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                                print(f"[GRAD_NAN] update={update} mb_start={start} param={n} grad contains NaN/Inf")
+                                dump = {
+                                    'update': update,
+                                    'mb_start': start,
+                                    'param_name': n,
+                                    'grad': p.grad.detach().cpu(),
+                                    'mb_obs': b_obs[mb_idx].detach().cpu() if 'b_obs' in locals() else None,
+                                    'mb_actions': b_actions[mb_idx].detach().cpu() if 'b_actions' in locals() else None,
+                                    'mb_adv': b_adv[mb_idx].detach().cpu() if 'b_adv' in locals() else None,
+                                    'state_dict': agent.state_dict(),
+                                }
+                                fn = os.path.join(diag_dir, f"grad_nan_update{update}_mb{start}_{n.replace('/','_')}.pt")
+                                try:
+                                    torch.save(dump, fn)
+                                    print(f"[GRAD_NAN] dumped minibatch diagnostics to {fn}")
+                                except Exception:
+                                    print("[GRAD_NAN] failed to write grad diagnostic dump")
+                                raise RuntimeError(f"NaN/Inf detected in gradients for param {n}")
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        pass
+                    # gradient diagnostics
+                    try:
+                        max_grad = 0.0
+                        for n, p in agent.named_parameters():
+                            if p.grad is not None:
+                                g = p.grad.detach()
+                                if g.numel() > 0:
+                                    gmax = float(g.abs().max().cpu().item())
+                                    if gmax > max_grad:
+                                        max_grad = gmax
+                        if GRAD_DBG_ENABLED:
+                            print(f"[GRAD_DBG] update={update} mb_start={start} max_grad={max_grad:.6e}")
+                    except Exception:
+                        pass
                     optimizer.step()
+                    # post-step diagnostics: check for NaN in params/optimizer
+                    try:
+                        _check_model_and_optimizer_nans(update, mb_info=start)
+                    except RuntimeError:
+                        # re-raise to abort training loop and surface the problem
+                        raise
 
             elapsed = max(time.time() - train_start_time, 1e-6)
             sps = int(global_step / elapsed)
@@ -1552,9 +1670,9 @@ def run_train_vector(
     finally:
         _atomic_save(model_path)
         if interrupted:
-            print(f"Interrupted checkpoint saved: {model_path}")
+            print(f"Interrupted checkpoint saved (tag={MODEL_TAG}): {model_path}")
         else:
-            print(f"Saved model: {model_path}")
+            print(f"Saved model (tag={MODEL_TAG}): {model_path}")
 
 # ============================================================================
 # デバッグ・再生機能
@@ -2127,7 +2245,7 @@ def run():
         if RESET_MODEL_ON_TRAIN and os.path.exists(model_path):
             try:
                 os.remove(model_path)
-                print(f"Removed existing checkpoint: {model_path}")
+                print(f"Removed existing checkpoint (tag={MODEL_TAG}): {model_path}")
             except Exception as exc:
                 print(f"Failed to remove checkpoint ({exc})")
 
