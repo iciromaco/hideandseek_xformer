@@ -1275,8 +1275,6 @@ class TeamCosEnv(gym.Env):
         min_hider_view_dist: ハイダー→シーカー方向の「可視時の」最小距離。可視情報が未記録／存在しない場合は float("inf") 
         Returns (team_reward, any_seen)
         """
-        # base reward: positive when nobody seen, negative proportional to
-        # number of seen hiders otherwise.
         if seen_count == 0:
             base = 1.0
         else:
@@ -1309,32 +1307,7 @@ class TeamCosEnv(gym.Env):
 
         # total distance bonus is the sum of hider- and seeker-perspective terms
         dist_bonus = float(hider_dist_bonus + seeker_dist_bonus)
-        dist_bonus2 = min(min_world_dist / 12.0, 1.0) - 0.5 # test
-        # dist_bonus3: reward based on seeker proximity to world center (closer -> larger)
-        try:
-            # compute distance from nearest seeker to Box1 (if present)
-            dist_bonus3 = 0.0
-            if getattr(self, 'box_ids', None) and len(self.box_ids) > 0:
-                box1_bid = self.box_ids[0]
-                try:
-                    box_pos = self._body_pos(box1_bid)
-                except Exception:
-                    box_pos = None
-                if box_pos is not None:
-                    min_box_dist = float("inf")
-                    for sk in getattr(self, 'seeker_keys', []):
-                        try:
-                            sid = self._resolve_body_id(sk)
-                            spos = self._body_pos(sid)
-                            d = math.hypot(float(spos[0] - box_pos[0]), float(spos[1] - box_pos[1]))
-                            if d < min_box_dist:
-                                min_box_dist = d
-                        except Exception:
-                            continue
-                    if min_box_dist != float("inf"):
-                        dist_bonus3 = float(max(0.0, 1.0 - min(min_box_dist / float(self.ARENA_HALF), 1.0)))
-        except Exception:
-            dist_bonus3 = 0.0
+        # dist_bonus2 = min(min_world_dist / 12.0, 1.0) - 0.5 # test
 
         # 設定済みのクラス属性を使用する（コンストラクタで設定されたもの）
         team_reward_gain = float(self.TEAM_REWARD_GAIN)
@@ -1342,8 +1315,7 @@ class TeamCosEnv(gym.Env):
 
         # separate contributions for easier debugging/inspection
         base_contrib = team_reward_gain * (1.0 - dist_bonus_weight) * base
-        # For this experiment, use only dist_bonus3 (seeker->center) for distance contribution.
-        dist_contrib = team_reward_gain * dist_bonus_weight * float(dist_bonus3)
+        dist_contrib = team_reward_gain * dist_bonus_weight * dist_bonus
         team_reward = float(base_contrib + dist_contrib)
 
         # expose both raw and contribution components for debugging/telemetry

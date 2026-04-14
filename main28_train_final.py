@@ -343,13 +343,11 @@ LOG_POLICY_PARAMS = _cfg("log_policy_params", hp.get("log_policy_params", "0"), 
 FORCE_FIXED_SEED = _cfg("force_fixed_seed", hp.get("force_fixed_seed", "0"), _to_bool, RUNTIME_OVERRIDES)
 FIXED_SEED_VAL = _cfg("fixed_seed_val", hp.get("fixed_seed_val", "123456789"), int, RUNTIME_OVERRIDES)
 
- # 以前の挙動では推論モード (TRAIN_MODE=False) のとき必ずビューアを有効化していたが、
-# プロファイルで明示的に `use_viewer = false` とした場合でも上書きされてしまっていた。
-# ここでは「デバッグプロファイル（RUN_PROFILE == 'debug'）から来た推論実行」の場合に
-# 自動でビューアを有効化するのみとし、プロファイルで明示指定された `use_viewer` を尊重する。
+# デバッグプロファイルではビューアを強制的に有効化する（-p debug 実行時の表示確認用途）
+# それ以外のときは `use_viewer` の設定を尊重する。
+if RUN_PROFILE == "debug":
+    USE_VIEWER = True
 if not TRAIN_MODE:
-    if RUN_PROFILE == "debug":
-        USE_VIEWER = True
     AUTO_TUNE_HPARAMS = False
 
 MODE = _cfg("mode", hp.get("mode", "refinement"), str, RUNTIME_OVERRIDES)
@@ -1178,25 +1176,20 @@ def run_train_vector(
     try:
         info_buffer = []
         viewer_started = False
-        # Predeclare viewer_sleep so it's visible to the whole function scope
-        viewer_sleep = float(hp.get("viewer_base_sleep", 0.025))
+        # viewer render timing
+        hp_action_repeat = int(hp.get("action_repeat", ENV_CONFIG.get("action_repeat", 10)))
+        viewer_sleep = hp_action_repeat * 0.0025
+
         # diagnostics dir
         diag_dir = os.path.join(os.getcwd(), "diagnostics")
         os.makedirs(diag_dir, exist_ok=True)
-        # viewer render timing
 
-        try:
-            base_viewer_sleep = float(hp.get("viewer_base_sleep", 0.025))
-            hp_action_repeat = int(hp.get("action_repeat", ENV_CONFIG.get("action_repeat", 10)))
-            viewer_ref = int(hp.get("viewer_ref_action_repeat", ENV_CONFIG.get("action_repeat", 10)))
-            ratio = float(max(1, hp_action_repeat)) / float(max(1, viewer_ref))
-            viewer_sleep = max(1e-4, base_viewer_sleep * ratio)
-            try:
-                print(f"[VIEWER] base={base_viewer_sleep} action_repeat={hp_action_repeat} viewer_ref={viewer_ref} ratio={ratio:.3f} viewer_sleep={viewer_sleep:.4f}")
-            except Exception:
-                pass
-        except Exception:
-            viewer_sleep = 0.025
+        # lightweight profiling accumulators (seconds)
+        prof_agent = 0.0
+        prof_env_step = 0.0
+        prof_reward = 0.0
+        prof_other = 0.0
+        prof_steps = 0
 
         def _check_model_and_optimizer_nans(update, mb_info=None):
             # scan parameters
@@ -1303,8 +1296,11 @@ def run_train_vector(
                 seq = history.get()
                 rollout_obs[t] = seq
 
+                # agent inference timing
+                t_agent0 = time.perf_counter()
                 with torch.no_grad():
                     action, logp, _, value = agent.get_action_and_value(seq)
+                prof_agent += time.perf_counter() - t_agent0
                 action_np = action.cpu().numpy()
                 # Log and guard against action saturation (continuous near +-1, discrete pinned at 0/1)
                 try:
@@ -1338,8 +1334,10 @@ def run_train_vector(
                     action_stat_count += action_np.shape[0]
                 except Exception:
                     pass
-                step_t0 = time.perf_counter()
+                # env.step timing
+                t_env0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = envs.step(action_np)
+                prof_env_step += time.perf_counter() - t_env0
                 # TEMP CHECK: detect NaN in observations coming from the environment
                 try:
                     if np.isnan(next_obs).any():
@@ -1384,8 +1382,10 @@ def run_train_vector(
                         raise
                     except Exception:
                         pass
-                info_buffer.append(info)
-                env_step_sec_sum += time.perf_counter() - step_t0
+                # Only collect info for debugging/wandb if a run is active (reduces per-step overhead)
+                if wandb_run is not None:
+                    info_buffer.append(info)
+                env_step_sec_sum += time.perf_counter() - t_env0
                 done_np = np.logical_or(term, trun).astype(np.float32)
                 done_last = done_np
 
@@ -1448,6 +1448,7 @@ def run_train_vector(
                 reward_compute_sec_sum += time.perf_counter() - reward_t0
 
                 global_step += num_envs
+                prof_steps += num_envs
                 rollout_actions[t] = action
                 rollout_logp[t] = logp
                 rollout_rewards[t] = torch.as_tensor(reward_np, device=device)
@@ -1847,7 +1848,18 @@ def run_train_vector(
                 wandb_run.log(payload, step=global_step)
 
             if update % hp["log_interval"] == 0:
-                print(f"Upd {update}/{num_updates} Step={global_step} SPS={sps} HideRate={hide_rate:.2f} WallStick={wall_stick_ratio:.2f} AvgR={avg_reward:.3f}")
+                # profiling summary (ms per env-step)
+                total_prof_time = prof_agent + prof_env_step + reward_compute_sec_sum + 1e-12
+                avg_agent_ms = (prof_agent / max(prof_steps, 1)) * 1000.0
+                avg_env_ms = (prof_env_step / max(prof_steps, 1)) * 1000.0
+                avg_reward_ms = (reward_compute_sec_sum / max(prof_steps, 1)) * 1000.0
+                agent_pct = prof_agent / total_prof_time
+                print(
+                    f"Upd {update}/{num_updates} Step={global_step} SPS={sps} HideRate={hide_rate:.2f} WallStick={wall_stick_ratio:.2f} AvgR={avg_reward:.3f}"
+                )
+                print(
+                    f"PROF(ms/step): agent={avg_agent_ms:.3f} env_step={avg_env_ms:.3f} reward={avg_reward_ms:.3f} | pct_agent={agent_pct:.1%} prof_steps={prof_steps}"
+                )
 
             if update % hp["save_interval"] == 0:
                 _atomic_save(model_path)
@@ -1883,6 +1895,13 @@ def run_debug_or_playback(env, agent, device, model_loaded):
     target_npc = None
     if NPC_ONLY_DEBUG:
         target_npc = RuleBasedSeeker() if env.target == "seeker" else RuleBasedHider()
+
+    # viewer timing for debug/playback (keep consistent with train vector)
+    try:
+        hp_action_repeat = int(hp.get("action_repeat", ENV_CONFIG.get("action_repeat", 10)))
+    except Exception:
+        hp_action_repeat = int(ENV_CONFIG.get("action_repeat", 10))
+    viewer_sleep = hp_action_repeat * 0.0025
 
     print("--- Start Simulation ---")
     print(f"Physics Step: {env.model.opt.timestep * 5}s")
@@ -1982,7 +2001,9 @@ def run_debug_or_playback(env, agent, device, model_loaded):
             step_count += 1
             lock_events += int(info.get("lock_event", 0))
             wall_stick += float(info.get("wall_stick", 0.0))
-            info_buffer.append(info)
+            # Only collect info for debugging/wandb if a run is active (reduces per-step overhead)
+            if wandb_run is not None:
+                info_buffer.append(info)
 
             # 最初の debug_log_n ステップ分のステップごとのデバッグ情報を収集する
             if step_count <= debug_log_n:

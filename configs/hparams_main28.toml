@@ -85,7 +85,7 @@ learning_rate = 1.0e-5 # 3.0e-4
 ent_coef = 0.01
 ent_coef_schedule = "linear"
 ent_coef_final = 0.01
-action_repeat = 8
+action_repeat = 10
 
 [runtime.trainseeker_forRB_withC]
 train_mode = true
