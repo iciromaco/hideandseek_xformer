@@ -66,9 +66,10 @@ agent_positions = {
     'hider2_body': np.array([5.0, 5.0])
 }
 
-print("[DEBUG] Agent positions (before visibility_engine):")
-for name, pos in agent_positions.items():
-    print(f"  {name}: {pos}")
+# Debug prints removed
+# print("[DEBUG] Agent positions (before visibility_engine):")
+# for name, pos in agent_positions.items():
+#     print(f"  {name}: {pos}")
 
 # visibility engineの初期化
 visibility_engine = VisibilityEngine(model, data, epsilon=0.1, max_steps=15, max_dist=LIDAR_MAX_DIST)
@@ -91,9 +92,10 @@ visibility_engine.dynamic_positions[3] = np.array([2.0, -2.0])  # box1
 visibility_engine.dynamic_positions[4] = np.array([-2.0, 2.0])  # box2
 visibility_engine.dynamic_positions[5] = np.array([0.0, 0.0])   # ramp
 
-print("\n[DEBUG] visibility_engine positions AFTER manual set:")
-for i in range(6):
-    print(f"  Object {i}: {visibility_engine.dynamic_positions[i]}")
+# Debug prints removed
+# print("\n[DEBUG] visibility_engine positions AFTER manual set:")
+# for i in range(6):
+#     print(f"  Object {i}: {visibility_engine.dynamic_positions[i]}")
 
 # 壁を線分として定義（厚みなし、SDF と同じ扱い）
 # 外壁：±6 の4本の線分

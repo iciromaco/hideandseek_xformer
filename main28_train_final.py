@@ -29,6 +29,16 @@ except Exception as exc:
     print(f"Exception in wandb import: {exc}")
     wandb = None
 
+# Apply stricter deterministic flags to improve reproducibility when requested.
+try:
+    torch.backends.cudnn.benchmark = False
+    # use_deterministic_algorithms available in PyTorch 1.8+
+    torch.use_deterministic_algorithms(True)
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except Exception as _exc:
+    print(f"Deterministic flags not fully applied: {_exc}")
+
 import warnings
 try:
     # suppress noisy dependency-version warnings from requests on startup
@@ -327,6 +337,11 @@ MODEL_POLICY_DETERMINISTIC = _cfg("model_policy_deterministic", hp.get("model_po
 DEBUG_SYMMETRIC_HIDER_POLICY = _cfg("debug_symmetric_hider_policy", hp.get("debug_symmetric_hider_policy", "0"), _to_bool, RUNTIME_OVERRIDES)
 TRAIN_OTHER_HIDER_POLICY = _cfg("train_other_hider_policy", hp.get("train_other_hider_policy", "rule"), str, RUNTIME_OVERRIDES)
 TRAIN_OTHER_SEEKER_POLICY = _cfg("train_other_seeker_policy", hp.get("train_other_seeker_policy", "rule"), str, RUNTIME_OVERRIDES)
+LOG_ACTION_SAT = _cfg("log_action_saturation", hp.get("log_action_saturation", "0"), _to_bool, RUNTIME_OVERRIDES)
+LOG_POLICY_PARAMS = _cfg("log_policy_params", hp.get("log_policy_params", "0"), _to_bool, RUNTIME_OVERRIDES)
+# optional forced fixed seed for reproducible debugging (set via hp or CLI override)
+FORCE_FIXED_SEED = _cfg("force_fixed_seed", hp.get("force_fixed_seed", "0"), _to_bool, RUNTIME_OVERRIDES)
+FIXED_SEED_VAL = _cfg("fixed_seed_val", hp.get("fixed_seed_val", "123456789"), int, RUNTIME_OVERRIDES)
 
  # 以前の挙動では推論モード (TRAIN_MODE=False) のとき必ずビューアを有効化していたが、
 # プロファイルで明示的に `use_viewer = false` とした場合でも上書きされてしまっていた。
@@ -1163,9 +1178,25 @@ def run_train_vector(
     try:
         info_buffer = []
         viewer_started = False
+        # Predeclare viewer_sleep so it's visible to the whole function scope
+        viewer_sleep = float(hp.get("viewer_base_sleep", 0.025))
         # diagnostics dir
         diag_dir = os.path.join(os.getcwd(), "diagnostics")
         os.makedirs(diag_dir, exist_ok=True)
+        # viewer render timing
+
+        try:
+            base_viewer_sleep = float(hp.get("viewer_base_sleep", 0.025))
+            hp_action_repeat = int(hp.get("action_repeat", ENV_CONFIG.get("action_repeat", 10)))
+            viewer_ref = int(hp.get("viewer_ref_action_repeat", ENV_CONFIG.get("action_repeat", 10)))
+            ratio = float(max(1, hp_action_repeat)) / float(max(1, viewer_ref))
+            viewer_sleep = max(1e-4, base_viewer_sleep * ratio)
+            try:
+                print(f"[VIEWER] base={base_viewer_sleep} action_repeat={hp_action_repeat} viewer_ref={viewer_ref} ratio={ratio:.3f} viewer_sleep={viewer_sleep:.4f}")
+            except Exception:
+                pass
+        except Exception:
+            viewer_sleep = 0.025
 
         def _check_model_and_optimizer_nans(update, mb_info=None):
             # scan parameters
@@ -1216,6 +1247,9 @@ def run_train_vector(
             print("[WARN] ent_coef not set or invalid; using default")
         if not isinstance(hp.get("learning_rate", None), (int, float)):
             print("[WARN] learning_rate not set or invalid; using default")
+        # track previous-update action mean for delta-based detection
+        prev_mean_action0 = None
+
         for update in range(1, num_updates + 1):
             # --- ent_coef/learning_rateスケジューリング ---
             frac = 1.0 - (update - 1) / max(num_updates - 1, 1)
@@ -1225,6 +1259,22 @@ def run_train_vector(
                 lr_now = lr_final + (lr_init - lr_final) * frac
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr_now
+
+            # Optional: enable FORWARD_TRACE for a specific update range to capture
+            # layer-level activations. Configure via hp keys `forward_trace_start` and
+            # `forward_trace_end` (inclusive). If not set, FORWARD_TRACE remains off.
+            try:
+                fts = int(hp.get("forward_trace_start", -1))
+                fte = int(hp.get("forward_trace_end", -1))
+            except Exception:
+                fts = -1
+                fte = -1
+            if fts >= 0 and fte >= 0 and fts <= update <= fte:
+                os.environ["FORWARD_TRACE"] = "1"
+                print(f"[FORWARD_TRACE] enabled for update={update} (range {fts}-{fte})")
+            else:
+                if "FORWARD_TRACE" in os.environ:
+                    os.environ.pop("FORWARD_TRACE", None)
 
             lock_evt_sum = 0
             grab_evt_sum = 0
@@ -1256,6 +1306,30 @@ def run_train_vector(
                 with torch.no_grad():
                     action, logp, _, value = agent.get_action_and_value(seq)
                 action_np = action.cpu().numpy()
+                # Log and guard against action saturation (continuous near +-1, discrete pinned at 0/1)
+                try:
+                    cont = action_np[:, 0:2]
+                    disc = action_np[:, 2:4]
+                    cont_sat_frac = float((np.abs(cont) > 0.999).mean())
+                    disc_sat_frac = float(((disc == 0.0) | (disc == 1.0)).mean())
+                    if LOG_ACTION_SAT:
+                        if cont_sat_frac > 0.0 or disc_sat_frac > 0.0:
+                            print(f"[ACTION_SAT] cont_sat_frac={cont_sat_frac:.3f} disc_sat_frac={disc_sat_frac:.3f}")
+                    # Clamp continuous actions slightly inside (-1,1) to avoid atanh extremes in logging
+                    action_np[:, 0:2] = np.clip(action_np[:, 0:2], -0.999, 0.999)
+                except Exception:
+                    pass
+                # Log policy continuous parameters (first sample) if available
+                    try:
+                        params = getattr(agent, "_last_cont_params", None)
+                        if LOG_POLICY_PARAMS and params is not None:
+                            cm, cls = params
+                            try:
+                                print(f"[POLICY_PARAMS] cont_mean={cm[0].tolist()} cont_logstd={cls[0].tolist()}")
+                            except Exception:
+                                print(f"[POLICY_PARAMS] cont_mean={cm[0]} cont_logstd={cls[0]}")
+                    except Exception:
+                        pass
                 # accumulate action stats: cont (0:forward,1:steer), disc (2:grab,3:lock)
                 try:
                     # sum across envs for this step
@@ -1266,12 +1340,30 @@ def run_train_vector(
                     pass
                 step_t0 = time.perf_counter()
                 next_obs, base_r, term, trun, info = envs.step(action_np)
+                # TEMP CHECK: detect NaN in observations coming from the environment
+                try:
+                    if np.isnan(next_obs).any():
+                        print("CRITICAL: NaN detected in observations from environment!")
+                        try:
+                            idxs = np.where(np.isnan(next_obs))
+                            print("NaN indices (env,feature):", idxs)
+                        except Exception:
+                            pass
+                        try:
+                            # dump the offending observations for offline inspection
+                            fn = os.path.join(diag_dir, f"env_nan_update{update}_t{t}.pt")
+                            torch.save({"next_obs": next_obs}, fn)
+                            print(f"[CRIT_DUMP] wrote obs dump to {fn}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 # Viewer 更新（可能なら）およびクローズ検出
                 if USE_VIEWER:
                     try:
                         if hasattr(envs, "render"):
                             envs.render()
-                            time.sleep(0.025)
+                            time.sleep(viewer_sleep)
                         # viewer 実行中か確認（SingleVecWrapper や env を透過的に扱う）
                         v = getattr(envs, "viewer", None)
                         if v is None and hasattr(envs, "_env"):
@@ -1504,6 +1596,9 @@ def run_train_vector(
                                     'mb_obs': b_obs[mb_idx].detach().cpu() if 'b_obs' in locals() else None,
                                     'mb_actions': b_actions[mb_idx].detach().cpu() if 'b_actions' in locals() else None,
                                     'mb_adv': b_adv[mb_idx].detach().cpu() if 'b_adv' in locals() else None,
+                                    'b_logp': b_logp[mb_idx].detach().cpu() if 'b_logp' in locals() else None,
+                                    'b_ret': b_ret[mb_idx].detach().cpu() if 'b_ret' in locals() else None,
+                                    'optimizer_state': optimizer.state_dict() if 'optimizer' in locals() else None,
                                     'state_dict': agent.state_dict(),
                                 }
                                 fn = os.path.join(diag_dir, f"grad_nan_update{update}_mb{start}_{n.replace('/','_')}.pt")
@@ -1573,7 +1668,102 @@ def run_train_vector(
                 cont_action_mean = [0.0, 0.0]
                 disc_action_rate = [0.0, 0.0]
 
+            # --- 更新ベースの負バイアス検出 (rollout 全体の前進行動平均) ---
+            try:
+                # rollout_actions: (rollout_steps, num_envs, act_dim)
+                mean_action0 = float(rollout_actions[:, :, 0].cpu().numpy().mean())
+            except Exception:
+                mean_action0 = float(cont_action_mean[0]) if cont_action_mean else 0.0
+
+            # thresholds (configurable via hp)
+            bias_thresh = float(hp.get("bias_dump_mean_threshold", -0.2))
+            delta_thresh = float(hp.get("bias_dump_delta_threshold", -0.4))
+            abort_on_dump = bool(hp.get("bias_dump_abort", False))
+
+            triggered = False
+            trigger_reasons = []
+            if mean_action0 < bias_thresh:
+                triggered = True
+                trigger_reasons.append(f"mean_action0<{bias_thresh}")
+            if prev_mean_action0 is not None:
+                delta = mean_action0 - float(prev_mean_action0)
+                if delta < delta_thresh:
+                    triggered = True
+                    trigger_reasons.append(f"delta<{delta_thresh} (delta={delta:.3f})")
+
+            if triggered:
+                try:
+                    dump = {
+                        'update': update,
+                        'mean_action0': mean_action0,
+                        'prev_mean_action0': prev_mean_action0,
+                        'trigger_reasons': trigger_reasons,
+                        'rollout_actions': rollout_actions.detach().cpu(),
+                        'rollout_obs': rollout_obs.detach().cpu(),
+                        'info_buffer': info_buffer,
+                        'state_dict': agent.state_dict(),
+                        'optimizer_state': optimizer.state_dict() if optimizer is not None else None,
+                    }
+                    fn = os.path.join(diag_dir, f"bias_dump_update{update}.pt")
+                    torch.save(dump, fn)
+                    # [BIAS_DUMP] console logging removed
+                except Exception:
+                    # [BIAS_DUMP] failed-to-write message suppressed
+                    pass
+                if abort_on_dump:
+                    raise RuntimeError(f"Bias dump triggered at update={update}: {trigger_reasons}")
+
+            prev_mean_action0 = mean_action0
+
             if wandb_run is not None:
+                def _info_key_float(info_obj, key, default=0.0):
+                    try:
+                        v = None
+                        if isinstance(info_obj, (list, tuple)):
+                            # list-of-dicts: collect per-env values and average only finite entries
+                            vals = [it.get(key, None) if isinstance(it, dict) else None for it in info_obj]
+                            vals = [x for x in vals if x is not None]
+                            if not vals:
+                                return float(default)
+                            if len(vals) == 1:
+                                v = vals[0]
+                            else:
+                                arr = np.array([np.array(x).astype(np.float64) for x in vals], dtype=object)
+                                # flatten numeric scalars/arrays to 1D list of scalars
+                                flat = []
+                                for item in arr:
+                                    try:
+                                        a = np.array(item, dtype=np.float64).ravel()
+                                        finite = a[np.isfinite(a)]
+                                        flat.extend(finite.tolist())
+                                    except Exception:
+                                        continue
+                                if not flat:
+                                    return float(default)
+                                v = float(np.mean(flat))
+                        elif isinstance(info_obj, dict):
+                            v = info_obj.get(key, default)
+                        else:
+                            return float(default)
+                        # handle numpy arrays / lists
+                        if hasattr(v, "tolist") and not isinstance(v, (str, bytes)):
+                            try:
+                                arr = np.array(v, dtype=np.float64).ravel()
+                                finite = arr[np.isfinite(arr)]
+                                if finite.size == 0:
+                                    return float(default)
+                                return float(np.mean(finite))
+                            except Exception:
+                                pass
+                        try:
+                            fv = float(v)
+                            if np.isfinite(fv):
+                                return fv
+                            return float(default)
+                        except Exception:
+                            return float(default)
+                    except Exception:
+                        return float(default)
                 payload = {
                     "global_step": global_step,
                     "train/update": update,
@@ -1595,6 +1785,10 @@ def run_train_vector(
                     "env/max_ramp_speed": max_ramp_speed,
                     "env/avg_blocked_ramp": avg_blocked_ramp,
                     "system/num_envs": num_envs,
+                    "dist/min_seen_dist": _info_key_float(info if 'info' in locals() else {}, "min_seen_dist", 1.0),
+                    "dist/min_hider_view_dist": _info_key_float(info if 'info' in locals() else {}, "min_hider_view_dist", 1.0),
+                    "dist/min_world_dist": _info_key_float(info if 'info' in locals() else {}, "min_world_dist", 1.0),
+                    "dist/box1_dist": _info_key_float(info if 'info' in locals() else {}, "box1_dist", 1.0),
                 }
                 if ramp_eval is not None:
                     payload.update(
@@ -1649,6 +1843,7 @@ def run_train_vector(
                     }
                 )
 
+                # [WANDPLOT] console logging removed (kept wandb logging)
                 wandb_run.log(payload, step=global_step)
 
             if update % hp["log_interval"] == 0:
@@ -1712,10 +1907,13 @@ def run_debug_or_playback(env, agent, device, model_loaded):
 
     for episode in range(num_episodes):
         # generate and log per-episode seed, then reset env with it for reproducibility
-        if MODEL_POLICY_DETERMINISTIC:
-            seed = 123456789
+        if FORCE_FIXED_SEED:
+            seed = int(FIXED_SEED_VAL)
         else:
-            seed = int(np.random.randint(0, 2**31 - 1))
+            if MODEL_POLICY_DETERMINISTIC:
+                seed = 123456789
+            else:
+                seed = int(np.random.randint(0, 2**31 - 1))
         np.random.seed(int(seed))
         torch.manual_seed(int(seed))
         obs, _ = env.reset(seed=int(seed))
@@ -1861,7 +2059,7 @@ def run_debug_or_playback(env, agent, device, model_loaded):
             if USE_VIEWER:
                 try:
                     env.render()
-                    time.sleep(0.025)
+                    time.sleep(viewer_sleep)
                     viewer_started = True
                 except Exception:
                     pass

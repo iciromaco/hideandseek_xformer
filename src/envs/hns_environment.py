@@ -118,7 +118,7 @@ class TeamCosEnv(gym.Env):
         avg_reward = float(np.mean(self._debug_reward_buffer)) if self._debug_reward_buffer else 0.0
         hide_rate = float(np.mean(self._debug_hide_buffer)) if self._debug_hide_buffer else 0.0
         # don't print WallDist when buffer may be empty; show core stats only
-        print(f"[DEBUG] Step={self.current_step} AvgR={avg_reward:.3f} HideRate={hide_rate:.2f}")
+        # [DEBUG] console logging removed
         self._debug_reward_buffer.clear()
         self._debug_hide_buffer.clear()
         self._debug_wall_distance_buffer.clear()

@@ -8,9 +8,10 @@ active_profile = "train"
 
 [runtime.common]
 # environment
-action_repeat =  8 # 10
+action_repeat =  10
 mode4_sdf_cell_size = 0.05
 show_turn_lines = false
+resume_training = true # 学習を継続
 
 # logging / debug
 debug_log_interval_steps = 200
@@ -69,7 +70,7 @@ wandb_run_name = "wall_only_confirm_10M"
 
 [runtime.trainseeker_forRB]
 train_mode = true
-use_viewer = true
+use_viewer = false
 training_target = "seeker"
 train_other_hider_policy = "rule"
 train_other_seeker_policy = "rule"
@@ -77,9 +78,14 @@ use_custom_reward = false
 npc_only_debug = false
 auto_tune_hparams = false
 total_timesteps = 10_000_000
-wandb_run_name = "seeker_forRB_100M"
+wandb_run_name = "seeker_forRB_10M"
 team_reward_gain = 1.0
-dist_bonus_weight = 1.0
+dist_bonus_weight = 0.5
+learning_rate = 1.0e-5 # 3.0e-4
+ent_coef = 0.01
+ent_coef_schedule = "linear"
+ent_coef_final = 0.01
+action_repeat = 8
 
 [runtime.trainseeker_forRB_withC]
 train_mode = true
@@ -93,6 +99,25 @@ auto_tune_hparams = false
 total_timesteps = 10_000_000
 wandb_run_name = "seeker_forRB_10M"
 
+[runtime.trainhider_forRB]
+train_mode = true
+use_viewer = true
+training_target = "hider"
+train_other_hider_policy = "model_if_available"
+train_other_seeker_policy = "model_if_available"
+use_custom_reward = false
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 10_000_000
+wandb_run_name = "seeker_forRB_10M"
+team_reward_gain = 1.0
+dist_bonus_weight = 1.0
+learning_rate = 1.0e-5 # 3.0e-4
+ent_coef = 0.01
+ent_coef_schedule = "linear"
+ent_coef_final = 0.01
+action_repeat = 8
+
 [runtime.ruleonly]
 # Monitor rule-based agents in default env signature (s1_h2_b2_r1)
 train_mode = false
@@ -102,19 +127,6 @@ debug_seeker_policy = "rule"
 play_episodes = 1
 num_envs = 1
 debug_log_interval_steps = 50
-
-[runtime.trainhider_forRB]
-# Train hider against rule-based opponents; no custom reward
-train_mode = true
-use_viewer = false
-training_target = "hider"
-train_other_hider_policy = "rule"
-train_other_seeker_policy = "rule"
-use_custom_reward = false
-npc_only_debug = false
-auto_tune_hparams = false
-total_timesteps = 10_000_000
-wandb_run_name = "hider_forRB_10M"
 
 [runtime.trainhider_forRB_withC]
 # Train hider against rule-based opponents; with custom reward enabled
@@ -247,3 +259,25 @@ clip_coef = 0.20
 ent_coef = 2.4e-3
 log_interval = 5
 save_interval = 25
+
+[runtime.test_seeker_box1]
+train_mode = true
+use_viewer = true
+training_target = "seeker"
+train_other_hider_policy = "rule"
+train_other_seeker_policy = "rule"
+use_custom_reward = true
+npc_only_debug = false
+auto_tune_hparams = false
+total_timesteps = 32000
+rollout_steps = 64
+update_epochs = 4
+minibatch_size = 16
+learning_rate = 4.0e-3
+ent_coef = 1.0e-3
+log_interval = 5
+save_interval = 50
+num_envs = 1
+force_fixed_seed = false
+fixed_seed_val = 123456789
+wandb_run_name = "test_seeker_box1"
